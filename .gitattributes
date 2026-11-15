@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# This file's exact exported bytes are recorded in client/support.json.
+*.patch -text

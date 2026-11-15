@@ -1,0 +1,663 @@
+-- Synthetic layout/action fixtures. No source game layouts or artwork are used.
+local realDofile=dofile
+local passed,assertions=0,0
+local S,files,parentFiles
+local function check(ok,message) assertions=assertions+1;assert(ok,message or "check failed") end
+local function equal(a,b,message) check(a==b,(message or "values differ")..": "..tostring(a).." / "..tostring(b)) end
+local function record(kind,...) S.events[#S.events+1]={kind=kind,args=table.pack(...)} end
+local function disabled() for _,v in ipairs(S.disabled) do if v then return true end end return false end
+local function action(module,name,...) record("action",module,name,...) end
+local function reset()
+  S={events={},draws={},texts={},disabled={},clips=0,fonts=0,colors=0,vars=0,children=0,tables=0,windows=0,
+    click={},mouse={},released={},down={},active={},frame=1,time=0,x=0,y=0,text={},states={},io={},rows=0,scroll=0,reads=0,headers=0,
+    art={},under={},rects={},visibleChildren={}}
+end
+reset()
+local api={}
+local function apiModule(name,methods)
+  api[name]=setmetatable(methods,{__index=function(_,key) error("Unregistered API "..name.."."..key) end})
+end
+api.Supports=function(module,member) return api[module]~=nil and (not member or rawget(api[module],member)~=nil) end
+apiModule("assets",{Image=function(path) record("asset",path);if path:find("missing",1,true) then return nil end;return S.imageHandle or "tex:"..path,64,32 end,
+  ItemIcon=function(id)return "icon:"..id,0,0,1,1 end})
+apiModule("interfaces",{
+ LoadBase=function()error("Compiled layouts must not use the code-base loader")end,
+ LoadData=function(path,baseOnly)
+   record("data",path,baseOnly==true,S.caller)
+   local source=baseOnly and parentFiles or files
+   return source and source[path]
+ end,
+})
+apiModule("windows",{
+ ChildState=function(screen,id) if screen=="Unknown" then return nil end;local t=S.states[id] or {}
+   if screen=="TextEntryWnd" and id=="OK" and S.minimum then return #((S.text.Entry or {})[1] or "")>=S.minimum end
+   return t.enabled~=false,t.checked,t.value,t.count,t.action end,
+ ChildShown=function(_,id) if S.visibleChildren[id]~=nil then return S.visibleChildren[id]end;return id~="Hidden" end,
+ ChildUnder=function(_,id)return S.under[id]end,
+ ChildArt=function(_,id,part)local a=S.art[id..":"..part];if a then return table.unpack(a,1,a.n) end end,
+ ChildRect=function(_,id)local a=S.rects[id];if a then return table.unpack(a)end end,
+ Text=function(_,id) local t=S.text[id];return t and t[1] or "",t and t[2] or false end,
+ ChildColor=function()end,ChildTooltip=function() return "tip" end,
+ ChildGauge=function()if S.noChildGauge then return nil,"" end;return 0.5,"50%" end,
+ ClickChild=function(screen,id,phase,outside)
+   action("windows","ClickChild",screen,id,phase,outside)
+   if screen=="TextEntryWnd" and (id=="Entry" or id=="OK") and #((S.text.Entry or {})[1] or "")>=(S.minimum or 0) then S.accepted=true end
+   if screen=="ConfirmationDialogBox" and phase=="left" then S.answered=true;S.answer=id=="Yes_Button" end
+   return true end,
+ SetText=function(screen,id,value)action("windows","SetText",screen,id,value)
+   if S.applyText then if S.maximum then value=value:sub(1,S.maximum)end;S.text[id]={value,true}end end,
+ SetSlider=function(...)action("windows","SetSlider",...) end,
+ ComboInfo=function(_,id) if id:find(":",1,true) then return {"CellA","CellB"},0 end;return {"A","B"},0 end,
+ ComboSelect=function(...)action("windows","ComboSelect",...)end,
+ ListInfo=function()if S.noList then return nil end;return S.rows,2,0,{"Name","Value"},{40,80},S.multi end,
+ ListRow=function(_,_,row)S.reads=S.reads+1;return {"Row"..row,"Value",disabled=S.rowDisabled} end,
+ ListClick=function(...)action("windows","ListClick",...) end,ListHeaderClick=function(...)action("windows","ListHeaderClick",...) end,
+ TabPage=function()return S.tab or 0 end,SetTabPage=function(...)action("windows","SetTabPage",...)end,
+ StmlLink=function(...)action("windows","StmlLink",...)end,
+ Replace=function()return S.shown~=false,20,30,200,100,false,false end,
+ Title=function()return "Test"end,Show=function(...)action("windows","Show",...)end,Placed=function(...)action("windows","Placed",...)end,
+})
+apiModule("character",{Label=function(n)return "Label"..n end,Gauge=function()return S.air or 0.25,""end})
+apiModule("inventory",{SlotItem=function()return S.item end,Item=function(slot)record("itemLookup",slot);return S.inventoryItem or S.item end,
+ ClickSlot=function(...)action("inventory","ClickSlot",...);return S.leftMade or false end})
+apiModule("cursor",{HoldingButton=function()return S.holdingButton end,PickUp=function(...)action("cursor","PickUp",...);S.holdingButton=S.pickupMade;return S.pickupMade or false end})
+apiModule("spells",{GemInfo=function()return S.gemInfo or {tex={},u0=0,u1=1,v0=0,v1=1,tooltip="Spell"}end,
+ GemOverlay=function()end,GemClick=function(...)action("spells","GemClick",...)end,
+ ButtonCoolDown=function()if S.cooldownTop then return S.cooldownTop,0.2,0.3,0.4,0.5 end end})
+apiModule("hotbars",{Button=function()return "spell","Hot"end,Click=function(...)action("hotbars","Click",...)end,
+ Info=function()return S.hotInfo or {tex={},enabled=true}end})
+hs={UI=api}
+ui={Col={Text=1,TextDisabled=2,FrameBg=3,Button=4,ButtonHovered=5,ButtonActive=6,Header=7,HeaderHovered=8,HeaderActive=9,Border=10},
+  StyleVar={FrameRounding=1,WindowRounding=2,ChildRounding=3,PopupRounding=4,TabRounding=5,GrabRounding=6,ScrollbarRounding=7},Mouse={Left=0,Right=1},HoveredFlags={AllowWhenDisabled=1},
+  Cond={Always=1,FirstUseEver=2},InputTextFlags={ReadOnly=1,Password=2,EnterReturnsTrue=4},
+  SelectableFlags={SpanAllColumns=1,AllowDoubleClick=2},TableFlags={ScrollY=1,RowBg=2,Resizable=4},TableColumnFlags={WidthFixed=1}}
+ui.window=function() error("The renderer must not register/intercept UI windows") end
+local originalWindow=ui.window
+ui.GetFrameCount=function()return S.frame end;ui.GetTime=function()return S.time end
+ui.GetIO=function()return S.io end
+ui.CalcTextSize=function(value)check(type(value)=="string","text must be a string");return #value*7,14 end
+ui.PushFont=function()S.fonts=S.fonts+1 end;ui.PopFont=function()S.fonts=S.fonts-1;check(S.fonts>=0)end
+ui.PushClipRect=function(...)S.clips=S.clips+1;record("clip",...)end;ui.PopClipRect=function()S.clips=S.clips-1;check(S.clips>=0)end
+ui.PushStyleColor=function()S.colors=S.colors+1 end;ui.PopStyleColor=function(n)S.colors=S.colors-n;check(S.colors>=0)end
+ui.PushStyleVar=function()S.vars=S.vars+1 end;ui.PopStyleVar=function(n)S.vars=S.vars-n;check(S.vars>=0)end
+ui.BeginDisabled=function(value)S.disabled[#S.disabled+1]=value end;ui.EndDisabled=function()check(#S.disabled>0);table.remove(S.disabled)end
+ui.DrawImage=function(...)S.draws[#S.draws+1]=table.pack(...)end
+ui.DrawRect=function(...)record("border",...)end;ui.DrawRectFilled=function(...)record("fill",...)end
+ui.DrawText=function(...)local a=table.pack(...);S.texts[#S.texts+1]=a end
+ui.SetCursorScreenPos=function(x,y)S.x,S.y=x,y end;ui.GetCursorScreenPos=function()return S.x,S.y end
+ui.GetWindowPos=function()return 0,0 end;ui.GetWindowSize=function()return 200,100 end
+ui.GetContentRegionAvail=function()return 200,100 end
+ui.SetNextWindowPos=function(...)record("windowpos",...)end;ui.SetNextWindowSize=function(...)record("windowsize",...)end
+ui.Begin=function()S.windows=S.windows+1;return true,true end;ui.End=function()S.windows=S.windows-1;check(S.windows>=0)end
+ui.InvisibleButton=function(id,w,h)S.last=id;record("hit",id,S.x,S.y,w,h);return not disabled() and S.click[id] or false end
+ui.IsItemHovered=function()return S.hover~=false end
+ui.IsItemActive=function()return not disabled() and S.active[S.last] or false end
+ui.IsItemClicked=function(button)return not disabled() and S.mouse[button] and S.mouse[button][S.last] or false end
+ui.IsMouseDown=function(button)return S.down[button] or false end
+ui.IsMouseReleased=function(button)return S.released[button] or false end
+ui.IsMouseClicked=function(button)return S.mouseClicked==button end
+ui.IsMouseDoubleClicked=function()return S.double or false end
+ui.IsMouseDragging=function()return S.drag or false end
+ui.GetMousePos=function()return S.mx or 0,S.my or 0 end
+ui.SetTooltip=function(...)record("tooltip",...)end
+ui.SetNextItemWidth=function(...)record("width",...)end
+ui.SetKeyboardFocusHere=function()record("focus")end
+ui.InputText=function(id,value,capacity,flags)
+  S.last=id;record("input",id,capacity,flags)
+  local changed=not disabled() and S.input~=nil
+  if flags&ui.InputTextFlags.EnterReturnsTrue~=0 then changed=not disabled() and S.enter==true end
+  return S.input or value,changed
+end
+ui.InputTextMultiline=function(id,value,capacity,w,h,flags)record("multiline",id,capacity,w,h,flags);return S.input or value,not disabled() and S.input~=nil end
+ui.BeginCombo=function(id)S.last=id;return S.combo==true and not disabled()end;ui.EndCombo=function()end
+ui.Selectable=function(id,selected,flags)S.last=id;record("selectable",id,flags);return not disabled() and S.click[id] or false end
+ui.BeginTable=function()S.tables=S.tables+1;return true end;ui.EndTable=function()S.tables=S.tables-1;check(S.tables>=0)end
+ui.TableSetupColumn=function()end;ui.TableNextRow=function()end;ui.TableNextColumn=function()end
+ui.TableHeadersRow=function()S.headers=S.headers+1 end;ui.TableHeadersRowClicked=function()S.headers=S.headers+1;return -1 end
+ui.TableGetHoveredColumn=function()return 1 end
+ui.GetScrollY=function()return S.scroll end;ui.SetScrollY=function(y)S.scroll=y;record("scroll",y)end
+ui.Dummy=function(...)record("dummy",...)end;ui.Image=function(...)record("inlineimage",...)end;ui.SameLine=function()end;ui.TextColored=function(...)record("cell",...)end
+ui.BeginChild=function()S.children=S.children+1;return true end;ui.EndChild=function()S.children=S.children-1;check(S.children>=0)end
+setmetatable(ui,{__index=function(_,key)error("Unregistered UI function "..key)end})
+
+local stml={Lines=function(raw)return {{raw}}end,DrawLines=function(view,_,_,key,callback)
+  check(type(key)=="number");S.stmlView=view
+  if S.stmlError then error("synthetic STML draw failure")end
+  if S.stmlLink then callback({27,"item:123"})end
+end}
+dofile=function(path)
+  if path:match("^lib/compiled/") then error("Compiled layouts must not use the code-root loader") end
+  if path=="lib/pack_bindings.lua" then return realDofile("shared/bindings.lua") end
+  if path=="lib/pack_renderer.lua" then return realDofile("shared/renderer.lua") end
+  if path=="lib/stml.lua" then return stml end
+  if files and files[path] then return files[path] end
+  error("Fixture file does not exist: "..path)
+end
+local function syntheticRenderer(renderer)
+  renderer.testProductionCompatible=renderer.Bindings.Compatible
+  local screens={Test=true,InventoryWindow=true,ActionsWindow=true,Bag3=true,CastSpellWnd=true,HotButtonWnd2=true,["ItemDisplayWindow#3"]=true}
+  -- Semantic control fixtures explicitly opt in their fake models. The shipped
+  -- bindings retain their conservative audit gate; no synthetic IDs are shipped.
+  renderer.Bindings.Compatible=function(screen,p,instance)
+    if screens[screen] then return true end
+    return renderer.testProductionCompatible(screen,p,instance)
+  end
+  return renderer
+end
+local R=syntheticRenderer(realDofile("shared/renderer.lua"))
+local serial=0
+local function fixture(index)
+  serial=serial+1
+  index=index or {version=2,windows={},images={},animations={},templates={}}
+  files={["lib/compiled/index.lua"]=index};parentFiles={}
+  return R.New({id="fixture"..serial,index="lib/compiled/index.lua"}),index
+end
+local function node(kind,id,x,y,w,h,fields)
+  return {type=kind,name=id,item=id,text=id,rect={x=x or 0,y=y or 0,w=w or 80,h=h or 20},
+    fields=fields or {},font=3,colors={},art={},children={}}
+end
+local function plan(...)
+  local p=node("Screen","Test",0,0,200,100);p.children={...};return p
+end
+local box={x=10,y=20,w=200,h=100,s=1}
+local function actions(module,name)
+  local out={};for _,event in ipairs(S.events)do if event.kind=="action" and event.args[1]==module and event.args[2]==name then out[#out+1]=event.args end end;return out
+end
+local function run(name,body)
+  reset()
+  local ok,why=xpcall(body,debug.traceback)
+  if not ok then error(name..": "..why,0)end
+  equal(S.clips,0,"clip stack");equal(S.fonts,0,"font stack");equal(S.colors,0,"color stack");equal(S.vars,0,"style stack")
+  equal(#S.disabled,0,"disabled stack");equal(S.children,0,"child stack");equal(S.tables,0,"table stack");equal(S.windows,0,"window stack")
+  equal(ui.window,originalWindow,"UI registration remains untouched")
+  passed=passed+1
+end
+
+run("exact geometry and explicit anchors",function()
+  local n=node("Button","Anchored",5,6,50,20);n.anchors={leftToLeft=true,rightToLeft=false,topToTop=true,bottomToTop=true,left=8,right=12,top=4,explicit={left=true,right=true,top=true}}
+  local r=R.Geometry(n,{x=100,y=200,w=300,h=160,s=2})
+  equal(r.x,116);equal(r.y,208);equal(r.w,260);equal(r.h,40)
+end)
+run("atlas crop and animated frame",function()
+  local I=fixture({version=2,windows={},images={atlas={path="uifiles/test/atlas.tga"}},animations={A={frames={{image="atlas",rect={x=16,y=8,w=16,h=8},duration=100},{image="atlas",rect={x=32,y=0,w=16,h=8},duration=100}},cycle=true}}})
+  S.time=0.05;check(R.Animation(I,"A",box));equal(S.draws[1][6],0.25);equal(S.draws[1][7],0.25);equal(S.draws[1][8],0.5);equal(S.draws[1][9],0.5)
+  S.frame=2;S.time=0.15;R.Animation(I,"A",box);equal(S.draws[2][6],0.5)
+end)
+run("source nine-slice frame",function()
+  local I=fixture({version=2,windows={},images={atlas={path="uifiles/test/atlas.tga"}},animations={A={frames={{image="atlas",rect={x=0,y=0,w=8,h=8}}}}},templates={F={fields={TopLeft="A",Top="A",TopRight="A",Left="A",Middle="A",Right="A",BottomLeft="A",Bottom="A",BottomRight="A"}}}})
+  check(R.Frame(I,"F",box));equal(#S.draws,9);equal(S.draws[2][2],18);equal(S.draws[2][4],202)
+end)
+run("disabled buttons cannot act",function()
+  local I=fixture();S.states.Save={enabled=false};S.click["##pack:Save"]=true;S.mouse[1]={["##pack:Save"]=true}
+  check(R.Draw("Test",plan(node("Button","Save")),I,box));equal(#actions("windows","ClickChild"),0)
+end)
+run("buttons act on the exact instance",function()
+  local I=fixture();S.click["##pack:Save"]=true
+  R.Draw("ItemDisplayWindow#3",plan(node("Button","Save")),I,box)
+  local a=actions("windows","ClickChild");equal(#a,1);equal(a[1][3],"ItemDisplayWindow#3");equal(a[1][4],"Save");equal(a[1][5],"left")
+end)
+run("explicit empty labels replace source text",function()
+  local I=fixture();S.text.Caption={"",true};R.Draw("Test",plan(node("Label","Caption")),I,box);equal(#S.texts,0)
+end)
+run("edit text and default zero capacity",function()
+  local I=fixture();S.input="new text";R.Draw("Test",plan(node("Editbox","Edit",0,0,100,20,{MaxChars=0})),I,box)
+  equal(actions("windows","SetText")[1][5],"new text")
+  for _,e in ipairs(S.events)do if e.kind=="input"then equal(e.args[2],4096)end end
+end)
+run("slider uses model step count and source geometry",function()
+  local I=fixture();S.states.Slider={value=1,count=11};S.active["##slider:Slider"]=true;S.mx=110;S.my=20
+  R.Draw("Test",plan(node("Slider","Slider",0,0,100,20)),I,box);equal(actions("windows","SetSlider")[1][5],10)
+end)
+run("combobox dispatches selected zero-based row",function()
+  local I=fixture();S.combo=true;S.click["B##2"]=true
+  R.Draw("Test",plan(node("Combobox","Pick")),I,box);equal(actions("windows","ComboSelect")[1][5],1)
+end)
+run("large list is virtual and retains disabled row rules",function()
+  local I=fixture();S.rows=1000;S.scroll=1600;S.rowDisabled=true;S.click["##row:99"]=true
+  R.Draw("Test",plan(node("Listbox","List",0,0,200,64)),I,box)
+  check(S.reads<15,"visible-row budget");equal(S.headers,1);equal(#actions("windows","ListClick"),0)
+end)
+run("tab page actions and selected contents",function()
+  local I=fixture();local tabs=node("TabBox","Tabs",0,0,200,100)
+  tabs.children={node("Page","One"),node("Page","Two")};tabs.children[2].children={node("Label","Second")};S.click["##tab:Tabs:2"]=true
+  R.Draw("Test",plan(tabs),I,box);equal(actions("windows","SetTabPage")[1][5],1)
+  check(#S.texts>=3)
+end)
+run("STML links keep host screen child message and identity",function()
+  local I=fixture();S.stmlLink=true;R.Draw("Test",plan(node("STMLbox","Description")),I,box)
+  local a=actions("windows","StmlLink")[1];equal(a[3],"Test");equal(a[4],"Description");equal(a[5],27);equal(a[6],"item:123")
+end)
+run("item held phases preserve slot zero and avoid release double action",function()
+  local I=fixture();local slot=node("InvSlot","Charm");slot.slot=0;local p=plan(slot)
+  S.mouse[0]={["##slot:Charm"]=true};S.down[0]=true;R.Draw("InventoryWindow",p,I,box)
+  S.mouse={};S.time=0.4;R.Draw("InventoryWindow",p,I,box)
+  S.down[0]=false;S.released[0]=true;S.time=0.5;R.Draw("InventoryWindow",p,I,box)
+  local a=actions("inventory","ClickSlot");equal(#a,2);equal(a[1][3],0);equal(a[1][5],"leftheld");equal(a[2][5],"left")
+end)
+run("unsupported graphs fall back before any action",function()
+  local I=fixture();local p=plan(node("Button","Save"),node("HtmlComponent","Browser"));S.click["##pack:Save"]=true
+  local ok,why=R.Draw("Test",p,I,box);equal(ok,false);check(why:find("adapter",1,true));equal(#actions("windows","ClickChild"),0)
+  local count=0;local wrapped=R.Wrap("Test",function()count=count+1;return 17 end,I.profile,"Unknown")
+  equal(wrapped(),17);equal(count,1);check(#R.Diagnostics(I)>0)
+end)
+run("lazy bucket inheritance and sparse defaults",function()
+  local path="lib/compiled/windows/ab123456.lua";local bucket="lib/compiled/buckets/0b.lua"
+  local I,index=fixture({version=2,storage="buckets-v1",windows={Base=path},defaults={Button={MaxChars=12}},images={},animations={},templates={}})
+  files[bucket]={};parentFiles[bucket]={[path]=plan(node("Button","Save"))}
+  local p=R.Resolve("Base",I);check(p);equal(p.children[1].fields.MaxChars,12);equal(R.Resolve("Base",I),p)
+end)
+run("parent index fills missing screen and resources",function()
+  serial=serial+1;local p=plan(node("Button","Save"));local path="lib/compiled/windows/aa1234.lua"
+  files={["lib/compiled/index.lua"]={version=2,windows={},images={A={path="uifiles/selected/a.png"}}},[path]=p}
+  parentFiles={["lib/compiled/index.lua"]={version=2,windows={OnlyParent=path},images={B={path="uifiles/default/b.png"}}}}
+  local I=R.New({id="inherited"..serial,index="lib/compiled/index.lua"});equal(R.Resolve("OnlyParent",I),p)
+  equal(I.index.images.A.path,"uifiles/selected/a.png");equal(I.index.images.B.path,"uifiles/default/b.png")
+end)
+run("fallback theme draws selected frame and button artwork",function()
+  local I=fixture({version=2,windows={},images={atlas={path="uifiles/test/atlas.tga"}},animations={A={frames={{image="atlas",rect={x=0,y=0,w=8,h=8}}}}},templates={W={fields={Background="A"}},B={fields={Normal="A",Pressed="A"}},G={fields={Background="A",Fill="A"}}},style={frame={template="W"},button={template="B"},gauge={template="G"}}})
+  local T={};R.StyleTheme(T,I);T.Panel(0,0,200,100,1);S.click.Press=true;check(T.Button("Press",0,0,80,20,1,"Action",{}));T.Bar("hp",0,30,100,40,1,0.5,nil,{center="Half"})
+  check(#S.draws>=4,"selected art, not just colors");equal(#S.texts,2)
+end)
+run("standalone model window has balanced lifetime",function()
+  local I=fixture();R.Draw("Test",plan(node("Label","Caption")),I);equal(#actions("windows","Placed"),1)
+end)
+
+run("compact tuple plans retain source fields anchors and byte colors",function()
+  local path="lib/compiled/windows/ab123456.lua"
+  local I=fixture({version=2,encoding="node-tuples-v1",windows={Test=path},defaults={Button={Enabled=false}},images={},animations={},templates={}})
+  files[path]={"Screen","Test",false,"source",{0,0,200,100},{true,true,true,true,0,0,0,0,0},"Title",3,{}, {},"",{}, {
+    {"Button","SourceButton","Save","child-source",{1,2,80,20},{true,true,true,false,4,0,8,12,13},"Save",5,
+      {TextColor={255,128,0,255}},{"A","B","C","D"},0,{Checked=true},{},0,7}}}
+  local p=R.Resolve("Test",I);check(p);equal(p.name,"Test");local n=p.children[1]
+  equal(n.name,"Save");equal(n.source,"child-source");equal(n.rect.w,80);equal(n.fields.Enabled,false);equal(n.fields.Checked,true)
+  check(n.anchors.explicit.top);check(n.anchors.explicit.left);check(n.anchors.explicit.right);equal(n.anchors.explicit.bottom,false)
+  equal(n.colors.TextColor[1],1);equal(n.colors.TextColor[2],128/255);equal(n.art.drawTemplate,"D");equal(n.slot,0);equal(n.gaugeEqType,7)
+end)
+
+local function artFixture()
+  local index={version=2,windows={},images={atlas={path="uifiles/test/atlas.tga"}},animations={},templates={},style={}}
+  for n,name in ipairs({"A","B","C","D","E","F","G"}) do index.animations[name]={frames={{image="atlas",rect={x=(n-1)*8,y=0,w=8,h=8}}}} end
+  local I=fixture(index);return I,index
+end
+run("dynamic static artwork hides replaces and draws live atlas cells",function()
+  local I=artFixture();local n=node("StaticAnimation","Indicator");n.art.animation="A";local p=plan(n)
+  S.art["Indicator:decal"]=table.pack(false);R.Draw("Test",p,I,box);equal(#S.draws,0,"explicitly hidden")
+  S.art={};R.Draw("Test",p,I,box);equal(S.draws[1][6],0,"nil uses selected compiled default")
+  S.draws={};S.art["Indicator:decal"]=table.pack("B");R.Draw("Test",p,I,box);equal(S.draws[1][6],8/64,"live animation")
+  S.draws={};local texture={};S.art["Indicator:decal"]=table.pack(texture,0.2,0.3,0.4,0.5)
+  R.Draw("Test",p,I,box);equal(S.draws[1][1],texture);equal(S.draws[1][7],0.3);equal(S.draws[1][9],0.5)
+  S.draws={};S.art["Indicator:decal"]=table.pack("MissingDynamicState");R.Draw("Test",p,I,box)
+  equal(#S.draws,0,"missing new state must not freeze the previous authored state");check(#R.Diagnostics(I)>0)
+end)
+run("host underlay ordering is stable and live child geometry wins",function()
+  local I=fixture();S.under.B=true;S.rects.A={12,14,30,16,true,6,8}
+  R.Draw("Test",plan(node("Label","A"),node("Label","B"),node("Label","C")),I,box)
+  equal(S.texts[1][7],"B");equal(S.texts[2][7],"A");equal(S.texts[3][7],"C")
+  equal(S.texts[2][1],22);equal(S.texts[2][2],34)
+end)
+run("frame side-only templates retain source cap dimensions",function()
+  local I,index=artFixture();index.templates.F={fields={Left="A",Middle="B",Right="C"}}
+  check(R.Frame(I,"F",box));equal(#S.draws,3);equal(S.draws[1][4]-S.draws[1][2],8);equal(S.draws[3][4]-S.draws[3][2],8)
+end)
+run("theme panels retain attack glow width and fade alpha",function()
+  local I=fixture();local T={};R.StyleTheme(T,I);T.Panel(10,20,110,80,2,{glow={1,0.2,0.1,0.5},glowWidth=3,alpha=0.25})
+  local e=S.events[#S.events];equal(e.kind,"border");equal(e.args[10],6);equal(e.args[8],0.125);equal(e.args[1],7)
+end)
+run("theme gauge keys select distinct selected-source templates",function()
+  local I,index=artFixture();index.style.gauges={}
+  local roles={hp="A",mana="B",endurance="C",experience="D",casting="E",target="F"}
+  for role,anim in pairs(roles)do index.templates[role]={fields={Background=anim,Fill=anim}};index.style.gauges[role]={template=role}end
+  local T={};R.StyleTheme(T,I)
+  for n,key in ipairs({"hp","mana","endurance","xp","cast","target"})do
+    S.draws={};T.Bar(key,0,0,100,10,1,0.5,nil,{});equal(S.draws[1][6],(n-1)*8/64,key)
+  end
+  S.draws={};T.Bar("aa",0,0,100,10,1,0.5,nil,{});equal(S.draws[1][6],24/64)
+end)
+run("primitive decorations preserve original item and action identity",function()
+  local I,index=artFixture();index.templates.B={fields={Normal="A",Pressed="B",Flyby="C"}}
+  index.templates.C={fields={Normal="D",Pressed="E"}};index.templates.S={fields={Background="A",Thumb={Normal="B",Flyby="C",Pressed="D",PressedFlyby="E"}}}
+  index.style.button={template="B"};index.style.checkbox={template="C"};index.style.slider={template="S"}
+  S.last="OriginalItem";S.x=123;S.y=456
+  check(R.DecorateWidget(I,"Button",box,{caption="Save##hidden",hovered=true}));equal(S.draws[1][6],16/64);equal(S.texts[1][7],"Save")
+  S.draws={};check(R.DecorateWidget(I,"Checkbox",box,{checked=true,caption="Choice"}));equal(S.draws[1][6],32/64)
+  S.draws={};check(R.DecorateWidget(I,"SliderInt",box,{fraction=0.75,hovered=true,active=true,valueText="75"}));equal(S.draws[2][6],32/64)
+  equal(S.last,"OriginalItem");equal(S.x,123);equal(S.y,456);equal(#actions("windows","ClickChild"),0)
+  for _,e in ipairs(S.events)do check(e.kind~="hit","decoration must not create input targets") end
+end)
+run("texture handles are reacquired after another frame evicts the sheet",function()
+  local I=artFixture();local old,new={},{}
+  S.imageHandle=old;R.Animation(I,"A",box);equal(S.draws[1][1],old)
+  S.imageHandle=new;R.Animation(I,"A",box);equal(S.draws[2][1],old,"same-frame lookup is shared")
+  S.frame=S.frame+1;R.Animation(I,"A",box);equal(S.draws[3][1],new,"reopened/evicted texture must recover")
+  local lookups=0;for _,e in ipairs(S.events)do if e.kind=="asset" then lookups=lookups+1 end end;equal(lookups,2)
+end)
+run("draggable action buttons do not also activate when released",function()
+  local I=fixture();local p=plan(node("Button","Ability"));S.active["##pack:Ability"]=true;S.drag=true;S.pickupMade=true
+  R.Draw("ActionsWindow",p,I,box);equal(#actions("cursor","PickUp"),1)
+  S.active={};S.drag=false;S.click["##pack:Ability"]=true;R.Draw("ActionsWindow",p,I,box)
+  equal(#actions("windows","ClickChild"),0)
+end)
+run("item long right press retains held display and outside release phases",function()
+  local I=fixture();local p=plan(node("InvSlot","Item"));S.mouse[1]={["##slot:Item"]=true};S.down[1]=true
+  R.Draw("Bag3",p,I,box);S.mouse={};S.time=0.6;R.Draw("Bag3",p,I,box)
+  S.down[1]=false;S.released[1]=true;S.hover=false;R.Draw("Bag3",p,I,box)
+  local a=actions("windows","ClickChild");equal(#a,3);equal(a[1][3],"Bag3");equal(a[1][5],"rightdown");equal(a[2][5],"rightheld");equal(a[3][5],"rightupheld");equal(a[3][6],true)
+end)
+run("spell gem right hold and hotbutton disabled state preserve semantics",function()
+  local I=fixture();local p=plan(node("SpellGem","CSPW_Spell0"));S.mouse[1]={["##gem:CSPW_Spell0"]=true};S.down[1]=true
+  R.Draw("CastSpellWnd",p,I,box);S.mouse={};S.time=0.6;R.Draw("CastSpellWnd",p,I,box)
+  S.down[1]=false;S.released[1]=true;R.Draw("CastSpellWnd",p,I,box)
+  local a=actions("spells","GemClick");equal(#a,3);equal(a[1][3],"CSPW_Spell0");equal(a[2][4],"rightheld");equal(a[3][4],"rightupheld")
+  S.hotInfo={enabled=false,label="Disabled",cooldown=0.5};S.click["##hot:HB_Button1"]=true
+  R.Draw("HotButtonWnd2",plan(node("HotButton","HB_Button1")),I,box);equal(#actions("hotbars","Click"),0)
+end)
+run("theme buttons retain the inherited overlap-aware hit function",function()
+  local I=fixture();local calls=0;local T={Hit=function(id,x0,y0,x1,y1)calls=calls+1;equal(id,"KeepHit");return true end}
+  local original=T.Hit;R.StyleTheme(T,I);check(T.Button("KeepHit",0,0,80,20,1,"Action",{}));equal(calls,1);equal(T.Hit,original)
+end)
+run("gauge offsets caps fill lines and caption use source geometry",function()
+  local I,index=artFixture();index.templates.G={fields={Background="A",Fill="B",Lines="C",LinesFill="D",EndCapLeft="E",EndCapRight="F"}}
+  local gauge=node("Gauge","HP",0,0,100,30,{GaugeOffsetX=3,GaugeOffsetY=16,TextOffsetX=7,TextOffsetY=2,DrawLinesFill=true})
+  gauge.art.drawTemplate="G";R.Draw("Test",plan(gauge),I,box)
+  equal(S.draws[1][2],13);equal(S.draws[1][3],36);equal(S.draws[1][5]-S.draws[1][3],8)
+  equal(#S.draws,6);equal(S.texts[1][1],17);equal(S.texts[1][2],22)
+end)
+run("linear layout skips hidden children and fills remaining client extent",function()
+  local I=fixture();local flow=node("HorizontalLayoutBox","Flow",0,0,200,50,{Spacing=5,PaddingLeft=4,PaddingRight=6,PaddingTop=2,PaddingBottom=3,Style_Dividers=false})
+  flow.children={node("Button","A",99,99,40,20),node("Button","Hidden",0,0,40,20),node("Button","B",99,99,30,20)}
+  R.Draw("Test",plan(flow),I,box)
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[#hits+1]=e.args end end
+  equal(#hits,2);equal(hits[1][2],14);equal(hits[1][3],22);equal(hits[1][5],45)
+  equal(hits[2][2],59);equal(hits[2][4],145)
+end)
+run("tile flow wraps and honors reverse source anchors",function()
+  local I=fixture();local flow=node("TileLayoutBox","Tiles",0,0,100,70,{Spacing=5,SecondarySpacing=7,AnchorToLeft=false,AnchorToTop=false,FirstPieceTemplate=true})
+  flow.children={node("Button","A",0,0,40,20),node("Button","B",0,0,90,90),node("Button","C",0,0,12,10)}
+  R.Draw("Test",plan(flow),I,box)
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[#hits+1]=e.args end end
+  equal(hits[1][2],70);equal(hits[1][3],70);equal(hits[2][2],25)
+  equal(hits[2][4],40);equal(hits[3][2],70);equal(hits[3][3],43)
+end)
+run("source layout strategies use padding and fail before unsupported parent resizing",function()
+  local I,index=fixture();index.templates.Flow={type="LayoutVertical",fields={Padding=3}}
+  local flow=node("LayoutBox","Flow",0,0,100,70,{Layout="Flow",Spacing=4})
+  flow.children={node("Label","A",33,33,30,10),node("Label","B",33,33,30,10)}
+  R.Draw("Test",plan(flow),I,box);equal(S.texts[1][1],13);equal(S.texts[1][2],23);equal(S.texts[2][2],37)
+  index.templates.Resize={type="LayoutHorizontal",fields={ResizeVertical=true}};flow.fields.Layout="Resize"
+  local p=plan(flow);local ok,why=R.CanDraw(p,I,"Test");equal(ok,false);check(why:find("Parent-size",1,true))
+end)
+run("linear dividers resize neighbors without changing host action targets",function()
+  local I=fixture();local flow=node("HorizontalLayoutBox","Flow",0,0,200,40,{Spacing=5,ResizeLast=true,Style_Dividers=true})
+  flow.children={node("Button","A",0,0,50,40,{MinHSize=20}),node("Button","B",0,0,50,40,{MinHSize=30})}
+  local p=plan(flow);S.active["##divider:Flow:1"]=true;S.mx=60;S.down[0]=true;R.Draw("Test",p,I,box)
+  S.mx=85;R.Draw("Test",p,I,box);S.active={};S.down={};S.events={};R.Draw("Test",p,I,box)
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[#hits+1]=e.args end end
+  equal(hits[1][1],"##pack:A");equal(hits[1][4],75);equal(hits[2][1],"##pack:B");equal(hits[2][4],120)
+  equal(#actions("windows","ClickChild"),0)
+end)
+run("compiled data survives code updates and retains the current caller",function()
+  local path="lib/compiled/windows/ab123456.lua"
+  local index={version=2,windows={Test=path},images={},animations={},templates={}}
+  local I=fixture(index);files[path]=plan(node("Button","SavedLayout"));S.caller="plugin.fixture"
+  local first=R.Resolve("Test",I);check(first);equal(first.children[1].name,"SavedLayout")
+  -- No generated file is available to dofile; replacing the presentation module
+  -- leaves the independent LoadData store and its selected layout untouched.
+  local updated=syntheticRenderer(realDofile("shared/renderer.lua"))
+  local after=updated.New({id=I.profile.id,index="lib/compiled/index.lua",revision="new-code"})
+  equal(updated.Resolve("Test",after).children[1].name,"SavedLayout")
+  S.click["##pack:SavedLayout"]=true;updated.Draw("Test",updated.Resolve("Test",after),after,box)
+  equal(actions("windows","ClickChild")[1][4],"SavedLayout")
+  local sawOwn,sawBase=false,false
+  for _,event in ipairs(S.events) do
+    if event.kind=="data" and event.args[3]=="plugin.fixture" then
+      if event.args[2] then sawBase=true else sawOwn=true end
+    end
+  end
+  check(sawOwn);check(sawBase);equal(S.caller,"plugin.fixture")
+end)
+run("inventory slot parsing is bounded and preserves raw source identity",function()
+  local B=R.Bindings
+  for n=0,32 do equal(B.InventorySlot(n),n);equal(B.InventorySlot("inventory/Equip "..n),n);equal(B.InventorySlot(tostring(n)),n) end
+  for n=0,9 do equal(B.InventorySlot("inventory/General "..n),23+n) end
+  local bad=table.pack(nil,false,{},-1,33,1.5,math.huge,0/0,"", "-1","33","1.5","1e1",
+    "inventory/Equip -1","inventory/Equip 33","inventory/Equip 1 suffix","inventory/Equip1",
+    "inventory/General 10","inventory/General -1","bank/Equip 0"," inventory/Equip 0","inventory/Equip 0 ")
+  for n=1,bad.n do equal(B.InventorySlot(bad[n]),nil,"invalid source slot") end
+  local slot=node("InvSlot","InvSlot32");slot.slot="inventory/Equip 32";S.inventoryItem={name="Carried item"}
+  equal(B.Item("InventoryWindow",slot),S.inventoryItem)
+  B.ItemClick("InventoryWindow",slot,"rightupheld",true)
+  local a=actions("inventory","ClickSlot")[1];equal(a[3],32);equal(a[5],"rightupheld");equal(a[6],true)
+  equal(slot.slot,"inventory/Equip 32","the raw compiled field is not rewritten")
+  slot.slot="inventory/Equip 33";B.ItemClick("InventoryWindow",slot,"left",false);equal(#actions("inventory","ClickSlot"),1)
+end)
+run("themed icon wells use source artwork UV opacity and square semantic rings",function()
+  local I,index=artFixture();index.animations.A_InvSlot=index.animations.B
+  local T={};R.StyleTheme(T,I);local texture={};S.last="ExistingSlot";S.x=91;S.y=92
+  check(T.Icon(10,20,40,2,texture,0.1,0.2,0.7,0.8,{1,0.3,0.2,0.6},{alpha=0.5,wellAlpha=0.25}))
+  equal(S.draws[1][6],8/64);equal(S.draws[1][13],0.25,"well opacity")
+  equal(S.draws[2][1],texture);equal(S.draws[2][2],13);equal(S.draws[2][6],0.1);equal(S.draws[2][9],0.8);equal(S.draws[2][13],0.5,"icon opacity")
+  local ring=S.events[#S.events];equal(ring.kind,"border");equal(ring.args[8],0.3);equal(ring.args[9],0,"source square geometry");equal(ring.args[10],3)
+  equal(S.last,"ExistingSlot");equal(S.x,91);equal(S.y,92);equal(#actions("windows","ClickChild"),0)
+end)
+run("icon frame fallback and hover cues retain existing input registration",function()
+  local I,index=artFixture();index.templates.B={fields={Normal="C"}};index.style.button={template="B"}
+  local T={};R.StyleTheme(T,I);S.last="HoveredSlot";S.hover=true
+  equal(T.Icon(0,0,40,1,nil,nil,nil,nil,nil,nil,{}),false);equal(S.draws[1][6],16/64)
+  T.HoverFx(0,0,40,40,1,8);local e=S.events[#S.events];equal(e.kind,"border");equal(e.args[9],0);equal(S.last,"HoveredSlot")
+  S.active.HoveredSlot=true;T.HoverFx(0,0,40,40,1,8);e=S.events[#S.events];equal(e.kind,"fill");equal(e.args[8],0.25);equal(e.args[9],0)
+  for _,event in ipairs(S.events)do check(event.kind~="hit","theme drawing must not register an item")end
+end)
+run("source checkbox decals retain checked hover and disabled states",function()
+  local I,index=artFixture();index.templates.Check={fields={NormalDecal="A",PressedDecal="B",DisabledDecal="C",PressedDisabledDecal="D",
+    FlybyDecal="E",PressedFlybyDecal="F"}};index.style.checkbox={template="Check"}
+  local cases={{checked=false,expected=0},{checked=true,expected=8},{enabled=false,expected=16},
+    {enabled=false,checked=true,expected=24},{hovered=true,expected=32},{hovered=true,checked=true,expected=40}}
+  for _,opts in ipairs(cases)do
+    S.draws={};opts.caption="Setting";R.DecorateWidget(I,"Checkbox",box,opts)
+    equal(#S.draws,1);equal(S.draws[1][6],opts.expected/64)
+  end
+  index.templates.Check.fields.PressedFlybyDecal="";S.draws={}
+  R.DecorateWidget(I,"Checkbox",box,{checked=true,hovered=true});equal(S.draws[1][6],8/64,"empty schema hover default retains checked artwork")
+end)
+run("button base and decal layers remain independent with model overrides",function()
+  local I,index=artFixture();index.templates.Button={fields={Normal="A",Pressed="B",Disabled="C",PressedDisabled="D",NormalDecal="E",PressedDecal="F"}}
+  local n=node("Button","Setting");n.art.drawTemplate="Button";S.hover=false;S.states.Setting={checked=true}
+  R.Draw("Test",plan(n),I,box);equal(#S.draws,2);equal(S.draws[1][6],8/64);equal(S.draws[2][6],40/64)
+  S.draws={};S.states.Setting={enabled=false,checked=true};R.Draw("Test",plan(n),I,box);equal(S.draws[1][6],24/64)
+  S.draws={};S.states.Setting={checked=false};S.art["Setting:decal"]=table.pack(false)
+  R.Draw("Test",plan(n),I,box);equal(#S.draws,1,"explicit model-hidden decal must not show the source default")
+  S.draws={};S.art["Setting:decal"]=nil;S.art["Setting:background"]=table.pack("G")
+  R.Draw("Test",plan(n),I,box);equal(#S.draws,2);equal(S.draws[1][6],48/64);equal(S.draws[2][6],32/64)
+end)
+run("dialog frame-only chrome cannot paint a background middle or titlebar",function()
+  local I,index=artFixture()
+  index.templates.Border={fields={TopLeft="A",Top="A",TopRight="A",Left="A",Middle="C",Right="A",BottomLeft="A",Bottom="A",BottomRight="A"}}
+  index.templates.Title={fields={Middle="D"}}
+  index.templates.Window={fields={Background="B",Border="Border",Titlebar="Title"}}
+  index.style.frame={template="Window"}
+  check(R.Chrome(I,box,{frameOnly=true,titleHeight=30}));equal(#S.draws,8)
+  for _,draw in ipairs(S.draws)do equal(draw[6],0,"only source edge pieces")end
+  for _,event in ipairs(S.events)do check(event.kind~="fill","outer frame must not wipe existing controls")end
+  local token=R.PushStyle(I);equal(token.vars,7,"window popup tab grab and scrollbar geometry are square");R.PopStyle(token)
+end)
+run("dialog background-only chrome excludes frame titlebar and fallback borders",function()
+  local I,index=artFixture()
+  index.templates.Border={fields={Top="A",Middle="C"}};index.templates.Title={fields={Middle="D"}}
+  index.templates.Window={fields={Background="B",Border="Border",Titlebar="Title"}};index.style.frame={template="Window"}
+  check(R.Chrome(I,box,{backgroundOnly=true,titleHeight=30}));equal(#S.draws,1);equal(S.draws[1][6],8/64)
+  for _,event in ipairs(S.events)do check(event.kind~="border","body must not draw a duplicate frame")end
+  local missing=fixture();S.events={};R.Chrome(missing,box,{backgroundOnly=true})
+  equal(#S.events,1);equal(S.events[1].kind,"fill","missing image still has a coherent plain background")
+end)
+run("unindexed item atlases are never stretched over ordinary buttons",function()
+  local I,index=artFixture();index.animations.Icons={grid=true,frames={{image="atlas",rect={x=0,y=0,w=64,h=32}}},fields={CellWidth=8,CellHeight=8}}
+  equal(R.Animation(I,"Icons",box),false);equal(#S.draws,0);check(#R.Diagnostics(I)>0)
+  index.templates.B={fields={Normal="A",NormalDecal="Icons"}};index.style.button={template="B"}
+  R.DecorateWidget(I,"Button",box,{caption="Save"});equal(#S.draws,1);equal(S.draws[1][6],0)
+end)
+run("existing host models and familiar source IDs cannot authorize unaudited behavior",function()
+  local I,index=fixture();local p=plan(node("Button","Save"));S.click["##pack:Save"]=true
+  local ok,why=R.Draw("GroupWindow",p,I,box);equal(ok,false);check(why:find("not audited",1,true));equal(#actions("windows","ClickChild"),0)
+  equal(R.testProductionCompatible("InventoryWindow",p),false)
+  equal(R.CanDraw(plan(node("Label","GroupMember1")),I,"GroupWindow"),false,"a label may own target clicks")
+  local path="lib/compiled/windows/ab123456.lua";index.windows.GroupWindow=path;files[path]=p
+  local called=0;local wrapped=R.Wrap("Group",function()called=called+1;return 41 end,I.profile,"GroupWindow")
+  equal(wrapped(),41);equal(called,1);equal(#actions("windows","ClickChild"),0)
+end)
+run("audited read-only air meter retains real air percentage and critical warning",function()
+  local I=fixture();local gauge=node("Gauge","Gauge",0,0,100,10);gauge.gaugeEqType=8
+  local p=plan(gauge);p.name="BreathWindow";p.item="BreathWindow"
+  S.noChildGauge=true;S.air=0.2;check(R.CanDraw(p,I,"BreathWindow"));check(R.Draw("BreathWindow",p,I,box));equal(S.texts[1][7],"20%")
+  equal(S.texts[1][8],10,"critical percentage fits the source's narrow air gauge")
+  local first;for _,event in ipairs(S.events)do if event.kind=="fill"then first=event.args end end
+  check(first);local initial=first[8];S.events={};S.time=math.pi/10;R.Draw("BreathWindow",p,I,box)
+  for _,event in ipairs(S.events)do if event.kind=="fill"then check(event.args[8]<=initial)end end
+  p.children[2]=node("Button","CustomAction");equal(R.testProductionCompatible("BreathWindow",p),false)
+  p.children[2]=nil;p.fields.DefaultControl="CustomAction";equal(R.testProductionCompatible("BreathWindow",p),false)
+  p.fields.DefaultControl=nil;gauge.gaugeEqType=1;equal(R.testProductionCompatible("BreathWindow",p),false)
+end)
+run("theme bar explicit opacity multiplies artwork and caption once",function()
+  local I,index=artFixture();index.templates.G={fields={Background="A",Fill="B"}};index.style.gauge={template="G"}
+  local T={};R.StyleTheme(T,I);T.Bar("breath",0,0,100,10,1,0.5,{1,0.2,0.3,1},{alpha=0.4,center="Half"})
+  equal(S.draws[1][13],0.4);equal(S.draws[2][13],0.4);equal(S.texts[1][6],0.4)
+  equal(I.palette.text[4],1,"shared palette alpha is not mutated")
+end)
+run("audited casting and aggro graphs accept only verified live value types",function()
+  local I,index=fixture()
+  local cast=node("Gauge","Gauge");cast.gaugeEqType=7
+  local name=node("Label","Casting_SpellName");name.eqType=134
+  local p=plan(cast,name);check(R.CanDraw(p,I,"CastingWindow"));check(R.Draw("CastingWindow",p,I,box))
+  local gauge=node("Gauge","AggroGauge");gauge.gaugeEqType=149
+  local controls={gauge}
+  for _,kind in ipairs({302,303,305,307})do local label=node("Label","Value"..kind);label.eqType=kind;controls[#controls+1]=label end
+  controls[#controls+1]=node("Label","LiteralPercent");controls[#controls].eqType="";controls[#controls].text="%"
+  local aggro=plan(table.unpack(controls));check(R.CanDraw(aggro,I,"AggroMeterWnd"));check(R.Draw("AggroMeterWnd",aggro,I,box))
+  controls[2].eqType=999;equal(R.testProductionCompatible("AggroMeterWnd",aggro,I),false)
+  name.eqType=305;equal(R.testProductionCompatible("CastingWindow",p,I),false)
+  name.eqType=134;p.children[3]=node("Editbox","UnauditedInput");equal(R.testProductionCompatible("CastingWindow",p,I),false)
+  p.children[3]=nil;local art=node("StaticAnimation","SpellAtlas");art.art.animation="Grid"
+  index.animations.Grid={grid=true};p.children[3]=art;equal(R.testProductionCompatible("CastingWindow",p,I),false)
+  check(R.CanDraw(plan(name),I,"CastingWindow"),"authored label-only cast layout still reads its live spell name")
+  local percentage=node("Label","Percent");percentage.eqType=305;check(R.CanDraw(plan(percentage),I,"AggroMeterWnd"))
+  equal(R.CanDraw(plan(node("Label","Literal")),I,"CastingWindow"),false,"literal-only status cannot replace live data")
+end)
+run("audited aura list routes removal and reserves Alt right click for the frame menu",function()
+  local I=fixture();local p=plan(node("Listbox","AuraList",0,0,180,80));S.rows=1
+  S.mouse[1]={["##row:0"]=true};check(R.CanDraw(p,I,"AuraWindow"));check(R.Draw("AuraWindow",p,I,box))
+  local calls=actions("windows","ListClick");equal(#calls,1);equal(calls[1][3],"AuraWindow");equal(calls[1][4],"AuraList");equal(calls[1][5],0);equal(calls[1][6],"right")
+  S.events={};S.io.alt=true;R.Draw("AuraWindow",p,I,box);equal(#actions("windows","ListClick"),0)
+  S.noList=true;local ok,why=R.CanDraw(p,I,"AuraWindow");equal(ok,false);check(why:find("data unavailable",1,true))
+  S.noList=false;p.children[1].name="UnknownAuraList";equal(R.testProductionCompatible("AuraWindow",p,I),false)
+end)
+run("audited respawn keeps selection timer disabled rows and exact button identity",function()
+  local I=fixture();local gauge=node("Gauge","TimeGauge");gauge.gaugeEqType=28
+  local select=node("Button","SelectButton");local list=node("Listbox","OptionsList",0,25,200,50)
+  local p=plan(gauge,list,select);S.rows=1;S.rowDisabled=true;S.click["##row:0"]=true;S.states.SelectButton={enabled=false};S.click["##pack:SelectButton"]=true
+  check(R.Draw("RespawnWnd",p,I,box));equal(#actions("windows","ListClick"),0);equal(#actions("windows","ClickChild"),0)
+  S.rowDisabled=false;S.states.SelectButton={enabled=true};S.events={};R.Draw("RespawnWnd",p,I,box)
+  local a=actions("windows","ClickChild");equal(#a,1);equal(a[1][3],"RespawnWnd");equal(a[1][4],"SelectButton");equal(a[1][5],"left")
+  p.children[4]=node("Button","UnknownRespawnButton");equal(R.testProductionCompatible("RespawnWnd",p,I),false)
+end)
+run("audited label action aliases dispatch only documented phases",function()
+  local I=fixture();local gauge=node("Gauge","TimeGauge");gauge.gaugeEqType=28
+  local p=plan(gauge,node("Listbox","OptionsList"),node("Label","SelectButton"));S.click["##label:SelectButton"]=true;S.mouse[1]={["##label:SelectButton"]=true}
+  check(R.Draw("RespawnWnd",p,I,box));local a=actions("windows","ClickChild");equal(#a,1);equal(a[1][4],"SelectButton");equal(a[1][5],"left")
+end)
+run("list double-click is registered and a drag cannot also activate a row",function()
+  local I=fixture();local p=plan(node("Listbox","List",0,0,200,80));S.rows=1;S.click["##row:0"]=true;S.double=true
+  R.Draw("Test",p,I,box);local a=actions("windows","ListClick");equal(#a,2);equal(a[1][6],"left");equal(a[2][6],"double")
+  local flags;for _,event in ipairs(S.events)do if event.kind=="selectable" and event.args[1]=="##row:0" then flags=event.args[2]end end
+  check(flags&ui.SelectableFlags.AllowDoubleClick~=0)
+  S.events={};S.active["##row:0"]=true;S.drag=true;S.pickupMade=true;R.Draw("Test",p,I,box)
+  equal(#actions("windows","ListClick"),0);equal(#actions("cursor","PickUp"),1)
+end)
+run("selected source identity cannot silently borrow an uncompiled parent's index",function()
+  serial=serial+1;files={["lib/compiled/index.lua"]={version=2,skin="default",windows={Test="lib/compiled/windows/a.lua"}}}
+  parentFiles={["lib/compiled/index.lua"]=files["lib/compiled/index.lua"]}
+  local missing=R.New({id="missing-selected"..serial,source="aya-stock",index="lib/compiled/index.lua"})
+  equal(next(missing.index.windows),nil);check(R.Diagnostics(missing)[1]:find("missing for the selected source",1,true))
+  files["lib/compiled/index.lua"]={version=2,skin="AYA-STOCK",windows={},images={},animations={},templates={}}
+  local own=R.New({id="correct-selected"..serial,source="aya-stock",index="lib/compiled/index.lua"})
+  check(own.index.windows.Test,"a verified selected index can still inherit sparse Default maps")
+end)
+run("invalid atlas crops never wrap arbitrary texture pixels",function()
+  local I,index=artFixture();index.animations.Bad={frames={{image="atlas",rect={x=60,y=0,w=8,h=8}}}}
+  equal(R.Animation(I,"Bad",box),false);equal(#S.draws,0);check(#R.Diagnostics(I)>0)
+  for _,crop in ipairs({{x=-1,y=0,w=8,h=8},{x=0,y=0,w=0,h=8},{x=0,y=0,w=8,h=math.huge}})do
+    index.animations.Bad.frames[1].rect=crop;equal(R.Animation(I,"Bad",box),false)
+  end
+  check(R.Animation(I,"A",box));equal(#S.draws,1,"valid atlas drawing remains usable")
+end)
+local function textPrompt()
+  S.text.Prompt={"Enter a name",true};S.text.Entry={"",true};S.applyText=true
+  return plan(node("Label","Prompt"),node("Editbox","Entry",0,25,160,20),node("Button","OK",0,50,70,20),node("Button","Cancel",80,50,70,20))
+end
+run("text entry focuses each opening and writes text before Enter validation",function()
+  local I=fixture();local p=textPrompt();S.minimum=3;S.maximum=5;S.input="xy";S.enter=true
+  R.TrackWindow("TextEntryWnd",true,I);check(R.Draw("TextEntryWnd",p,I,box));equal(S.accepted,nil,"backend minimum is not bypassed")
+  local focus=0;local setAt,clickAt
+  for n,event in ipairs(S.events)do
+    if event.kind=="focus"then focus=focus+1 end
+    if event.kind=="input"then equal(event.args[2],256);check(event.args[3]&ui.InputTextFlags.EnterReturnsTrue~=0)end
+    if event.kind=="action" and event.args[2]=="SetText"then setAt=n end
+    if event.kind=="action" and event.args[2]=="ClickChild"then clickAt=n end
+  end
+  equal(focus,1);check(setAt<clickAt);equal(actions("windows","ClickChild")[1][4],"Entry")
+  S.events={};S.input="valid_name";R.TrackWindow("TextEntryWnd",true,I);R.Draw("TextEntryWnd",p,I,box)
+  equal(S.accepted,true);equal(S.text.Entry[1],"valid","model owns the request maximum")
+  for _,event in ipairs(S.events)do check(event.kind~="focus","focus is not stolen every frame")end
+  R.TrackWindow("TextEntryWnd",false,I);R.TrackWindow("TextEntryWnd",true,I);S.events={};S.enter=false;S.input=nil
+  R.Draw("TextEntryWnd",p,I,box);focus=0;for _,event in ipairs(S.events)do if event.kind=="focus"then focus=focus+1 end end;equal(focus,1)
+end)
+run("text entry obeys disabled OK and never dispatches Enter from another model",function()
+  local I=fixture();local p=textPrompt();S.minimum=2;S.click["##pack:OK"]=true;S.enter=false
+  check(R.Draw("TextEntryWnd",p,I,box));equal(#actions("windows","ClickChild"),0);equal(S.accepted,nil)
+  p.children[2].fields.Style_Multiline=true;equal(R.testProductionCompatible("TextEntryWnd",p,I),false)
+  p.children[2].fields.Style_Multiline=false;S.text.Entry={"",false};equal(R.CanDraw(p,I,"TextEntryWnd"),false,"a familiar ID without supplied model text is unavailable")
+end)
+run("text entry refocuses after a hidden presenter skips HUD entirely",function()
+  local I=fixture();local p=textPrompt()
+  local function frame(n)
+    S.frame=n;S.events={};R.TrackWindow("TextEntryWnd",true,I);check(R.Draw("TextEntryWnd",p,I,box))
+    local focused=0;for _,event in ipairs(S.events)do if event.kind=="focus"then focused=focused+1 end end
+    return focused
+  end
+  equal(frame(10),1);equal(frame(11),0)
+  -- The original callback returns before HUD on frames 12 and 13.
+  equal(frame(14),1);equal(frame(15),0)
+end)
+local function confirmation()
+  S.text.TextOutput={"<c \"#ffffff\">Question</c>",true}
+  S.visibleChildren={Yes_Button=true,No_Button=true,OK_Button=false,Cancel_Button=false}
+  return plan(node("STMLbox","TextOutput",0,0,200,60),node("Button","Yes_Button",0,65,60,20),
+    node("Button","No_Button",70,65,60,20),node("Button","OK_Button",0,65,60,20),node("Button","Cancel_Button",140,65,60,20))
+end
+run("confirmation uses backend modes without any implicit Enter acceptance",function()
+  local I=fixture();local p=confirmation();S.enter=true
+  check(R.Draw("ConfirmationDialogBox",p,I,box));equal(S.answered,nil);equal(#actions("windows","ClickChild"),0)
+  S.click["##pack:Yes_Button"]=true;R.Draw("ConfirmationDialogBox",p,I,box);equal(S.answered,true);equal(S.answer,true)
+  S.events={};S.answered=nil;S.answer=nil;S.visibleChildren={Yes_Button=false,No_Button=false,OK_Button=true,Cancel_Button=false}
+  S.click["##pack:OK_Button"]=true;R.Draw("ConfirmationDialogBox",p,I,box)
+  local a=actions("windows","ClickChild");equal(#a,1);equal(a[1][4],"OK_Button");equal(S.answer,false,"OK intentionally uses the backend false answer")
+  S.text.TextOutput={"",false};S.events={};equal(R.Draw("ConfirmationDialogBox",p,I,box),false,"expired/closed model cannot remain as a blank source question")
+  equal(#actions("windows","ClickChild"),0)
+end)
+run("confirmation rejects missing mode controls or a visible unsupported Cancel",function()
+  local I=fixture();local p=confirmation();S.visibleChildren.Cancel_Button=true
+  equal(R.CanDraw(p,I,"ConfirmationDialogBox"),false)
+  S.visibleChildren.Cancel_Button=false;p.children[4]=nil;p.children[5]=nil
+  equal(R.testProductionCompatible("ConfirmationDialogBox",p,I),false)
+end)
+run("STML uses the real link-table contract and resets new questions to the top",function()
+  local I=fixture();local p=confirmation();S.stmlLink=true;S.scroll=150
+  check(R.Draw("ConfirmationDialogBox",p,I,box));equal(S.scroll,0)
+  local a=actions("windows","StmlLink")[1];equal(a[3],"ConfirmationDialogBox");equal(a[4],"TextOutput");equal(a[5],27);equal(a[6],"item:123")
+  S.stmlView.cum={1,2};S.stmlView.cumKey=13;S.text.TextOutput={"A different question",true};S.scroll=80
+  R.Draw("ConfirmationDialogBox",p,I,box);equal(S.scroll,0);equal(S.stmlView.cum,nil)
+end)
+run("STML draw failures restore child font and clipping before propagating",function()
+  local I=fixture();S.stmlError=true
+  local ok,why=pcall(R.Draw,"Test",plan(node("STMLbox","Description")),I,box)
+  equal(ok,false);check(why:find("synthetic STML draw failure",1,true));equal(S.children,0);equal(S.fonts,0);equal(S.clips,0)
+end)
+print(string.format("Lua renderer: %d cases, %d assertions passed",passed,assertions))

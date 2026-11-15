@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+dist/
+artifacts/
+.local/
+*.log
+*.png
+*.zip
+!/ui-pack-0.2.0-preview.1.zip

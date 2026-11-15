@@ -1,0 +1,106 @@
+{
+  "schema": 1,
+  "version": "0.2.0-preview.1",
+  "skins": [
+    {
+      "id": "default",
+      "label": "Default",
+      "source": "default"
+    },
+    {
+      "id": "default_old",
+      "label": "Default Old",
+      "source": "default_old"
+    },
+    {
+      "id": "aya-stock",
+      "label": "AYA",
+      "source": "aya-stock"
+    },
+    {
+      "id": "delta-stock",
+      "label": "Delta",
+      "source": "delta-stock"
+    },
+    {
+      "id": "drakah-pers-adeptus-stock",
+      "label": "Drakah Pers Adeptus",
+      "source": "drakah-pers-adeptus-stock"
+    },
+    {
+      "id": "DuxaUI-stock",
+      "label": "Duxa UI",
+      "source": "DuxaUI-stock"
+    },
+    {
+      "id": "Graphite-stock",
+      "label": "Graphite",
+      "source": "Graphite-stock"
+    },
+    {
+      "id": "ib-stock",
+      "label": "IB",
+      "source": "ib-stock"
+    },
+    {
+      "id": "lodidodi-stock",
+      "label": "Lodidodi",
+      "source": "lodidodi-stock"
+    },
+    {
+      "id": "Lords-stock",
+      "label": "Lords",
+      "source": "Lords-stock"
+    },
+    {
+      "id": "Nemesis-stock",
+      "label": "Nemesis",
+      "source": "Nemesis-stock"
+    },
+    {
+      "id": "po2-stock",
+      "label": "PO2",
+      "source": "po2-stock"
+    },
+    {
+      "id": "po2alt-stock",
+      "label": "PO2 Alternate",
+      "source": "po2alt-stock"
+    },
+    {
+      "id": "qqcustom-stock",
+      "label": "QQ Custom",
+      "source": "qqcustom-stock"
+    },
+    {
+      "id": "qqui-stock",
+      "label": "QQ UI",
+      "source": "qqui-stock"
+    },
+    {
+      "id": "sars-stock",
+      "label": "SARS",
+      "source": "sars-stock"
+    },
+    {
+      "id": "Sparxx-stock",
+      "label": "Sparxx",
+      "source": "Sparxx-stock"
+    },
+    {
+      "id": "Takus-stock",
+      "label": "Takus",
+      "source": "Takus-stock"
+    },
+    {
+      "id": "vert-stock",
+      "label": "Vert",
+      "source": "vert-stock"
+    },
+    {
+      "id": "wow-stock",
+      "label": "WoW",
+      "source": "wow-stock"
+    }
+  ]
+}
