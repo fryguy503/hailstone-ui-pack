@@ -16,8 +16,12 @@ RUNTIME = {"lib/pack_renderer.lua": "shared/renderer.lua",
            "lib/theme.lua": "shared/theme.lua",
            "lib/style.lua": "shared/style.lua",
            "lib/hud.lua": "shared/hud.lua",
+           "lib/layout.lua": "shared/layout.lua",
            "lib/pregame.lua": "shared/pregame.lua",
            "lib/pack_source_windows.lua": "shared/source_windows.lua",
+           "lib/pack_source_presenters.lua": "shared/source_presenters.lua",
+           "lib/pack_status_presenters.lua": "shared/status_presenters.lua",
+           "lib/pack_model_presenters.lua": "shared/model_presenters.lua",
            "menus.lua": "shared/menus.lua",
            "zz_pack.lua": "shared/bootstrap.lua"}
 

@@ -199,10 +199,21 @@ run("plugin-private helpers use shared Begin scope without borrowing root caches
   base.Dialog=base.Window
   local P={Begin=function(key)if S.failPregame then error("pregame failure")end;return UI.Begin(key,true,0)end,End=UI.End}
   local pluginUI=setmetatable({},{__index=UI,__newindex=function()error("plugin ui is read-only")end})
-  local plugin=env({ui=pluginUI,hs={UI={windows=strict({Shown=function()return not S.hiddenBase end},"windows"),
+  rootEnv.hailstone_skin_presenters={context=rootContext,owner="root"}
+  local plugin
+  plugin=env({ui=pluginUI,hs={UI={windows=strict({Shown=function()return not S.hiddenBase end},"windows"),
     interfaces=strict({LoadBase=function(path)if path=="lib/pregame.lua"then return P end;equal(path,"lib/hud.lua");return base end},"interfaces")}},
-    dofile=function(path)equal(path,"lib/pack_context.lua");return privateContext end},rootEnv)
+    dofile=function(path)
+      if path=="lib/pack_context.lua"then return privateContext end
+      if path=="lib/pack_source_presenters.lua"then return module("shared/source_presenters.lua",plugin)end
+      if path=="lib/pack_model_presenters.lua"then return module("shared/model_presenters.lua",plugin)end
+      if path=="lib/pack_status_presenters.lua"then error("No status controller installed in this fixture")end
+      error("Unexpected private helper: "..path)
+    end},rootEnv)
   local H=module("shared/hud.lua",plugin)
+  check(rawget(plugin,"hailstone_skin_presenters")~=rootEnv.hailstone_skin_presenters)
+  equal(rawget(plugin,"hailstone_skin_presenters").context,privateContext)
+  equal(module("shared/source_presenters.lua",plugin),rawget(plugin,"hailstone_skin_presenters"))
   local returned=table.pack(H.Window("CustomPlugin","Plugin HUD",{size=function()return 100,50 end},function()end))
   equal(returned.n,3);equal(returned[1],"preserved");equal(returned[2],nil);equal(returned[3],17)
   equal(paints,1);equal(#S.chrome,0,"root Begin does not duplicate private helper chrome")
@@ -249,7 +260,14 @@ local function hudFixture()
   local UI=strict({GetWindowPos=function()return 1,2 end,GetWindowSize=function()return 420,260 end,
     PushClipRect=function(...)S.clips=S.clips+1;S.clipCalls[#S.clipCalls+1]=table.pack(...)end,
     PopClipRect=function()S.clips=S.clips-1;check(S.clips>=0)end},"ui")
-  local environment=env({ui=UI,hs={UI=api},dofile=function(path)equal(path,"lib/pack_context.lua");return context end})
+  local environment
+  environment=env({ui=UI,hs={UI=api},dofile=function(path)
+    if path=="lib/pack_context.lua"then return context end
+    if path=="lib/pack_source_presenters.lua"then return module("shared/source_presenters.lua",environment)end
+    if path=="lib/pack_model_presenters.lua"then return module("shared/model_presenters.lua",environment)end
+    if path=="lib/pack_status_presenters.lua"then error("No status controller installed in this fixture")end
+    error("Unexpected helper: "..path)
+  end})
   local wrapped=module("shared/hud.lua",environment)
   local function body()S.bodies=S.bodies+1;return "functional body"end
   local function opts()return {size=function()return 180,90 end,resizable={150,75},onClose=function()end}end

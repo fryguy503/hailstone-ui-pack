@@ -9,8 +9,9 @@ base.Push = function(...)
   push(...)
   stack[#stack+1] = context.renderer.PushStyle(context.instance)
   local fonts=context.instance.style.fonts or {}
-  local normal=tonumber((fonts.byType or {}).Label) or 3
-  ui.PushFont(math.max(1,math.min(6,normal)))
+  local normal=tonumber(fonts.text or (fonts.byType or {}).Label) or 3
+  if normal<1 or normal>6 or normal%1~=0 then normal=3 end
+  ui.PushFont(normal)
 end
 base.Pop = function(...)
   local token = stack[#stack]

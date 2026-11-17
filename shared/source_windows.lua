@@ -10,6 +10,8 @@ for _,entry in ipairs(entries) do
   entry.options = {closable=entry.closable, size=function() return 260,72 end}
 end
 ui.window("Skin status windows", function()
+  local presenter=rawget(_G,"hailstone_skin_presenters")
+  if presenter and presenter.Frame then presenter.Frame() end
   if not API.session.InGame() then return end
   for _,entry in ipairs(entries) do
     if API.windows.Shown(entry.screen) then

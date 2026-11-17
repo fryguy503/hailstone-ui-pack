@@ -3,6 +3,39 @@
 local API = hs.UI
 local B = {}
 
+local function presenter(screen)
+  for _,key in ipairs({"hailstone_skin_status_presenters","hailstone_skin_presenters","hailstone_skin_model_presenters"}) do
+    local value=rawget(_G,key)
+    if value and value.Handles and value.Handles(screen) then return value end
+  end
+end
+
+function B.DrawControl(screen,node,box,instance,renderer)
+  local value=presenter(screen)
+  return value and value.DrawControl and value.DrawControl(screen,node,box,instance,renderer)==true or false
+end
+function B.AfterControl(screen,node,box,instance,renderer)
+  local value=presenter(screen)
+  if value and value.AfterControl then return value.AfterControl(screen,node,box,instance,renderer) end
+end
+
+function B.UseHostRect(screen,node)
+  -- Item-display model rectangles describe the built-in arrangement, not the selected source layout.
+  return false
+end
+function B.HotTarget(screen,node)
+  local source=type(node.eqType)=="string" and node.eqType or ""
+  local bar,button=source:match("^hotbutton/Bar (%d+)/(%d+)$")
+  bar,button=tonumber(bar),tonumber(button)
+  if bar and button and bar>=0 and bar<10 and button>=0 and button<12 then
+    return bar==0 and "HotButtonWnd" or "HotButtonWnd"..(bar+1),"HB_Button"..(button+1)
+  end
+  if (screen=="HotButtonWnd" or screen:match("^HotButtonWnd%d+$")) and tostring(node.name or ""):match("^HB_Button%d+$") then
+    local n=tonumber(node.name:match("(%d+)$"))
+    if n and n>=1 and n<=12 then return screen,node.name end
+  end
+end
+
 function B.Function(module, member)
   local t = API[module]
   if not t then return nil end
@@ -23,10 +56,17 @@ function B.State(screen, node)
   local fields = node.fields or {}
   if enabled == nil then enabled = fields.Enabled ~= false end
   if checked == nil then checked = fields.Checked == true end
+  local owner=presenter(screen)
+  if owner and owner.Enabled and owner.Enabled(screen,node)==false then enabled=false;action=false end
   return enabled, checked, value, count, action
 end
 
 function B.Shown(screen, node)
+  local owner=presenter(screen)
+  if owner and owner.Shown then
+    local result=owner.Shown(screen,node)
+    if result~=nil then return result end
+  end
   local shown = B.Call("windows", "ChildShown", screen, B.Id(node))
   if shown == nil then return (node.fields or {}).Visible ~= false end
   return shown ~= false
@@ -52,14 +92,22 @@ end
 
 function B.Gauge(screen, node)
   local fraction, text, r, g, b = B.Call("windows", "ChildGauge", screen, B.Id(node))
+  local raw
   if fraction == nil and tonumber(node.gaugeEqType or node.eqType) then
-    local unused
-    fraction, text, unused, r, g, b = B.Call("character", "Gauge", tonumber(node.gaugeEqType or node.eqType))
+    fraction, text, raw, r, g, b = B.Call("character", "Gauge", tonumber(node.gaugeEqType or node.eqType))
   end
-  return fraction or 0, text or "", r and {r, g, b, 1} or nil
+  -- The host already converts special negative bands to their actual fill/tint.
+  -- Only -1 means the gauge must draw nothing, including its track and caption.
+  if raw == -1 then return nil, text or "", nil, raw end
+  return fraction or 0, text or "", r and {r, g, b, 1} or nil, raw
 end
 
 function B.Click(screen, node, phase, outside)
+  local owner=presenter(screen)
+  if owner and owner.Click then
+    local handled=owner.Click(screen,node,phase,outside)
+    if handled~=nil then return handled end
+  end
   return B.Call("windows", "ClickChild", screen, B.Id(node), phase or "left", outside == true)
 end
 
@@ -79,6 +127,11 @@ function B.InventorySlot(value)
 end
 
 function B.Item(screen, node)
+  local owner=presenter(screen)
+  if owner and owner.Item then
+    local handled,item=owner.Item(screen,node)
+    if handled then return item end
+  end
   local item = B.Call("inventory", "SlotItem", screen, B.Id(node))
   if item then return item end
   local slot=B.InventorySlot(node.slot)
@@ -88,6 +141,11 @@ function B.Item(screen, node)
 end
 
 function B.ItemClick(screen, node, phase, outside)
+  local owner=presenter(screen)
+  if owner and owner.ItemClick then
+    local handled=owner.ItemClick(screen,node,phase,outside)
+    if handled~=nil then return handled end
+  end
   local slot=B.InventorySlot(node.slot)
   if screen == "InventoryWindow" and slot then
     return B.Call("inventory", "ClickSlot", slot, nil, phase, outside == true)
@@ -107,7 +165,9 @@ end
 
 function B.Drag(screen, node, row)
   if ui.IsItemActive() and ui.IsMouseDragging(ui.Mouse.Left) and not B.Call("cursor", "HoldingButton") then
-    return B.Call("cursor", "PickUp", screen, B.Id(node), row)
+    local target,child
+    if node.type=="HotButton" then target,child=B.HotTarget(screen,node) end
+    return B.Call("cursor", "PickUp", target or screen, child or B.Id(node), row~=nil and row+1 or nil)
   end
   return false
 end
@@ -153,6 +213,8 @@ local containers={Screen=true,Page=true,LayoutBox=true,HorizontalLayoutBox=true,
 local statics={StaticAnimation=true,StaticTintedBlendAnimation=true,StaticFrame=true,StaticText=true,StaticHeader=true}
 
 function B.Compatible(screen, plan, instance)
+  local value=presenter(screen)
+  if value and value.CanDraw then return value.CanDraw(screen,plan,instance) end
   local audit=audits[screen]
   if not audit then return false,"Behavior adapter not audited for "..tostring(screen) end
   if not B.Function("character","Gauge") or not B.Function("character","Label") then
@@ -228,12 +290,16 @@ function B.Compatible(screen, plan, instance)
 end
 
 function B.Events(screen,node)
+  local value=presenter(screen)
+  if value and value.Events then return value.Events(screen,node) end
   local audit=audits[screen]
   local rule=audit and (audit.controls or {})[B.Id(node)]
   return rule and rule.click
 end
 
 function B.Input(screen,node)
+  local value=presenter(screen)
+  if value and value.Input then return value.Input(screen,node) end
   local audit=audits[screen]
   return audit and (audit.controls or {})[B.Id(node)]
 end

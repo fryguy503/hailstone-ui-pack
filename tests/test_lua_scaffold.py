@@ -65,7 +65,7 @@ class LuaScaffoldTests(unittest.TestCase):
             _, archive = packager.package("0.2.0-preview.1", root / "output", root)
             with zipfile.ZipFile(archive) as z:
                 self.assertIsNone(z.testzip())
-                self.assertEqual(len(z.namelist()), 241)
+                self.assertEqual(len(z.namelist()), 1 + 20 * (2 + len(packager.RUNTIME)))
                 self.assertIn("ui/default/lib/pack_renderer.lua", z.namelist())
                 self.assertIn("ui/default/zz_pack.lua", z.namelist())
                 self.assertNotIn("ui/default/lib/compiled/index.lua", z.namelist())

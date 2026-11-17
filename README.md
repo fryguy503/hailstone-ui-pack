@@ -16,18 +16,31 @@ The installer reads the player's source layouts once and compiles them to Lua
 presentation data. The client loads Lua only; it does not load XML interfaces.
 Actions and state use the standard `hs.UI` API.
 
-Audited compatible windows use their compiled source layouts and control artwork.
-Other client windows retain their complete built-in behavior, including inventory,
-buff menus, chat links, maps, tasks and confirmations. Selected frames, colors,
-fonts, icons and control styling also apply to newer windows and addon windows.
+Source presenters use the compiled control geometry for inventory, player,
+target, group, chat, hotbars, item displays, buffs, spell gems and extended
+targets, alongside the audited dialogs and status windows. Frames retain their
+independent corners and edge artwork; captions reserve readable space for the
+selected font. Source controls call the host's item, chat, spell and window
+services rather than imitating game state.
+
+Additional client features remain reachable through **Client tools...** in a
+source window's context menu. Windows without a compatible source presenter keep
+their working built-in body with selected frames, fonts and control artwork.
 Custom skins inherit missing layout data from Default and functionality from Modern.
 
-This remains a preview. Audited source bodies cover air, casting, aggro, auras,
-respawn, text prompts and confirmations. Other gameplay windows retain the client's
-layouts with selected source frames and styling. Full original layout parity is
-not complete. Automated checks do not establish every live interaction. Missing
-original AYA and Duxa art uses a coordinated fallback
-and is reported explicitly. See [validation](docs/validation.md) and
+First-use HUD placement prefers the source coordinates and moves unsaved windows
+to reduce collisions while keeping their computed size and orientation. Saved
+window moves take precedence. Small viewports may still require manual adjustment.
+Existing saved sizes also take precedence. Use the frame menu's **Reset size**
+to restore a skin's source dimensions, or **Reset position** for its initial placement.
+
+This remains a preview. Revised gameplay layouts need fresh visual and interaction
+acceptance; earlier login captures do not establish source-body fidelity. Full
+original pixel parity is not claimed. The host does not expose an inventory
+character-render texture, so the source character-preview area has no fabricated
+portrait. Missing original artwork uses diagnosed, coordinated fallbacks where
+available; compatible shared resources are identified separately from originals.
+See [validation](docs/validation.md) and
 [acceptance](docs/acceptance.md).
 
 ## Install
@@ -61,7 +74,7 @@ python tools/install.py --client-dir "C:\HailstoneData" --runtime-only
 
 ## Portable addon and local data
 
-The root manifest and `ui-pack-0.2.0-preview.1.zip` contain original Lua code and
+The root manifest and `ui-pack-0.2.0-preview.2.zip` contain original Lua code and
 descriptors only. Installing them registers the entries; source compilation is
 still required before loading. Source layouts, compiled player data, artwork,
 accounts and settings are excluded from the public repository and archive.
@@ -85,7 +98,9 @@ python tools/preview_matrix.py --client "C:\Hailstone\hailstone.exe" --game-dir 
 ```
 
 Each capture uses neutral settings and a fresh UI-only registry. It does not copy
-accounts or personal settings. See [Windows test packaging](docs/windows-preview-package.md).
+accounts or personal settings. These are login-only previews. Gameplay layout
+review requires populated window models and separate captures; it must not be
+inferred from this command. See [Windows test packaging](docs/windows-preview-package.md).
 
 ## License
 

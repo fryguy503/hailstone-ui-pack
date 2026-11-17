@@ -18,7 +18,11 @@ local function apiModule(name,methods)
   api[name]=setmetatable(methods,{__index=function(_,key) error("Unregistered API "..name.."."..key) end})
 end
 api.Supports=function(module,member) return api[module]~=nil and (not member or rawget(api[module],member)~=nil) end
-apiModule("assets",{Image=function(path) record("asset",path);if path:find("missing",1,true) then return nil end;return S.imageHandle or "tex:"..path,64,32 end,
+apiModule("assets",{Image=function(path) record("asset",path)
+  if S.assetInfo and S.assetInfo[path]~=nil then
+    local v=S.assetInfo[path];if v==false then return nil end;return table.unpack(v)
+  end
+  if path:find("missing",1,true) then return nil end;return S.imageHandle or "tex:"..path,64,32 end,
   ItemIcon=function(id)return "icon:"..id,0,0,1,1 end})
 apiModule("interfaces",{
  LoadBase=function()error("Compiled layouts must not use the code-base loader")end,
@@ -57,7 +61,11 @@ apiModule("windows",{
  Replace=function()return S.shown~=false,20,30,200,100,false,false end,
  Title=function()return "Test"end,Show=function(...)action("windows","Show",...)end,Placed=function(...)action("windows","Placed",...)end,
 })
-apiModule("character",{Label=function(n)return "Label"..n end,Gauge=function()return S.air or 0.25,""end})
+apiModule("character",{Label=function(n)return "Label"..n end,Gauge=function()
+  if S.unavailableGauge then return nil,"Hidden",-1 end
+  if S.specialGauge then return 1,"Special",-2,0.5,0,0 end
+  return S.air or 0.25,""
+end})
 apiModule("inventory",{SlotItem=function()return S.item end,Item=function(slot)record("itemLookup",slot);return S.inventoryItem or S.item end,
  ClickSlot=function(...)action("inventory","ClickSlot",...);return S.leftMade or false end})
 apiModule("cursor",{HoldingButton=function()return S.holdingButton end,PickUp=function(...)action("cursor","PickUp",...);S.holdingButton=S.pickupMade;return S.pickupMade or false end})
@@ -289,11 +297,34 @@ run("dynamic static artwork hides replaces and draws live atlas cells",function(
   S.draws={};S.art["Indicator:decal"]=table.pack("MissingDynamicState");R.Draw("Test",p,I,box)
   equal(#S.draws,0,"missing new state must not freeze the previous authored state");check(#R.Diagnostics(I)>0)
 end)
-run("host underlay ordering is stable and live child geometry wins",function()
+run("host underlay ordering preserves authored child geometry",function()
   local I=fixture();S.under.B=true;S.rects.A={12,14,30,16,true,6,8}
   R.Draw("Test",plan(node("Label","A"),node("Label","B"),node("Label","C")),I,box)
   equal(S.texts[1][7],"B");equal(S.texts[2][7],"A");equal(S.texts[3][7],"C")
-  equal(S.texts[2][1],22);equal(S.texts[2][2],34)
+  equal(S.texts[2][1],10);equal(S.texts[2][2],20)
+end)
+run("only an explicit dynamic adapter may borrow host child geometry",function()
+  local I=fixture();S.rects.A={12,14,30,16,true,6,8}
+  local original=R.Bindings.UseHostRect
+  R.Bindings.UseHostRect=function(screen,n) return screen=="Test" and n.name=="A" end
+  R.Draw("Test",plan(node("Label","A")),I,box)
+  R.Bindings.UseHostRect=original
+  equal(S.texts[1][1],22);equal(S.texts[1][2],34)
+end)
+run("custom source drawing requires a presenter preflight",function()
+  local I=fixture();local p=plan(node("Button","Unsupported"))
+  local events=#S.events
+  equal(R.Draw("Test",p,I,box,true),false)
+  local called=0
+  local denied={CanDraw=function()called=called+1;return false,"data unavailable" end}
+  local ok,why=R.Draw("Test",p,I,box,denied)
+  equal(ok,false);equal(why,"data unavailable");equal(called,1);equal(#S.events,events)
+end)
+run("paint-only source controls never register input or actions",function()
+  local I=fixture();local n=node("Button","Paint")
+  R.PaintControl("Test",n,box,I,{caption="Paint only",hovered=true})
+  for _,event in ipairs(S.events)do check(event.kind~="hit" and event.kind~="action") end
+  equal(S.texts[#S.texts][7],"Paint only")
 end)
 run("frame side-only templates retain source cap dimensions",function()
   local I,index=artFixture();index.templates.F={fields={Left="A",Middle="B",Right="C"}}
@@ -355,6 +386,57 @@ run("theme buttons retain the inherited overlap-aware hit function",function()
   local I=fixture();local calls=0;local T={Hit=function(id,x0,y0,x1,y1)calls=calls+1;equal(id,"KeepHit");return true end}
   local original=T.Hit;R.StyleTheme(T,I);check(T.Button("KeepHit",0,0,80,20,1,"Action",{}));equal(calls,1);equal(T.Hit,original)
 end)
+run("hotbuttons distinguish a quick right release from one held activation",function()
+  local I=fixture();local p=plan(node("HotButton","HB_Button1"))
+  S.mouse[1]={["##hot:HB_Button1"]=true};S.down[1]=true
+  R.Draw("HotButtonWnd2",p,I,box);equal(#actions("hotbars","Click"),0)
+  S.mouse={};S.time=0.1;S.down[1]=false;S.released[1]=true
+  R.Draw("HotButtonWnd2",p,I,box)
+  local a=actions("hotbars","Click");equal(#a,1);equal(a[1][5],"right")
+  S.events={};S.released={};S.mouse[1]={["##hot:HB_Button1"]=true};S.down[1]=true;S.time=1
+  R.Draw("HotButtonWnd2",p,I,box);S.mouse={};S.time=1.6;R.Draw("HotButtonWnd2",p,I,box)
+  S.time=1.8;R.Draw("HotButtonWnd2",p,I,box)
+  S.down[1]=false;S.released[1]=true;R.Draw("HotButtonWnd2",p,I,box)
+  a=actions("hotbars","Click");equal(#a,1);equal(a[1][5],"rightheld")
+end)
+run("hotbuttons keep icon tint cooldown direction and mapped key text",function()
+  local I=fixture();local p=plan(node("HotButton","HB_Button1",0,0,40,40))
+  local tex={};S.hotInfo={tex=tex,tint={0.2,0.3,0.4,0.5},cooldown=0.25,overlay="7"}
+  S.text.HB_Button1={"Ctrl+1",true};R.Draw("HotButtonWnd2",p,I,box)
+  local drawn;for _,v in ipairs(S.draws) do if v[1]==tex then drawn=v end end
+  check(drawn);equal(drawn[10],0.2);equal(drawn[11],0.3);equal(drawn[12],0.4);equal(drawn[13],0.5)
+  local cooldown=false;for _,e in ipairs(S.events) do
+    if e.kind=="fill" and e.args[2]==30 and e.args[4]==60 then cooldown=true end
+  end
+  check(cooldown,"cooldown covers the bottom 75 percent")
+  local key=false;for _,v in ipairs(S.texts) do if v[7]=="Ctrl+1" then key=true end end
+  check(key,"configured hotkey caption survives source presentation")
+end)
+run("per-instance authored hotbar layouts resolve before the shared family",function()
+  local generic,specific=plan(node("Button","Wide")),plan(node("Button","Tall"))
+  local a,b="lib/compiled/windows/generic.lua","lib/compiled/windows/specific.lua"
+  local I=fixture({version=2,windows={HotButtonWnd=a,HotButtonWnd2=b}})
+  files[a]=generic;files[b]=specific
+  equal(R.Resolve("HotButtonWnd2",I),specific);equal(R.Resolve("HotButtonWnd3",I),generic)
+end)
+run("after-control enrichment stays clipped and unwinds failures",function()
+  local I=fixture();local previous=R.Bindings.AfterControl
+  R.Bindings.AfterControl=function(screen,n,b,owner,renderer)
+    equal(screen,"Test");equal(n.name,"Slot");equal(owner,I);equal(renderer,R);check(S.clips>0)
+    error("enrichment failure")
+  end
+  local ok,why=pcall(R.Draw,"Test",plan(node("InvSlot","Slot")),I,box)
+  R.Bindings.AfterControl=previous
+  equal(ok,false);check(why:find("enrichment failure",1,true));equal(S.clips,0)
+end)
+run("unavailable native gauges paint nothing while special bands retain fill",function()
+  local I=fixture();local g=node("Gauge","Missing");g.gaugeEqType=16;S.noChildGauge=true;S.unavailableGauge=true
+  R.Draw("Test",plan(g),I,box);equal(#S.draws,0);equal(#S.texts,0)
+  for _,e in ipairs(S.events) do check(e.kind~="fill" and e.kind~="border","unavailable track must remain hidden") end
+  S.unavailableGauge=false;S.specialGauge=true;S.events={};R.Draw("Test",plan(g),I,box)
+  local painted=false;for _,e in ipairs(S.events) do if e.kind=="fill" and e.args[5]==0.5 then painted=true end end
+  check(painted,"native special negative values already supply a visible fill")
+end)
 run("gauge offsets caps fill lines and caption use source geometry",function()
   local I,index=artFixture();index.templates.G={fields={Background="A",Fill="B",Lines="C",LinesFill="D",EndCapLeft="E",EndCapRight="F"}}
   local gauge=node("Gauge","HP",0,0,100,30,{GaugeOffsetX=3,GaugeOffsetY=16,TextOffsetX=7,TextOffsetY=2,DrawLinesFill=true})
@@ -375,8 +457,18 @@ run("tile flow wraps and honors reverse source anchors",function()
   flow.children={node("Button","A",0,0,40,20),node("Button","B",0,0,90,90),node("Button","C",0,0,12,10)}
   R.Draw("Test",plan(flow),I,box)
   local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[#hits+1]=e.args end end
-  equal(hits[1][2],70);equal(hits[1][3],70);equal(hits[2][2],25)
+  equal(#hits,3,"the first real gem or buff remains visible")
+  equal(hits[1][1],"##pack:A");equal(hits[1][2],70);equal(hits[1][3],70);equal(hits[2][2],25)
   equal(hits[2][4],40);equal(hits[3][2],70);equal(hits[3][3],43)
+end)
+run("explicitly hidden prototypes still supply cell size without occupying space",function()
+  local I=fixture();local flow=node("TileLayoutBox","Tiles",0,0,100,70,{Spacing=5,FirstPieceTemplate=true})
+  flow.children={node("Button","Prototype",0,0,40,20),node("Button","A",0,0,90,90),node("Button","B",0,0,12,10)}
+  S.visibleChildren.Prototype=false
+  R.Draw("Test",plan(flow),I,box)
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[#hits+1]=e.args end end
+  equal(#hits,2);equal(hits[1][1],"##pack:A");equal(hits[1][2],10);equal(hits[1][4],40)
+  equal(hits[2][2],55);equal(hits[2][4],40)
 end)
 run("source layout strategies use padding and fail before unsupported parent resizing",function()
   local I,index=fixture();index.templates.Flow={type="LayoutVertical",fields={Padding=3}}
@@ -659,5 +751,228 @@ run("STML draw failures restore child font and clipping before propagating",func
   local I=fixture();S.stmlError=true
   local ok,why=pcall(R.Draw,"Test",plan(node("STMLbox","Description")),I,box)
   equal(ok,false);check(why:find("synthetic STML draw failure",1,true));equal(S.children,0);equal(S.fonts,0);equal(S.clips,0)
+end)
+run("named vertical strategy retains anchor-sized zero-Size gem containers",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Vertical={type="LayoutVertical",fields={Padding=2,ResizeHorizontal=true,ResizeVertical=true}}}})
+  local root=plan();root.fields.Layout="Vertical"
+  local tile=node("TileLayoutBox","Gems",0,0,0,0,{AutoStretch=true,Spacing=2,SecondarySpacing=2,HorizontalFirst=true,FirstPieceTemplate=true})
+  tile.anchors={leftToLeft=true,rightToLeft=false,topToTop=true,bottomToTop=false,explicit={}}
+  tile.children={node("Button","Gem0",0,0,20,10),node("Button","Gem1",0,0,20,10),node("Button","Gem2",0,0,20,10)}
+  root.children={tile}
+  local at={x=10,y=20,w=100,h=60,s=1}
+  local w,h=R.MeasureChildren("Test",root,I,at);equal(w,98);equal(h,58)
+  R.DrawChildren("Test",root,I,at)
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[e.args[1]]=e.args end end
+  equal(hits["##pack:Gem0"][2],12);equal(hits["##pack:Gem0"][3],22)
+  equal(hits["##pack:Gem1"][2],34);equal(hits["##pack:Gem2"][2],56)
+  equal(hits["##pack:Gem0"][4],20);equal(hits["##pack:Gem0"][5],10)
+  equal(tile.rect.w,0,"source geometry is not rewritten");equal(tile.rect.h,0)
+end)
+run("named strategies resize requested axes and retain excluded anchored children",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Horizontal={type="LayoutHorizontal",fields={Padding=2,ResizeHorizontal=false,ResizeVertical=true}}}})
+  local root=plan();root.fields={Layout="Horizontal",Spacing=4}
+  root.children={node("Button","A",0,0,30,10,{AutoStretchVertical=true}),node("Button","B",0,0,40,20),
+    node("Button","OutsideFlow",1,3,8,9,{UseInLayoutHorizontal=false})}
+  R.DrawChildren("Test",root,I,{x=10,y=20,w=100,h=60,s=1})
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[e.args[1]]=e.args end end
+  equal(hits["##pack:A"][2],12);equal(hits["##pack:A"][3],22);equal(hits["##pack:A"][4],30);equal(hits["##pack:A"][5],56)
+  equal(hits["##pack:B"][2],46);equal(hits["##pack:B"][5],20,"fixed child height is retained")
+  equal(hits["##pack:OutsideFlow"][2],11);equal(hits["##pack:OutsideFlow"][3],23)
+  S.events={};I.index.templates.Horizontal.fields.ResizeVertical=false
+  R.DrawChildren("Test",root,I,{x=10,y=20,w=100,h=60,s=1})
+  for _,e in ipairs(S.events)do if e.kind=="hit"and e.args[1]=="##pack:A"then equal(e.args[5],10,"disabled resize axis keeps authored height")end end
+end)
+run("named vertical strategy shares only its remaining span among stretch children",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Vertical={type="LayoutVertical",fields={Padding=2,ResizeHorizontal=true,ResizeVertical=true}}}})
+  local root=plan();root.fields={Layout="Vertical",Spacing=4}
+  root.children={node("Button","A",0,0,0,0,{AutoStretch=true}),node("Button","B",0,0,0,0,{AutoStretch=true}),node("Button","Fixed",0,0,30,10)}
+  R.DrawChildren("Test",root,I,{x=10,y=20,w=100,h=80,s=1})
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[e.args[1]]=e.args end end
+  equal(hits["##pack:A"][5],29);equal(hits["##pack:B"][5],29)
+  equal(hits["##pack:A"][4],96);equal(hits["##pack:Fixed"][4],30)
+  equal(hits["##pack:B"][3],55);equal(hits["##pack:Fixed"][3],88)
+end)
+run("source gauge caption offsets retain the enclosing client clip",function()
+  local I=fixture();S.text={}
+  local g=node("Gauge","OffsetGauge",20,25,90,18,{TextOffsetX=-3,TextOffsetY=-2})
+  R.Draw("Test",plan(g),I,box)
+  local clip
+  for _,e in ipairs(S.events) do
+    if e.kind=="clip" and e.args[1]==27 and e.args[2]==43 then clip=e.args;break end
+  end
+  check(clip,"the logical gauge clip must include the negative caption offset")
+  equal(clip[3],120);equal(clip[4],63);equal(clip[5],true,"parent window clipping remains authoritative")
+end)
+run("source gauges retain authored caption color independently of fill tint",function()
+  local I=fixture();local g=node("Gauge","ColoredGauge")
+  g.colors.TextColor={0,0,0,1};g.colors.FillTint={0,1,0,1}
+  R.Draw("Test",plan(g),I,box)
+  equal(#S.texts,1);equal(S.texts[1][3],0);equal(S.texts[1][4],0);equal(S.texts[1][5],0)
+  equal(S.texts[1][7],"50%")
+end)
+run("inherited inventory gestures can select per-cell source artwork without creating input",function()
+  local I=artFixture();local T={};R.StyleTheme(T,I)
+  local n=node("InvSlot","SourceEar");n.art.background="A";I.sourceSlotNode=n
+  T.Icon(10,20,40,1,nil,0,0,1,1,nil,{wellAlpha=1})
+  equal(#S.draws,1);equal(S.draws[1][6],0);equal(S.draws[1][8],8/64)
+  for _,e in ipairs(S.events)do check(e.kind~="hit" and e.kind~="action","visual scope cannot consume inventory input")end
+  I.sourceSlotNode=nil
+end)
+run("embedded source hotbuttons use their declared canonical bar for actions and drags",function()
+  local I=fixture();local old=R.Bindings.HotTarget
+  R.Bindings.HotTarget=function(screen,n)equal(screen,"Test");equal(n.name,"Embedded");return "HotButtonWnd9","HB_Button2" end
+  S.click["##hot:Embedded"]=true
+  local ok,why=pcall(R.Draw,"Test",plan(node("HotButton","Embedded")),I,box)
+  R.Bindings.HotTarget=old;check(ok,why)
+  local a=actions("hotbars","Click");equal(#a,1);equal(a[1][3],"HotButtonWnd9");equal(a[1][4],"HB_Button2")
+  R.Bindings.HotTarget=function()return "HotButtonWnd9","HB_Button2" end
+  S.events={};S.click={};S.active["##hot:Embedded"]=true;S.drag=true;S.pickupMade=true
+  ok,why=pcall(R.Draw,"Test",plan(node("HotButton","Embedded")),I,box)
+  R.Bindings.HotTarget=old;check(ok,why)
+  a=actions("cursor","PickUp");equal(#a,1);equal(a[1][3],"HotButtonWnd9");equal(a[1][4],"HB_Button2")
+  equal(#actions("hotbars","Click"),0)
+end)
+run("decorative nested screens paint their own template while clipping masks stay bare",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Inner={type="WindowDrawTemplate",fields={}}}})
+  local previous=R.WindowChrome;local calls={}
+  R.WindowChrome=function(n,title,at,owner,opts)
+    calls[#calls+1]={node=n,title=title,at=at,owner=owner,opts=opts}
+    check(S.clips>0,"nested chrome stays inside the source parent clip")
+  end
+  local panel=node("Screen","InnerPanel",5,6,80,50,{Style_Border=true,Style_Transparent=false})
+  panel.art.drawTemplate="Inner";panel.children={node("Label","Child",0,0,30,12)}
+  local mask=node("Screen","GaugeMask",90,0,25,10,{Style_Border=false,Style_Transparent=true})
+  mask.art.drawTemplate="Inner";mask.children={node("Gauge","Oversized",0,0,8000,8)}
+  local unstyled=node("Screen","LayoutOnly",0,70,30,12,{Style_Border=true})
+  R.DrawChildren("Test",plan(panel,mask,unstyled),I,box)
+  equal(#calls,1);equal(calls[1].node.name,"InnerPanel");equal(calls[1].node.art.drawTemplate,"Inner")
+  equal(calls[1].at.x,15);equal(calls[1].at.y,26);equal(calls[1].opts.close,false)
+  equal(mask.rect.w,25);equal(mask.children[1].rect.w,8000,"mask geometry remains authored")
+  S.events={};calls={};panel.fields.Style_Transparent=true
+  R.DrawChildren("Test",plan(panel),I,box)
+  equal(#calls,1,"transparent background can still have its authored border")
+  equal(calls[1].node.fields.Style_Transparent,true);equal(calls[1].node.fields.Style_Border,true)
+  R.WindowChrome=previous
+end)
+run("selected source pages paint once before their children without changing tab actions",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Inner={type="WindowDrawTemplate",fields={}}}})
+  local previous=R.WindowChrome;local count=0
+  R.WindowChrome=function()count=count+1 end
+  local page=node("Page","Page",0,0,100,80,{Style_Border=true,Style_Transparent=true})
+  page.art.drawTemplate="Inner";page.children={node("Label","Child",2,3,30,12)}
+  local tab=node("TabBox","Tabs",0,0,100,100);tab.children={page}
+  R.DrawChildren("Test",plan(tab),I,box);equal(count,1)
+  count=0;R.DrawChildren("Test",page,I,box);equal(count,1)
+  equal(#actions("windows","SetTabPage"),0,"painting never selects a page")
+  R.WindowChrome=previous
+end)
+run("opaque nested window backgrounds underlay target siblings and paint only once",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Inner={type="WindowDrawTemplate",fields={Background="opaque.tga"}}}})
+  local prior=R.WindowChrome;local painted=0;local textCount
+  R.WindowChrome=function()painted=painted+1;textCount=#S.texts;record("nested-background")end
+  local label=node("Label","TargetName",3,0,108,14);label.text="Guard Bob"
+  local container=node("Screen","BuffWindow",0,0,0,0,{Style_Border=false,Style_Titlebar=false,Style_Transparent=false})
+  container.art.drawTemplate="Inner"
+  container.anchors={rightToLeft=false,bottomToTop=false,explicit={left=true,top=true,right=true,bottom=true}}
+  container.children={node("Button","Buff0",0,30,24,24)}
+  R.DrawChildren("Test",plan(label,container),I,box)
+  equal(painted,1,"the source background is retained without a second foreground repaint")
+  equal(textCount,0,"the opaque background is painted before preceding source labels")
+  local found=false;for _,t in ipairs(S.texts)do if t[7]=="Guard Bob"then found=true end end
+  check(found,"target label retains its authored text")
+  local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[#hits+1]=e.args[1]end end
+  equal(hits[1],"##pack:Buff0","container inputs and children retain their source order")
+  R.WindowChrome=prior
+end)
+run("nested chrome underlay failures restore clipping and leave source geometry unchanged",function()
+  local I=fixture({version=2,windows={},images={},animations={},templates={Inner={type="WindowDrawTemplate",fields={}}}})
+  local prior=R.WindowChrome;local p=node("Screen","Panel",4,5,60,20,{Style_Border=true})
+  p.art.drawTemplate="Inner";R.WindowChrome=function()error("synthetic chrome failure")end
+  local ok,why=pcall(R.DrawChildren,"Test",plan(p),I,box)
+  R.WindowChrome=prior
+  equal(ok,false);check(tostring(why):find("synthetic chrome failure",1,true)~=nil)
+  equal(S.clips,0);equal(p.rect.x,4);equal(p.paintedChromeNode,nil,"paint bookkeeping stays on ephemeral rectangles")
+  R.DrawChildren("Test",plan(p),I,box)
+end)
+run("presenter coverage uses anchored geometry and parent clips without drawing or actions",function()
+  local I=fixture();local anchored=node("SpellGem","Anchored",0,0,0,0)
+  anchored.anchors={leftToLeft=true,topToTop=true,rightToLeft=false,bottomToTop=false,
+    explicit={left=true,top=true,right=true,bottom=true}}
+  local panel=node("Screen","Clip",50,0,20,20)
+  panel.children={node("Button","Outside",30,0,10,10),node("Gauge","Long",15,0,8000,8)}
+  local root=plan(anchored,node("Button","Zero",0,0,0,0),node("Button","Hidden"),panel)
+  local seen={};R.VisitChildren("Test",root,I,{x=0,y=0,w=100,h=80,s=1},function(n,r,v)seen[n.name]={r,v}end)
+  equal(seen.Anchored[1].w,100);equal(seen.Anchored[1].h,80)
+  equal(seen.Zero,nil);equal(seen.Hidden,nil);equal(seen.Outside,nil)
+  equal(seen.Long[1].w,8000);equal(seen.Long[2].w,5,"intrinsic width cannot escape its clipping parent")
+  equal(#S.draws,0);equal(#S.texts,0)
+  for _,e in ipairs(S.events)do check(e.kind~="hit"and e.kind~="action","coverage traversal is read only")end
+end)
+run("presenter coverage may include reachable inactive pages without changing selected tabs",function()
+  local I=fixture();local a=node("Page","PageA");a.children={node("Button","SlotA",0,0,20,12)}
+  local b=node("Page","PageB");b.children={node("Button","SlotB",0,0,20,12)}
+  local tabs=node("TabBox","Tabs",0,0,80,60);tabs.children={a,b}
+  local root=plan(tabs);local selected={}
+  R.VisitChildren("Test",root,I,box,function(n)selected[n.name]=true end)
+  check(selected.SlotA);equal(selected.SlotB,nil)
+  local all={};R.VisitChildren("Test",root,I,box,function(n)all[n.name]=true end,{allPages=true})
+  check(all.SlotA and all.SlotB);equal(#actions("windows","SetTabPage"),0);equal(#S.draws,0)
+end)
+run("noninteger scaled exact-fit tiles keep five pieces per row or column",function()
+  local scale=1.5*((720-12*1.5)/(550*1.5))
+  for _,horizontal in ipairs{true,false}do
+    local I=fixture();local tile=node("TileLayoutBox","ExactFit",0,0,200,200,
+      {HorizontalFirst=horizontal,Spacing=0,SecondarySpacing=0})
+    for n=1,6 do tile.children[n]=node("Button","Piece"..n,0,0,40,40)end
+    -- Resolve a 200-design-pixel region against the far edge of a larger
+    -- parent, just like a right/bottom anchored inventory tile. Subtraction
+    -- introduces a different rounding path than multiplying each 40px piece.
+    tile.rect.w,tile.rect.h=horizontal and 200 or 120,horizontal and 120 or 200
+    tile.anchors=horizontal and{leftToLeft=false,left=200,rightToLeft=false,right=0,explicit={left=true,right=true}}
+      or{topToTop=false,top=200,bottomToTop=false,bottom=0,explicit={top=true,bottom=true}}
+    local at=R.Geometry(tile,{x=0,y=0,w=520*scale,h=520*scale,s=scale})
+    S.events={};R.DrawChildren("Test",tile,I,at)
+    local hits={};for _,e in ipairs(S.events)do if e.kind=="hit"then hits[e.args[1]]=e.args end end
+    local axis=horizontal and 3 or 2
+    local start=horizontal and at.y or at.x
+    equal(hits["##pack:Piece5"][axis],start,"the fifth piece exactly fits the first span")
+    equal(hits["##pack:Piece6"][axis],start+40*scale,"the sixth piece starts the next span")
+    local seen={};R.VisitChildren("Test",tile,I,at,function(n,r)seen[n.name]=r end)
+    equal(horizontal and seen.Piece5.y or seen.Piece5.x,start)
+    equal(horizontal and seen.Piece6.y or seen.Piece6.x,start+40*scale,"paint and coverage share the exact-fit decision")
+    -- A real subpixel deficit is much larger than the arithmetic error bound.
+    if horizontal then at.w=at.w-0.0000001 else at.h=at.h-0.0000001 end
+    seen={};R.VisitChildren("Test",tile,I,at,function(n,r)seen[n.name]=r end)
+    equal(horizontal and seen.Piece5.y or seen.Piece5.x,start+40*scale,"genuine overflow still wraps")
+  end
+end)
+run("verified shared artwork is used only when its selected original is missing",function()
+  for _,entry in ipairs({
+    {"uifiles/qqcustom-stock/CS_Buttons.bmp","uifiles/qqui-stock/CS_Buttons.bmp",256,256,4,4,124,20},
+    {"uifiles/qqui-stock/Buff_Background.tga","uifiles/DuxaUI-stock/Buff_Background.tga",64,128,1,1,24,124},
+  })do
+    local original,shared,w,h=table.unpack(entry)
+    local I=fixture({version=2,windows={},images={Sheet={path=original}},animations={Shared={frames={{image="Sheet",rect={x=entry[5],y=entry[6],w=entry[7],h=entry[8]}}}}}})
+    S.assetInfo={[original]=false,[shared]={"shared",w,h}};S.draws={}
+    check(R.Animation(I,"Shared",box));equal(S.draws[1][1],"shared");equal(S.draws[1][6],entry[5]/w)
+    local reported=false;for _,message in ipairs(R.Diagnostics(I))do if message:find("compatible shared artwork",1,true)then reported=true end end
+    check(reported,"fallback provenance remains explicit")
+    S.frame=S.frame+1;S.assetInfo[original]={"original",w,h};S.events={};S.draws={}
+    check(R.Animation(I,"Shared",box));equal(S.draws[1][1],"original")
+    for _,event in ipairs(S.events)do if event.kind=="asset"then equal(event.args[1],original,"recovered originals take precedence")end end
+  end
+end)
+run("shared artwork with incompatible dimensions never substitutes a sheet",function()
+  local original,shared="uifiles/qqcustom-stock/CS_Buttons.bmp","uifiles/qqui-stock/CS_Buttons.bmp"
+  local I=fixture({version=2,windows={},images={Sheet={path=original}}})
+  S.assetInfo={[original]=false,[shared]={"wrong",512,256}}
+  equal(R.Animation(I,"Sheet",box),false);equal(#S.draws,0)
+end)
+run("ambiguous same-name source atlases keep their diagnosed themed fallback",function()
+  local original="uifiles/Graphite-stock/window_pieces21.tga"
+  local I=fixture({version=2,windows={},images={Sheet={path=original}}});S.assetInfo={[original]=false}
+  equal(R.Animation(I,"Sheet",box),false)
+  local calls=0;for _,event in ipairs(S.events)do if event.kind=="asset"then calls=calls+1;equal(event.args[1],original)end end
+  equal(calls,1);equal(#S.draws,0)
 end)
 print(string.format("Lua renderer: %d cases, %d assertions passed",passed,assertions))

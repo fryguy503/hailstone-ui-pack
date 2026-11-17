@@ -45,6 +45,8 @@ class RendererContractTest(unittest.TestCase):
         for path in (ROOT / "shared").glob("*.lua"):
             text = code(path)
             calls.update(re.findall(r'B\.(?:Call|Function)\("(\w+)"\s*,\s*"(\w+)"', text))
+            # Presenter modules use the same guarded two-part call convention.
+            calls.update(re.findall(r'\b(?:call|has)\("(\w+)"\s*,\s*"(\w+)"', text))
             calls.update(re.findall(r'\b(?:API|hs\.UI)\.(\w+)\.(\w+)\s*\(', text))
             # B.Requirements declares dynamically checked dependencies this way.
             required = re.search(r"local required\s*=\s*\{(.*?)\nfunction B.Requirements", text, re.S)
@@ -56,17 +58,29 @@ class RendererContractTest(unittest.TestCase):
 
 @unittest.skipUnless(LUA, "Lua interpreter unavailable; set HAILSTONE_LUA")
 class LuaRuntimeTest(unittest.TestCase):
-    def run_fixture(self, name: str, label: str):
+    def run_fixture(self, name: str, label: str, pattern: str | None = None):
         completed = subprocess.run([LUA, str(ROOT / "tests" / name)], cwd=ROOT,
                                    capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        self.assertRegex(completed.stdout, rf"Lua {label}: \d+ cases, \d+ assertions passed")
+        self.assertRegex(completed.stdout, pattern or rf"Lua {label}: \d+ cases, \d+ assertions passed")
 
     def test_renderer_runtime(self):
         self.run_fixture("lua_renderer_test.lua", "renderer")
 
     def test_helpers_runtime(self):
         self.run_fixture("lua_helpers_test.lua", "helpers")
+
+    def test_chrome_geometry_runtime(self):
+        self.run_fixture("lua_chrome_geometry_test.lua", "chrome geometry")
+
+    def test_source_presenters_runtime(self):
+        self.run_fixture("lua_source_presenters_test.lua", "source presenters", r"Source presenters: \d+ assertions passed")
+
+    def test_status_presenters_runtime(self):
+        self.run_fixture("lua_status_presenters_test.lua", "status presenters", r"source status presenters: \d+ assertions passed")
+
+    def test_model_presenters_runtime(self):
+        self.run_fixture("lua_model_presenters_test.lua", "model presenters", r"Model presenters: \d+ assertions passed")
 
 
 if __name__ == "__main__":

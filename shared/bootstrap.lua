@@ -97,12 +97,15 @@ do
         if selected=="" then selected=nil end
       end
       local x,y=ui.GetWindowPos();local w,h=ui.GetWindowSize();local s=ui.GetIO().uiScale or 1
-      ui.PushClipRect(x,y,x+w,y+h,false)
+      local cx,cy=ui.GetCursorScreenPos();local cw,ch=ui.GetContentRegionAvail()
+      -- Raw/native Begin has already drawn its caption and close button. Its
+      -- compatibility decoration must not cover those pixels or hit targets.
+      -- Source-owned presenters instead use WindowChrome before their body.
+      ui.PushClipRect(x,math.max(y,math.min(y+h,cy)),x+w,y+h,false)
       local ok,why=pcall(context.renderer.Chrome,context.instance,{x=x,y=y,w=w,h=h,s=s},
         {template=selected,frameOnly=true})
       ui.PopClipRect()
       if not ok then error(why,0) end
-      local cx,cy=ui.GetCursorScreenPos();local cw,ch=ui.GetContentRegionAvail()
       context.renderer.Chrome(context.instance,{x=cx,y=cy,w=math.max(0,cw),h=math.max(0,ch),s=s},
         {template=selected,backgroundOnly=true})
     end

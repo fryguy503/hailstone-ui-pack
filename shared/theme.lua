@@ -28,10 +28,16 @@ for name, value in pairs(roles) do
   end
 end
 modern_palette_gen = (modern_palette_gen or 0) + 1
-local byType = (context.instance.style.fonts or {}).byType or {}
-local normal = math.max(1, math.min(6, tonumber(byType.Label) or 3))
-T.font.normal, T.font.small, T.font.tiny = normal, math.max(1,normal-1), math.max(1,normal-2)
-T.font.large, T.font.huge = math.min(6,normal+1), math.min(6,normal+2)
+local fonts = context.instance.style.fonts or {}
+local byType = fonts.byType or {}
+local function sourceFont(value, fallback)
+  value=tonumber(value)
+  return value and value>=1 and value<=6 and value%1==0 and value or fallback
+end
+local normal = sourceFont(fonts.text or byType.Label,3)
+T.font.normal, T.font.small = normal, sourceFont(fonts.small,normal)
+T.font.tiny = sourceFont(fonts.small,normal)
+T.font.large, T.font.huge = sourceFont(fonts.title,normal), sourceFont(fonts.title,normal)
 local selection = {{id=context.profile.id, name=context.profile.label,
   description="The selected interface's artwork, fonts and control styling"}}
 T.palettes = {default=context.profile.id, list=selection}
@@ -39,4 +45,12 @@ T.Palette = function() return context.profile.id end
 T.SetPalette = function() end
 T.TestPaletteCycle = function() end
 ui_palette = {list=function() return selection end, current=T.Palette, set=T.SetPalette}
-return context.renderer.StyleTheme(T, context.instance)
+context.renderer.StyleTheme(T, context.instance)
+local panel=T.Panel
+T.Panel=function(...)
+  -- The source-owned HUD bridge draws exactly one complete outer frame. Its
+  -- inherited movement/resize mechanics must not paint a second generic panel.
+  if context.sourceManagedPanel then return false end
+  return panel(...)
+end
+return T
