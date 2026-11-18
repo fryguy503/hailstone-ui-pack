@@ -42,16 +42,22 @@ do
   local ok,result=pcall(dofile,"lib/pack_model_presenters.lua")
   if ok then models=result end
 end
+local function finishManaged(previous,ok,...)
+  context.managedChrome=previous
+  if not ok then error((...),0) end
+  return ...
+end
 local function managed(fn,...)
   local previous=context.managedChrome
   context.managedChrome={pending=true}
   local scope=_G.hailstone_skin_managed_begin
-  local result
-  if type(scope)=="function" then result=table.pack(pcall(scope,fn,...))
-  else result=table.pack(pcall(fn,...)) end
-  context.managedChrome=previous
-  if not result[1] then error(result[2],0) end
-  return table.unpack(result,2,result.n)
+  if type(scope)=="function" then return finishManaged(previous,pcall(scope,fn,...)) end
+  return finishManaged(previous,pcall(fn,...))
+end
+local function finishSource(previous,ok,...)
+  context.sourceManagedPanel=previous
+  if not ok then error((...),0) end
+  return ...
 end
 local enhanced = {OptionsWindow=true, InventoryWindow=true, SpellBookWnd=true, MapViewWnd=true,
   TaskWnd=true, ItemDisplayWindow=true, PluginConsent=true, WebBrowserWnd=true,
@@ -69,15 +75,15 @@ local function bridge(original, kind)
     local shown=screen and (options.shown==true or hostShown)
     if kind=="dialog" and options.shown~=nil then shown=options.shown end
     if screen then R.TrackWindow(screen,shown,instance) end
+    -- The base still records the visibility transition. There is no draw
+    -- callback to decorate for an explicitly closed native window.
+    if screen and not shown and (hostShown==false or kind=="dialog" and options.shown==false) then
+      if context.paths[screen] then presentationPath(screen,"adapted") end
+      return original(screen,title,options,body)
+    end
     -- Keep lazy plans lazy: the base also claims its hidden windows, as before.
     if screen and shown then
       appearance = R.Resolve(screen, instance)
-      if not preserve(screen) then plan = appearance end
-      if plan then
-        local ok
-        ok, why = R.CanDraw(plan, instance, screen)
-        if not ok then plan = nil end
-      end
     end
     local presenter
     if appearance then
@@ -88,13 +94,23 @@ local function bridge(original, kind)
         local ok,reason=presenter.CanDraw(screen,appearance,instance)
         if not ok then presenter=nil;why=reason end
       end
-      if not presenter and plan then presenter=generic end
+      -- A typed presenter supplies its own compatibility checks. Audit the
+      -- raw graph only when the generic renderer can actually be selected.
+      if not (presenter and sourceChrome) and not preserve(screen) then
+        local ok,reason=R.CanDraw(appearance,instance,screen)
+        if ok then
+          plan=appearance
+          presenter=presenter or generic
+        elseif not why then why=reason end
+      end
     end
     if presenter and sourceChrome then
       local opts={};for key,value in pairs(options) do opts[key]=value end
+      local layout=presenter==source and {} or nil
       local originalSize=options.size or function() return appearance.rect.w,appearance.rect.h end
       local fields=appearance.fields or {}
       local designW,designH,sourceFit=appearance.rect.w,appearance.rect.h,1
+      local initialInsets=R.ChromeInsets(appearance,instance,1)
       local function fit(w,h,s)
         local io=ui.GetIO()
         local W,H=tonumber(io.width),tonumber(io.height)
@@ -104,11 +120,13 @@ local function bridge(original, kind)
         return math.max(1/s,w*ratio),math.max(1/s,h*ratio),ratio
       end
       opts.size=function(s)
-        originalSize(s) -- inherited controllers prepare their frame's state here
-        if presenter.Size then designW,designH=presenter.Size(screen,appearance,instance,R)
+        -- Some bases can limit preparation to their own body. Client tools
+        -- still calls the original size before drawing that body.
+        if options.bodyOnlySize~=true then originalSize(s) end
+        if presenter.Size then designW,designH=presenter.Size(screen,appearance,instance,R,layout)
         else designW,designH=appearance.rect.w,appearance.rect.h end
         local w,h;w,h,sourceFit=fit(math.max(1,designW),math.max(1,designH),s)
-        opts.titleHeight=R.ChromeInsets(appearance,instance,1).titleHeight*sourceFit
+        opts.titleHeight=initialInsets.titleHeight*sourceFit
         return w,h
       end
       opts.fit=false -- the selected source's outer rectangle is its initial size
@@ -118,7 +136,6 @@ local function bridge(original, kind)
       end
       opts.panel=false
       opts.onClose=nil -- the source close box below owns its art and hit rectangle
-      local initialInsets=R.ChromeInsets(appearance,instance,1)
       opts.titleHeight=initialInsets.titleHeight
       opts.rollup=opts.rollup and initialInsets.titleHeight>0
       opts.place=function(W,H,w,h,s)
@@ -192,7 +209,7 @@ local function bridge(original, kind)
             client={x=cx,y=cy,w=scrollX and virtualW or client.w,h=scrollY and virtualH or client.h,s=sourceScale}
             if not visible then ui.EndChild();return end
           end
-          local ok,drawn,reason,closed=pcall(presenter.Draw,screen,appearance,instance,client,R)
+          local ok,drawn,reason,closed=pcall(presenter.Draw,screen,appearance,instance,client,R,layout)
           if child then
             ui.SetCursorScreenPos(client.x,client.y);ui.Dummy(client.w,client.h)
             ui.EndChild()
@@ -221,10 +238,7 @@ local function bridge(original, kind)
       end
       local previous=context.sourceManagedPanel
       context.sourceManagedPanel=true
-      local result=table.pack(pcall(managed,nativeWindow,screen,title,opts,authored))
-      context.sourceManagedPanel=previous
-      if not result[1] then error(result[2],0) end
-      return table.unpack(result,2,result.n)
+      return finishSource(previous,pcall(managed,nativeWindow,screen,title,opts,authored))
     end
     local opts = options
     if plan and (plan.rect or {}).w and (plan.rect or {}).h then

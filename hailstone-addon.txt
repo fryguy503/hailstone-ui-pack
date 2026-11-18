@@ -1,9 +1,9 @@
 hailstone-addon 1
 name ui-pack
 kind ui
-version 0.2.0-preview.6
+version 0.2.0-preview.7
 min_client 0.7.1-beta
 author Fryguy
 description Twenty ready-to-use Lua interfaces with bundled layouts and UI artwork.
 caps none
-package any 18620617 f9d58b8c3935b31d53aba19a8f38ecb40639329c42e3c33c5bccc555c2581ba7 ui-pack-0.2.0-preview.6.zip
+package any 19005077 2d1ae6cc90feefa5b4d8b05617158853a58ebe3d4802d5bb550d4b702ad208e2 ui-pack-0.2.0-preview.7.zip

@@ -4,7 +4,7 @@ local context=dofile("lib/pack_context.lua")
 local previous=rawget(_G,"hailstone_skin_presenters")
 if previous and previous.context==context then return previous end
 local API=hs.UI
-local P={context=context}
+local P={context=context,BorrowsDrawRects=true}
 rawset(_G,"hailstone_skin_presenters",P)
 local chats,toolsOpen,hotbars={},{},{}
 local itemLayouts,itemLayoutScreens,itemSources={},{},setmetatable({},{__mode="k"})
@@ -12,6 +12,11 @@ local listed,lastFrame,lastName,lastAtSelect={},-1,nil,false
 local libraries={}
 local measured=setmetatable({},{__mode="k"})
 local repaired=setmetatable({},{__mode="k"})
+local fixedGraphs=setmetatable({},{__mode="k"})
+local inventoryCoverage=setmetatable({},{__mode="k"})
+local EMPTY={}
+local activePlayer,playerPool=nil,{}
+local useSourceVisibility={}
 local function lib(name)
   if libraries[name]==nil then
     local ok,result=pcall(dofile,"lib/"..name..".lua")
@@ -44,8 +49,8 @@ function P.Frame()
   if selecting and not lastAtSelect or name and lastName and name~=lastName then chats={};itemLayouts={};itemLayoutScreens={} end
   lastAtSelect=selecting
   if selecting then lastName=nil elseif name then lastName=name end
-  listed={}
-  for _,window in ipairs(call("chat","Windows") or {}) do listed["Chat"..window.slot]=window end
+  for screen in pairs(listed) do listed[screen]=nil end
+  for _,window in ipairs(call("chat","Windows") or EMPTY) do listed["Chat"..window.slot]=window end
   for screen in pairs(chats) do if not listed[screen] then chats[screen]=nil end end
 end
 local inventoryActions={IW_Destroy=true,IW_Tinting=true,IW_FacePick=true,IW_AltAdvBtn=true,IW_Skills=true,
@@ -65,8 +70,7 @@ local function slot(node)
   return n and n>=0 and n<=32 and n%1==0 and n or nil
 end
 P.InventorySlot=slot
-local function nativeAction(screen,node)
-  local key,name=family(screen),id(node)
+local function nativeAction(key,name)
   if key=="InventoryWindow" then return inventoryActions[name] or name:match("^IW_Money[0-3]$")~=nil end
   if key=="PlayerWindow" then return playerActions[name]==true end
   if key=="HotButtonWnd" then return hotActions[name] or name:match("^HB_Button%d+$")~=nil end
@@ -77,26 +81,62 @@ local function nativeAction(screen,node)
   return false
 end
 function P.Enabled(screen,node)
-  if not P.Handles(screen) then return end
-  if family(screen)=="PlayerWindow" and id(node)=="PW_CombatStateAnim" then return true end
-  if node.type=="Button" and not nativeAction(screen,node) then return false end
+  local key=type(screen)=="string" and family(screen)
+  if key=="PlayerWindow" and id(node)=="PW_CombatStateAnim" then return true end
+  if key and node.type=="Button" and not nativeAction(key,id(node)) then return false end
 end
 function P.Click(screen,node)
-  if family(screen)=="PlayerWindow" and id(node)=="PW_CombatStateAnim" then return true end
-end
-function P.Events(screen,node)
-  if nativeAction(screen,node) then
-    if family(screen)=="PlayerWindow" then return {left=true,right=id(node)=="PlayerHP"} end
-    return {left=true,right=true,phases=family(screen)=="ItemDisplayWindow"}
+  if screen=="PlayerWindow" then
+    local view=activePlayer
+    while view do
+      view.revision=view.revision+1
+      view=view.parent
+    end
+    if id(node)=="PW_CombatStateAnim" then return true end
   end
 end
+function P.CharacterGauge(kind)
+  local view=activePlayer
+  if not view or kind<0 or kind>255 or kind%1~=0 then return call("character","Gauge",kind) end
+  local gauge=view.gauges[kind]
+  if not gauge then gauge={};view.gauges[kind]=gauge end
+  if gauge.revision~=view.revision then
+    gauge[1],gauge[2],gauge[3],gauge[4],gauge[5],gauge[6]=call("character","Gauge",kind)
+    gauge.revision=view.revision
+  end
+  return table.unpack(gauge,1,6)
+end
+local leftOnly={left=true,right=false}
+local leftRight={left=true,right=true}
+local mouseActions={left=true,right=true,phases=false}
+local mousePhases={left=true,right=true,phases=true}
+function P.Events(screen,node)
+  local key,name=family(screen),id(node)
+  if nativeAction(key,name) then
+    if key=="PlayerWindow" then return name=="PlayerHP" and leftRight or leftOnly end
+    return key=="ItemDisplayWindow" and mousePhases or mouseActions
+  end
+end
+local required = {
+  ChatWindow={{"chat","Windows"},{"chat","Text"},{"chat","Submit"},{"chat","TakeFocus"}},
+  HotButtonWnd={{"hotbars","Info"},{"hotbars","Click"},{"cursor","PickUp"}},
+  InventoryWindow={{"inventory","Item"},{"inventory","ClickSlot"},{"character","Label"}},
+}
+local needDefault={{"windows","ClickChild"},{"character","Gauge"}}
+local supported={Screen=true,Page=true,LayoutBox=true,HorizontalLayoutBox=true,VerticalLayoutBox=true,
+  TileLayoutBox=true,TemplateContainer=true,Label=true,Gauge=true,Button=true,InvSlot=true,HotButton=true,
+  StaticAnimation=true,StaticTintedBlendAnimation=true,StaticFrame=true,StaticText=true,StaticHeader=true,
+  STMLbox=true,Editbox=true,TabBox=true,Listbox=true}
+local function fixedGraph(node,depth)
+  local kind=node.type
+  if depth>64 or not supported[kind] or kind=="TabBox" or kind=="Listbox" or kind=="Editbox"then return false end
+  for _,child in ipairs(node.children or EMPTY)do if not fixedGraph(child,depth+1)then return false end end
+  return true
+end
 function P.CanDraw(screen,plan)
-  if not P.Handles(screen) or type(plan)~="table" or plan.type~="Screen" then return false,"No source presenter" end
-  local key=family(screen)
-  local needs=key=="ChatWindow" and {{"chat","Windows"},{"chat","Text"},{"chat","Submit"},{"chat","TakeFocus"}}
-    or key=="HotButtonWnd" and {{"hotbars","Info"},{"hotbars","Click"},{"cursor","PickUp"}}
-    or key=="InventoryWindow" and {{"inventory","Item"},{"inventory","ClickSlot"},{"character","Label"}}
-    or {{"windows","ClickChild"},{"character","Gauge"}}
+  local key=type(screen)=="string" and family(screen)
+  if not key or type(plan)~="table" or plan.type~="Screen" then return false,"No source presenter" end
+  local needs=required[key] or needDefault
   for _,need in ipairs(needs) do
     if not API[need[1]] or type(API[need[1]][need[2]])~="function" then
       return false,"Source presenter needs "..need[1].."."..need[2]
@@ -104,13 +144,17 @@ function P.CanDraw(screen,plan)
   end
   if key=="ChatWindow" and (not lib("stml") or not lib("chatlinks")) then return false,"Chat text helpers unavailable" end
   if key=="InventoryWindow" and not lib("items") then return false,"Inventory gesture helper unavailable" end
-  local supported={Screen=true,Page=true,LayoutBox=true,HorizontalLayoutBox=true,VerticalLayoutBox=true,
-    TileLayoutBox=true,TemplateContainer=true,Label=true,Gauge=true,Button=true,InvSlot=true,HotButton=true,
-    StaticAnimation=true,StaticTintedBlendAnimation=true,StaticFrame=true,StaticText=true,StaticHeader=true,
-    STMLbox=true,Editbox=true,TabBox=true,Listbox=true}
+  -- A packaged graph whose entire shape is accepted needs no visibility
+  -- queries during compatibility checks. Controls still query live state.
+  if plan._packColorsNormalized then
+    if fixedGraphs[plan]==nil then fixedGraphs[plan]=fixedGraph(plan,0) end
+    if fixedGraphs[plan] then return true end
+  end
   local function check(node,depth)
     if key=="HotButtonWnd" and node.type=="SpellGem" and id(node):match("^HB_SpellGem%d+$") and not tonumber(node.eqType) then return true end
     if depth>64 or not supported[node.type] then return false,"Source control adapter unavailable: "..tostring(node.type) end
+    local children=node.children
+    if (not children or #children==0) and node.type~="Editbox" and node.type~="TabBox" and node.type~="Listbox" then return true end
     if call("windows","ChildShown",screen,id(node))==false then return true end
     if key~="ChatWindow" and node.type=="Editbox" then return false,"Source text-entry adapter unavailable" end
     if node.type=="TabBox" then
@@ -138,6 +182,9 @@ end
 local function slotIdentity(key,node,screen)
   if key=="InventoryWindow" and node.type=="InvSlot" then return slot(node) end
   if key=="HotButtonWnd" and node.type=="HotButton" then
+    local record=hotbars[screen]
+    local cached=record and record.slotIds[node]
+    if cached~=nil then return cached or nil end
     -- Legacy names such as HB1_Button1 still address the same native slot.
     -- Use the renderer's mapping so coverage and clicks agree.
     local bar,button=lib("pack_bindings").HotTarget(screen,node)
@@ -153,10 +200,79 @@ local function reference(plan,instance,R)
   local inset=R and R.ChromeInsets and R.ChromeInsets(plan,instance,1)or {left=0,right=0,top=0,bottom=0}
   return {x=0,y=0,w=math.max(1,base.w-inset.left-inset.right),h=math.max(1,base.h-inset.top-inset.bottom),s=1}
 end
+local function indexInventorySlots(root)
+  local nodes,templates,first={},{}
+  local flowing=false
+  local function visit(node,flow)
+    local fields=node.fields or EMPTY
+    local childFlow=flow or node.type=="TileLayoutBox" or node.type=="HorizontalLayoutBox"
+      or node.type=="VerticalLayoutBox" or type(fields.Layout)=="string" and fields.Layout~=""
+    local n=node.type=="InvSlot" and slot(node) or nil
+    local coversSlot=n~=nil
+    if coversSlot then
+      if flow then flowing=true end
+      first=first or node
+      templates[n]=templates[n] or node
+    end
+    for _,child in ipairs(node.children or EMPTY)do
+      if visit(child,childFlow) then coversSlot=true end
+    end
+    if coversSlot and node~=root then nodes[#nodes+1]=node end
+    return coversSlot
+  end
+  visit(root,false)
+  return {nodes=not flowing and nodes or nil,templates=templates,first=first}
+end
+
+-- Fixed slots can only move when the authored client bounds change. The
+-- reachability audit still reruns when a slot/ancestor changes visibility.
+-- Flow layouts stay live because even an unrelated sibling can move a slot.
+local function inventoryCoverageMatches(record,screen,instance,R,box)
+  local cached=record.result
+  local matches=cached and cached.instance==instance and cached.renderer==R
+    and cached.visit==R.VisitChildren and cached.w==box.w and cached.h==box.h
+  local bindings=lib("pack_bindings")
+  if not bindings then return false end
+  local shown=record.shown
+  for i,node in ipairs(record.nodes)do
+    local visible=bindings.Shown(screen,node)
+    if shown[i]~=visible then matches=false;shown[i]=visible end
+  end
+  if not matches then record.result=nil end
+  return matches
+end
+local noExtras={}
 local function missing(screen,plan,instance,R)
-  local seen,template,templates,pageOf,placed,prototypes={},nil,{},{},{},{}
   local key=family(screen)
+  if key~="InventoryWindow" and key~="HotButtonWnd" and key~="ItemDisplayWindow" then return noExtras end
   local base=reference(plan,instance,R)
+  local bar=key=="HotButtonWnd" and hotbars[screen]
+  local fixed=bar and bar.fixedCoverage and bar.plan==plan
+  local cached=fixed and bar.coverage
+  if cached and cached.instance==instance and cached.renderer==R and cached.w==base.w and cached.h==base.h then
+    return cached.absent,cached.template,cached.templates,base.w
+  end
+  local inventory
+  if key=="InventoryWindow" and plan._packColorsNormalized and R and R.VisitChildren then
+    inventory=inventoryCoverage[plan]
+    if not inventory then
+      inventory=indexInventorySlots(plan)
+      inventory.shown={}
+      inventoryCoverage[plan]=inventory
+    end
+    if inventory.nodes and inventoryCoverageMatches(inventory,screen,instance,R,base) then
+      return inventory.result.absent,inventory.first,inventory.templates,base.w
+    end
+  end
+  local seen,template,templates,pageOf,placed,prototypes={},nil,{},{},{},{}
+  local function indexSlot(node)
+    local n=slotIdentity(key,node,screen)
+    if n~=nil then
+      template=template or node
+      templates[n]=templates[n]or node
+    end
+    return n
+  end
   local function index(node,page,parent,inFlow)
     if node.type=="Page"then page=node end
     pageOf[node]=page or false
@@ -165,21 +281,20 @@ local function missing(screen,plan,instance,R)
       if R and R.Geometry then at=R.Geometry(node,parent)
       else local r=node.rect or {};at={x=parent.x+(r.x or 0),y=parent.y+(r.y or 0),w=r.w or 0,h=r.h or 0,s=1}end
     end
-    local n=slotIdentity(key,node,screen)
-    if n~=nil then
-      template=template or node;templates[n]=templates[n]or node
-      if key=="ItemDisplayWindow"and not inFlow and at.w>0 and at.h>0 then
-        prototypes[#prototypes+1]={key=n,box=at,page=pageOf[node]}
-      end
+    local n=indexSlot(node)
+    if n~=nil and not inFlow and at.w>0 and at.h>0 then
+      prototypes[#prototypes+1]={key=n,box=at,page=pageOf[node]}
     end
     local f=node.fields or {}
     local flow=inFlow or node.type=="TileLayoutBox"or node.type=="HorizontalLayoutBox"or node.type=="VerticalLayoutBox"
       or type(f.Layout)=="string"and f.Layout~=""
     for _,child in ipairs(node.children or{})do index(child,page,at,flow)end
   end
-  index(plan,nil,base,false)
+  if key=="ItemDisplayWindow"then index(plan,nil,base,false)
+  elseif inventory then template,templates=inventory.first,inventory.templates
+  else walk(plan,indexSlot)end
   if R and R.VisitChildren then
-    R.VisitChildren(screen,plan,instance,reference(plan,instance,R),function(node,at,visible)
+    R.VisitChildren(screen,plan,instance,base,function(node,at,visible)
       local n=slotIdentity(key,node,screen)
       if n~=nil then
         seen[n]=true
@@ -214,13 +329,24 @@ local function missing(screen,plan,instance,R)
       if call("windows","ChildShown",screen,name)==true and not seen[name]then out[#out+1]=name end
     end
   end
-  return out,template,templates
+  if fixed then
+    bar.coverage={instance=instance,renderer=R,w=base.w,h=base.h,absent=out,template=template,templates=templates}
+  elseif inventory and inventory.nodes then
+    inventory.result={instance=instance,renderer=R,visit=R.VisitChildren,w=base.w,h=base.h,absent=out}
+  end
+  return out,template,templates,base.w
 end
-local function extrasHeight(screen,plan,instance,R)
-  local absent,template=missing(screen,plan,instance,R)
+local function slotsForDraw(screen,plan,instance,R,layout)
+  if layout and layout.plan==plan and layout.frame==ui.GetFrameCount() then
+    layout.plan=nil
+    return layout.absent,layout.template,layout.templates,layout.width
+  end
+  return missing(screen,plan,instance,R)
+end
+local function extrasHeight(absent,template,clientWidth)
   if #absent==0 then return 0 end
   local size=math.max(24,math.min(48,tonumber((template and template.rect or {}).h) or 40))
-  local per=math.max(1,math.floor(reference(plan,instance,R).w/(size+4)))
+  local per=math.max(1,math.floor(clientWidth/(size+4)))
   return math.ceil(#absent/per)*(size+4)+4
 end
 local function tabsHeight(screen)
@@ -249,7 +375,12 @@ local function itemSource(plan)
   end
   index(plan)
   if not nodes.IconButton or not nodes.IDW_ItemInfo1 or not nodes.ItemDescription or not descriptionPage then return end
-  saved={nodes=nodes,page=descriptionPage,tab=tab};itemSources[plan]=saved;return saved
+  local fonts,seen={},{}
+  for _,node in pairs(nodes)do
+    local font=node.font or 3
+    if not seen[font]then seen[font]=true;fonts[#fonts+1]=node end
+  end
+  saved={nodes=nodes,page=descriptionPage,tab=tab,fonts=fonts};itemSources[plan]=saved;return saved
 end
 local function itemPlain(value)
   return tostring(value or""):gsub("\r",""):gsub("<[Bb][Rr]%s*/?>","\n"):gsub("</?[Pp]>","\n"):gsub("<[^>]*>","")
@@ -341,7 +472,7 @@ local function drawPlayer(screen, plan, instance, box, R, panel)
   local header = math.min(panel.height * scale, math.max(0, box.h - scale))
   local inset = math.min(4 * scale, box.w / 8)
   local card = {x = box.x + inset, y = box.y, w = box.w - inset * 2, h = header, s = scale}
-  local fraction, gaugeName, raw, r, g, b = call("character", "Gauge", 1)
+  local fraction, gaugeName, raw, r, g, b = P.CharacterGauge(1)
   local name = call("character", "Name")
   if not name or name == "" then name = gaugeName or "" end
   local tint = r and {r, g, b, 1}
@@ -384,35 +515,47 @@ end
 -- builder placed info lines, shared stat/value boxes and socket rows after it
 -- knew the item. Reconstruct that responsibility using the selected skin's
 -- fonts, icon size, margins, column proportions and control artwork.
+local itemInfoIds,itemStatIds,itemHeroicIds={},{},{}
+for n=1,13 do itemInfoIds[n]="IDW_ItemInfo"..n;itemHeroicIds[n]="IDW_Heroic"..n end
+for row=1,26 do
+  itemStatIds[row]={}
+  for col=1,3 do
+    local prefix="IDW_Row"..row.."Col"..col
+    itemStatIds[row][col]={label=prefix.."Stat",value=prefix.."Value"}
+  end
+end
+local function itemText(screen,name,signature,allowHidden)
+  if call("windows","ChildShown",screen,name)==false and not allowHidden then return "" end
+  local text=tostring(call("windows","Text",screen,name) or "")
+  if text~=""then signature[#signature+1]=name..":"..#text..":"..text end
+  return text
+end
 function P.ItemLayout(screen,plan,instance,R,width,height,s)
   if type(screen)~="string"or family(screen)~="ItemDisplayWindow"or not API.windows or type(API.windows.Text)~="function"then return plan end
   local source=itemSource(plan);if not source then return plan end
   s=math.max(.01,tonumber(s)or 1);width=math.max(1,tonumber(width)or 400);height=math.max(1,tonumber(height)or 200)
-  local live,signature={}, {tostring(width),tostring(height),tostring(s),tostring(call("settings","Option","font_face"))}
-  local function read(name)
-    if live[name]then return live[name]end
-    local shown=call("windows","ChildShown",screen,name)
-    local value,supplied=call("windows","Text",screen,name)
-    local record={shown=shown~=false,text=tostring(value or""),supplied=supplied}
-    live[name]=record;signature[#signature+1]=name..":"..tostring(shown)..":"..#record.text..":"..record.text
-    return record
-  end
+  local signature={tostring(width),tostring(height),tostring(s),tostring(call("settings","Option","font_face"))}
   local infos,cells,heroics,sockets={},{},{},{}
-  for n=1,13 do local name="IDW_ItemInfo"..n;local value=read(name)
-    if value.shown and value.text~=""then infos[#infos+1]={name=name,text=value.text}end
+  for _,name in ipairs(itemInfoIds)do
+    local text=itemText(screen,name,signature)
+    if text~=""then infos[#infos+1]={name=name,text=text}end
   end
-  for row=1,26 do cells[row]={}
-    for col=1,3 do
-      local prefix="IDW_Row"..row.."Col"..col
-      local label,value=read(prefix.."Stat"),read(prefix.."Value")
-      if label.shown and label.text~=""then
-        local x,y,w=call("windows","ChildRect",screen,prefix.."Stat")
-        cells[row][col]={label=prefix.."Stat",value=prefix.."Value",text=label.text,valueText=value.shown and value.text or"",x=x,y=y,w=w}
+  for row,ids in ipairs(itemStatIds)do
+    cells[row]=EMPTY
+    for col,names in ipairs(ids)do
+      local text=itemText(screen,names.label,signature)
+      if text~=""then
+        if cells[row]==EMPTY then cells[row]={} end
+        local value=itemText(screen,names.value,signature)
+        local x,y,w=call("windows","ChildRect",screen,names.label)
+        signature[#signature+1]=tostring(x)..":"..tostring(y)..":"..tostring(w)
+        cells[row][col]={label=names.label,value=names.value,text=text,valueText=value,x=x,y=y,w=w}
       end
     end
   end
-  for n=1,13 do local name="IDW_Heroic"..n;local value=read(name)
-    if value.shown and value.text~=""then
+  for _,name in ipairs(itemHeroicIds)do
+    local text=itemText(screen,name,signature)
+    if text~=""then
       local x,y=call("windows","ChildRect",screen,name)
       signature[#signature+1]=tostring(x)..":"..tostring(y)
       local owner,distance
@@ -422,7 +565,7 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
           if not distance or delta<distance then owner,distance=cell,delta end
         end
       end end end
-      local entry={name=name,text=value.text};heroics[#heroics+1]=entry
+      local entry={name=name,text=text};heroics[#heroics+1]=entry
       if owner then owner.heroic=entry;entry.assigned=true end
     end
   end
@@ -433,19 +576,19 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
     -- The screen is authoritative. An item child may retain its default shown
     -- state while its parent socket screen is hidden by the live model.
     if screenShown==true or screenShown==nil and call("windows","ChildShown",screen,prefix.."_Item")==true then
-      local description=read(prefix.."_Description")
+      local description=itemText(screen,prefix.."_Description",signature,true)
       local buy=n==7 and call("windows","ChildShown",screen,prefix.."_Buy_Button")==true
-      local buyText=buy and read(prefix.."_Buy_Button").text or""
+      local buyText=buy and itemText(screen,prefix.."_Buy_Button",signature)or""
       signature[#signature+1]=tostring(buy)
-      sockets[#sockets+1]={prefix=prefix,text=description.text,appearance=n==7,buy=buy,buyText=buyText}
+      sockets[#sockets+1]={prefix=prefix,text=description,appearance=n==7,buy=buy,buyText=buyText}
     end
   end
-  local modifier,description,final=read("IDW_ModButtonLabel"),read("ItemDescription"),read("Hailstone_EvolvingFinalResult")
-  local fonts={}
-  for _,node in pairs(source.nodes)do if not fonts[node.font or 3]then
-    fonts[node.font or 3]=true;local fw,fh=itemMeasure(R,instance,node,"Wg",s)
+  local modifier=itemText(screen,"IDW_ModButtonLabel",signature)
+  local final=itemText(screen,"Hailstone_EvolvingFinalResult",signature)
+  for _,node in ipairs(source.fonts)do
+    local fw,fh=itemMeasure(R,instance,node,"Wg",s)
     signature[#signature+1]=tostring(node.font or 3)..":"..tostring(fw)..":"..tostring(fh)
-  end end
+  end
   local key=table.concat(signature,"\31");local cache=itemLayouts[screen]
   for index,name in ipairs(itemLayoutScreens)do if name==screen then table.remove(itemLayoutScreens,index);break end end
   table.insert(itemLayoutScreens,1,screen)
@@ -562,11 +705,11 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
     end
   end
   for _,entry in ipairs(heroics)do if not entry.assigned then y=y+label(entry.name,entry.text,margin,y,available,first)+gap end end
-  if modifier.shown and modifier.text~=""then
+  if modifier~=""then
     local button=take("IDW_ModButton",{type="Button",font=first.font,fields={}},"Button")
     local size=math.max(12,math.min(20,(button.rect or{}).h or 15))
     page.children[#page.children+1]=itemAbsolute(button,margin,y,size,size)
-    local h=label("IDW_ModButtonLabel",modifier.text,margin+size+gap,y,math.max(1,available-size-gap),first)
+    local h=label("IDW_ModButtonLabel",modifier,margin+size+gap,y,math.max(1,available-size-gap),first)
     y=y+math.max(size,h)+gap*2
   end
   for _,entry in ipairs(sockets)do
@@ -603,9 +746,9 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
     page.children[#page.children+1]=itemAbsolute(group,margin,y,available,rowHeight)
     y=y+rowHeight+gap*2
   end
-  if final.shown and final.text~=""then
+  if final~=""then
     local button=take("Hailstone_EvolvingFinalResult",{type="Button",font=first.font,fields={Style_HCenter=true,Style_VCenter=true}},"Button")
-    local h;button.sourceItemCaption,h=itemWrap(R,instance,button,final.text,available,s);h=math.max(24,h+8)
+    local h;button.sourceItemCaption,h=itemWrap(R,instance,button,final,available,s);h=math.max(24,h+8)
     page.children[#page.children+1]=itemAbsolute(button,margin,y,available,h);y=y+h+gap
   end
   local descriptionHeight=math.max(80,height-top-tabHeight-y-gap)
@@ -623,6 +766,13 @@ function P.OwnsScroll(screen,plan)
   return type(screen)=="string"and family(screen)=="ItemDisplayWindow"and itemSource(plan)~=nil
     and API.windows and type(API.windows.Text)=="function"or false
 end
+local noHotOverride={}
+local function hotShown(name,record)
+  if name=="HB_InvSlot" or name:match("^HB_InvSlot%d+$") or name:match("^HB_SpellGem%d+$") then return false end
+  if name=="HB_VerticalBarPageButtons" then return record.spinner and record.vertical end
+  if name=="HB_HorizontalBarPageButtons" then return record.spinner and not record.vertical end
+  if name:match("^HB_.*BarTemplate$") then return false end
+end
 local function hotPlan(screen,plan,instance,R)
   if family(screen)~="HotButtonWnd" then return plan end
   local bar=tonumber(screen:match("(%d+)$")) or 1
@@ -630,19 +780,34 @@ local function hotPlan(screen,plan,instance,R)
   local spinner=call("hotbars","Setting",bar,"ShowSpinner")~=false
   local columns=tonumber(ui.GetSetting("hud.perRow."..screen))
   if columns then columns=math.max(1,math.min(12,math.floor(columns))) end
-  local key=tostring(percent)..":"..tostring(spinner)..":"..tostring(columns)
   local record=hotbars[screen]
-  if record and record.source==plan and record.key==key then return record.plan end
-  record={source=plan,key=key,spinner=spinner,plan=copy(plan)};hotbars[screen]=record
+  if record and record.source==plan and record.percent==percent and record.spinner==spinner and record.configuredColumns==columns
+      and record.instance==instance and record.renderer==R and record.chrome==(R and R.ChromeInsets)
+      and record.geometry==(R and R.Geometry)then
+    return record.plan
+  end
+  record={source=plan,percent=percent,spinner=spinner,configuredColumns=columns,plan=copy(plan),fixedCoverage=plan._packColorsNormalized==true,
+    instance=instance,renderer=R,chrome=R and R.ChromeInsets,geometry=R and R.Geometry,slotIds={},visibility={}}
+  hotbars[screen]=record
   local tile,first,templates={},nil,{}
   walk(record.plan,function(node)
+    local name=id(node)
+    record.visibility[node]=name
+    -- Native hotbars expose the same slots on every page. Spinner, size and
+    -- column changes create a fresh graph. User-adjustable flow stays live.
+    local fields=node.fields or{}
+    if node.type=="HorizontalLayoutBox" or node.type=="VerticalLayoutBox"
+        or fields.Layout and fields.Layout~=""then record.fixedCoverage=false end
     if node.type=="Button" then
-      local n=tonumber(id(node):match("^HB_Button(%d+)$"))
+      local n=tonumber(name:match("^HB_Button(%d+)$"))
       if n and n>=1 and n<=12 then node.type="HotButton" end
     end
-    if node.type=="TileLayoutBox" and id(node)=="HB_HotButtonLayout" then tile=node end
-    if node.type=="HotButton" then first=first or node end
-    if id(node):match("^HB_.*BarTemplate$") then templates[id(node)]=node end
+    if node.type=="TileLayoutBox" and name=="HB_HotButtonLayout" then tile=node end
+    if node.type=="HotButton" then
+      first=first or node
+      record.slotIds[node]=slotIdentity("HotButtonWnd",node,screen) or false
+    end
+    if name:match("^HB_.*BarTemplate$") then templates[name]=node end
   end)
   if not tile.type then tile=nil end
   local insets=R and R.ChromeInsets and R.ChromeInsets(plan,instance,1) or {left=0,right=0,top=0,bottom=0}
@@ -674,6 +839,14 @@ local function hotPlan(screen,plan,instance,R)
     end
   end
   record.columns=columns or record.columns or (record.vertical and 1 or 12)
+  record.first,record.tile=first,tile
+  -- The graph and native slot identities are immutable until a setting rebuild.
+  -- Keep the host's live visibility/state reads in bindings; only the presenter's
+  -- source prototype and spinner decisions are prepared here.
+  for node,name in pairs(record.visibility)do
+    local shown=hotShown(name,record)
+    record.visibility[node]=shown==nil and noHotOverride or shown
+  end
   -- PercentSize is a host setting for the authored control grid, not a switch
   -- back to the inherited presenter's button dimensions or arrangement.
   if percent~=1 then
@@ -694,29 +867,39 @@ local function hotPlan(screen,plan,instance,R)
 end
 function P.Shown(screen,node)
   if node.sourceReplaced then return false end
+  if screen=="PlayerWindow" then
+    local view=activePlayer
+    if not view then return end
+    -- Layout, underlay and draw visit the same authored controls. A Player
+    -- action invalidates this scope along with its current gauge readings.
+    local value=view.shown[node]
+    if not value then value={};view.shown[node]=value end
+    if value.revision~=view.revision then
+      local shown=call("windows","ChildShown",screen,id(node))
+      value.shown=shown==nil and useSourceVisibility or shown
+      value.revision=view.revision
+    end
+    if value.shown==useSourceVisibility then return (node.fields or EMPTY).Visible~=false end
+    return value.shown~=false
+  end
   if family(screen)=="InventoryWindow" and optionalInventoryLists[id(node)] then
     return call("windows","ListInfo",screen,id(node))~=nil
   end
   local record=hotbars[screen]
   if not record then return end
-  local name=id(node)
-  if name=="HB_InvSlot" or name:match("^HB_InvSlot%d+$") or name:match("^HB_SpellGem%d+$") then return false end
-  if name=="HB_VerticalBarPageButtons" then return record.spinner and record.vertical end
-  if name=="HB_HorizontalBarPageButtons" then return record.spinner and not record.vertical end
-  if name:match("^HB_.*BarTemplate$") then return false end
+  local shown=record.visibility[node]
+  if shown~=nil then if shown~=noHotOverride then return shown end;return end
+  return hotShown(id(node),record)
 end
 function P.Resize(screen,plan,instance,R,w,h)
   if family(screen)~="HotButtonWnd" then return end
   local prepared=hotPlan(screen,plan,instance,R)
-  local first,tile
-  walk(prepared,function(node)
-    if node.type=="HotButton" then first=first or node end
-    if node.type=="TileLayoutBox" and id(node)=="HB_HotButtonLayout" then tile=node end
-  end)
+  local record=hotbars[screen]
+  local first,tile=record.first,record.tile
   if not first or not tile then return end
   local gap=tonumber((tile.fields or {}).Spacing) or 5
   local secondary=tonumber((tile.fields or {}).SecondarySpacing) or 5
-  local current=hotbars[screen].columns
+  local current=record.columns
   local columns
   if math.abs(w-prepared.rect.w)>=math.abs(h-prepared.rect.h) then
     local inset=prepared.rect.w-(current*(first.rect.w+gap)-gap)
@@ -728,7 +911,7 @@ function P.Resize(screen,plan,instance,R,w,h)
   end
   ui.SetSetting("hud.perRow."..screen,math.max(1,math.min(12,columns)))
 end
-function P.Size(screen,plan,instance,R)
+function P.Size(screen,plan,instance,R,layout)
   P.Frame()
   plan=hotPlan(screen,plan,instance,R)
   local w,h=(plan.rect or {}).w or 320,(plan.rect or {}).h or 200
@@ -751,21 +934,28 @@ function P.Size(screen,plan,instance,R)
   end
   if R and R.MeasureChildren and R.ChromeInsets then
     local inset=R.ChromeInsets(plan,instance,1)
-    local key=table.concat({inset.left,inset.right,inset.top,inset.bottom},":")
     local saved=measured[plan]
-    if not saved or saved.key~=key then
+    if not saved or saved.left~=inset.left or saved.right~=inset.right or saved.top~=inset.top or saved.bottom~=inset.bottom then
       local cw,ch=R.MeasureChildren(screen,plan,instance,{x=0,y=0,w=math.max(1,w-inset.left-inset.right),
         h=math.max(1,h-inset.top-inset.bottom),s=1})
       -- Absolute controls parked outside a source window stay clipped. Only
       -- compensate its chrome here; generated host extras are added explicitly.
-      saved={key=key,w=math.max(w,math.min(cw,w)+inset.left+inset.right),
+      saved={left=inset.left,right=inset.right,top=inset.top,bottom=inset.bottom,
+        w=math.max(w,math.min(cw,w)+inset.left+inset.right),
         h=math.max(h,math.min(ch,h)+inset.top+inset.bottom)}
       measured[plan]=saved
     end
     w,h=saved.w,saved.h
   end
   local panel = playerPanel(screen, instance)
-  return w,h+extrasHeight(screen,plan,instance,R)+tabsHeight(screen)+transferHeight(screen)+(panel and panel.height or 0)
+  local absent,template,templates,clientWidth=missing(screen,plan,instance,R)
+  -- The inherited window sizes and paints together. Keep static slot
+  -- coverage for that draw only; slot content is still read by each control.
+  if layout and absent~=noExtras then
+    layout.plan,layout.frame=plan,ui.GetFrameCount()
+    layout.absent,layout.template,layout.templates,layout.width=absent,template,templates,clientWidth
+  end
+  return w,h+extrasHeight(absent,template,clientWidth)+tabsHeight(screen)+transferHeight(screen)+(panel and panel.height or 0)
 end
 local function chat(screen)
   local value=chats[screen]
@@ -881,6 +1071,7 @@ local function drawChatTabs(window, box, instance, R)
 end
 
 function P.DrawControl(screen,node,box,instance,R)
+  if screen=="PlayerWindow" then return false end
   local key,name=family(screen),id(node)
   if key=="ItemDisplayWindow"and node.sourceItemCaption~=nil and R.DrawButton then
     R.DrawButton(screen,node,box,instance,node.sourceItemCaption);return true
@@ -949,11 +1140,32 @@ local function replaceUnreachable(screen,plan,absent)
   end
   local result=clone(plan);repaired[plan]={key=key,plan=result};return result
 end
-function P.Draw(screen,plan,instance,box,R)
+local function paintPlayer(screen,plan,instance,box,R)
+  local panel=playerPanel(screen,instance)
+  if panel and R.PaintHealthBox then return drawPlayer(screen,plan,instance,box,R,panel) end
+  local content={x=box.x,y=box.y,w=box.w,h=math.max(1,box.h),s=box.s}
+  local drawn,why=R.Draw(screen,plan,instance,content,P)
+  if not drawn then return false,why end
+  return true
+end
+local function drawPlayerScope(screen,plan,instance,box,R)
+  local at=#playerPool
+  local view=playerPool[at] or {gauges={},shown=setmetatable({},{__mode="k"}),revision=0}
+  if at>0 then playerPool[at]=nil end
+  view.parent=activePlayer
+  view.revision=view.revision+1
+  activePlayer=view
+  local ok,drawn,why=pcall(paintPlayer,screen,plan,instance,box,R)
+  activePlayer=view.parent
+  view.parent=nil
+  if #playerPool<4 then playerPool[#playerPool+1]=view end
+  if not ok then error(drawn,0) end
+  return drawn,why
+end
+function P.Draw(screen,plan,instance,box,R,layout)
   P.Frame()
   plan=hotPlan(screen,plan,instance,R)
-  local panel = playerPanel(screen, instance)
-  if panel and R.PaintHealthBox then return drawPlayer(screen, plan, instance, box, R, panel) end
+  if screen=="PlayerWindow" then return drawPlayerScope(screen,plan,instance,box,R) end
   if family(screen)=="ItemDisplayWindow"then
     local s=box.s or 1;local transfer=transferHeight(screen)*s
     local availableHeight=math.max(1,box.h-transfer)
@@ -986,8 +1198,8 @@ function P.Draw(screen,plan,instance,box,R)
       return true
     end
   end
-  local absent,template,templates=missing(screen,plan,instance,R)
-  local extra=extrasHeight(screen,plan,instance,R)*(box.s or 1)
+  local absent,template,templates,clientWidth=slotsForDraw(screen,plan,instance,R,layout)
+  local extra=extrasHeight(absent,template,clientWidth)*(box.s or 1)
   local tabs=tabsHeight(screen)*(box.s or 1)
   local transfer=transferHeight(screen)*(box.s or 1)
   if tabs>0 then drawChatTabs(listed[screen],box,instance,R) end

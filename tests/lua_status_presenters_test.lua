@@ -88,17 +88,34 @@ local box={x=10,y=20,w=24,h=24,s=1}
 
 -- Capability/graph admission never invokes an action or guesses a model from a source ID.
 do
-  reset();local p=plan();p.children={node("Label","Decorative",1,2,30,12)}
+  reset();local p=plan();local reads=0;local label=node("Label","Decorative",1,2,30,12)
+  label.type=nil
+  setmetatable(label,{__index=function(_,key)if key=="type"then reads=reads+1;return "Label"end end})
+  p.children={label}
   for _,screen in ipairs{"TargetWindow","GroupWindow","BuffWindow","ShortDurationBuffWindow","CastSpellWnd","ExtendedTargetWnd"}do check(M.CanDraw(screen,p,instance()))end
+  equal(reads,1,"retained graph shape only needs one walk")
   equal(#S.events,0);check(not M.CanDraw("MerchantWnd",p,instance()))
   local original=spells.BookMemorize;spells.BookMemorize=nil;check(not M.CanDraw("CastSpellWnd",p,instance()));spells.BookMemorize=original
   local cycle=plan();cycle.children={cycle};check(not M.CanDraw("GroupWindow",cycle,instance()))
 end
 
+-- With no appended controls, there is no need to traverse the graph to hide replacements.
+do
+  reset();local p=plan();local reads=0;local n=node("Button","Buff0");n.children=nil
+  setmetatable(n,{__index=function(_,key)if key=="children"then reads=reads+1;return {}end end})
+  p.children={n}
+  local w,h=M.Size("BuffWindow",p,instance(),{VisitChildren=function()end})
+  equal(w,100);equal(h,50);equal(reads,1)
+end
+
 -- Group actions use the model's member ID even for a source-specific gauge name.
 do
   reset();local inst=instance();local n=node("Gauge","CustomMana",2,3,80,7,32)
+  local checks=0;local originalSupport=hs.UI.Supports
+  hs.UI.Supports=function(...)checks=checks+1;return originalSupport(...)end
   S.click=true;M.DrawControl("GroupWindow",n,box,inst,R)
+  equal(checks,0,"live status draws do not repeat capability queries")
+  hs.UI.Supports=originalSupport
   equal(events("click")[1][3],"Gauge2");equal(events("click")[1][4],"left")
   equal(S.paint[1].node,n);equal(S.paint[1].box.x,10)
   reset();S.right=true;M.DrawControl("GroupWindow",n,box,instance(),R)
@@ -107,6 +124,74 @@ do
   reset();S.active=true;S.drag=true;S.click=true;M.DrawControl("GroupWindow",n,box,instance(),R);equal(#events("click"),0)
   reset();S.click=true;local moving=instance();moving.hud={DragItem=function()return true end}
   M.DrawControl("GroupWindow",n,box,moving,R);equal(#events("click"),0)
+end
+
+-- One draw reuses a row's read until its action makes a fresh read necessary.
+do
+  reset();local p=plan();local n=node("Gauge","CustomMana",2,3,80,7,32)
+  n.statusNativeName="ManaGauge2";n.fields.Visible=false
+  local originalState,originalClick,originalShown=windows.ChildState,windows.ClickChild,windows.ChildShown
+  local stateReads,visibilityReads=0,0
+  windows.ChildState=function(screen,child)
+    if screen=="GroupWindow"and child=="Gauge2"then stateReads=stateReads+1 end
+    return originalState(screen,child)
+  end
+  windows.ChildShown=function(screen,child)
+    if screen=="GroupWindow"and(child=="ManaGauge2"or child=="CustomMana")then
+      visibilityReads=visibilityReads+1;return S.shown[child]
+    end
+    return originalShown(screen,child)
+  end
+  windows.ClickChild=function(...)
+    S.enabled=false;S.shown.ManaGauge2=true;return originalClick(...)
+  end
+  local adapter={Draw=function(screen,_,inst,client,presenter)
+    equal(presenter.Shown(screen,n),false,"an unconstrained native alias uses authored visibility")
+    equal(presenter.Shown(screen,n),false)
+    equal(visibilityReads,2,"an unconstrained native result is reused within the draw")
+    presenter.DrawControl(screen,n,client,inst,R)
+    presenter.DrawControl(screen,n,client,inst,R)
+    equal(stateReads,1,"matching rows share a live state read")
+    S.click=true;presenter.DrawControl(screen,n,client,inst,R)
+    presenter.DrawControl(screen,n,client,inst,R)
+    equal(stateReads,2,"an action invalidates the row read")
+    equal(presenter.Shown(screen,n),true,"the next visibility check also sees the native action")
+    equal(visibilityReads,3)
+    return true
+  end}
+  check(M.Draw("GroupWindow",p,instance(),{x=0,y=0,w=120,h=90,s=1},adapter))
+  equal(#events("click"),1,"the next control sees the host's new disabled state")
+  windows.ChildState,windows.ClickChild,windows.ChildShown=originalState,originalClick,originalShown
+end
+
+-- Nested draws keep separate scratch, restore the outer read on errors, and
+-- invalidate both scopes when a native action can update their shared model.
+do
+  reset();local p=plan();local probe=node("Label","VisibilityProbe")
+  local outer,inner=instance(),instance()
+  local function draw(inst,callback)
+    return M.Draw("TargetWindow",p,inst,{x=0,y=0,w=100,h=50,s=1},{Draw=callback})
+  end
+  S.shown.VisibilityProbe=false
+  check(draw(outer,function(screen,_,inst,client,presenter)
+    equal(presenter.Shown(screen,probe),false)
+    S.shown.VisibilityProbe=true
+    local ok,why=pcall(draw,inner,function()
+      equal(presenter.Shown(screen,probe),true,"even nested draws of the same screen read fresh state")
+      error("nested draw failure")
+    end)
+    check(not ok and tostring(why):find("nested draw failure",1,true))
+    equal(presenter.Shown(screen,probe),false,"the outer draw regains its own reads after the error")
+    check(draw(inner,function()
+      equal(presenter.Shown(screen,probe),true)
+      presenter.Click(screen,probe,"left")
+      windows.ClickChild(screen,probe.name,"left")
+      return true
+    end))
+    equal(presenter.Shown(screen,probe),true,"the nested action also clears the outer read")
+    return true
+  end))
+  equal(M.Shown("TargetWindow",probe),nil,"there is no active read scope after drawing")
 end
 
 -- Empty extended-target rows keep their role menu; the host owns selection/type semantics.
@@ -143,6 +228,18 @@ do
   equal(#events("button"),0)
   S.choice="Spell Info";M.Draw("TargetWindow",p,inst,{x=0,y=0,w=100,h=50,s=1},R)
   equal(events("spellShow")[1][2],44)
+end
+
+-- A reused tuple clears fields which no longer have an overlay value.
+do
+  reset();local p=plan();p.children={node("Button","Buff0")};local inst=instance()
+  local client={x=0,y=0,w=100,h=50,s=1}
+  S.buffs['BuffWindow:Buff0']={21,90000,"Old",true,.25,"2"}
+  check(M.Draw("BuffWindow",p,inst,client,R))
+  equal(S.paint[1].opts.tint[4],.25);equal(S.text[2][7],"2")
+  S.paint={};S.text={};S.buffs['BuffWindow:Buff0']={22,90000,"Current",true}
+  check(M.Draw("BuffWindow",p,inst,client,R))
+  equal(S.paint[1].opts.tint[4],1);equal(#S.text,1);equal(S.text[1][7],"Current")
 end
 
 -- Missing source slots are appended using source art; authored geometry stays exact.
@@ -187,14 +284,23 @@ do
   p.children={strip,number0,number1,name,node("Button","Buff0",175,1,24,24),node("Button","Buff1",175,26,24,24)}
   R.Geometry=function(n,parent)return{x=parent.x+n.rect.x,y=parent.y+n.rect.y,w=n.rect.w,h=n.rect.h,s=parent.s}end
   S.buffs['BuffWindow:Buff0']={44,100000,"Spirit of Wolf",true}
+  local originalSlot=hs.UI.buffs.Slot
+  local slotReads=0
+  hs.UI.buffs.Slot=function(screen,child,overlays)
+    if screen=="BuffWindow"and child=="Buff0"and overlays then slotReads=slotReads+1 end
+    return originalSlot(screen,child,overlays)
+  end
   M.Draw("BuffWindow",p,inst,{x=0,y=0,w=200,h=125,s=1},R)
+  equal(slotReads,1,"the background, number, label and icon share the active buff read")
   local drawn={};for _,v in ipairs(S.paint)do drawn[v.node.name]=true end
   check(drawn.BW_Number0Label);check(drawn.Buff0Label);check(drawn.Buff0)
   check(not drawn.BW_Number1Label);check(not drawn.Buff1)
   local clips=events("clip");equal(#clips,1);equal(clips[1][2],175);equal(clips[1][3],1);equal(clips[1][4],199);equal(clips[1][5],25)
   equal(S.clipDepth,0)
-  S.paint={};S.events={};S.buffs={};S.frame=2
+  S.paint={};S.events={};S.buffs={}
   M.Draw("BuffWindow",p,inst,{x=0,y=0,w=200,h=125,s=1},R)
+  equal(slotReads,2,"a second draw uses current buff data even in the same frame")
+  hs.UI.buffs.Slot=originalSlot
   equal(#S.paint,0,"empty source decorations stay hidden");equal(#events("clip"),0)
   S.buffs['BuffWindow:Buff1']={45,100000,"Second slot",true};S.frame=3
   M.Draw("BuffWindow",p,inst,{x=0,y=0,w=200,h=125,s=1},R)
@@ -204,6 +310,177 @@ do
   S.frame=4;local ok,why=pcall(M.Draw,"BuffWindow",p,inst,{x=0,y=0,w=200,h=125,s=1},R)
   check(not ok and why:find("background paint failed",1,true));equal(S.clipDepth,0)
   R.PaintControl=paint;R.Geometry=nil
+end
+
+-- Authored buff intersections survive movement and follow native visibility.
+do
+  reset();local p=plan({},100,50);local inst=instance()
+  local strip=node("StaticAnimation","BuffBackground",8,5,24,42)
+  local group=node("Screen","AbsoluteBuffGroup",8,5,30,40)
+  group.children={node("Button","Buff0",0,0,24,24)}
+  p.children={strip,group};p._packColorsNormalized=true
+  S.buffs["BuffWindow:Buff0"]={44,100000,"Ward",true}
+  local calculations=0
+  R.Geometry=function(n,parent)
+    calculations=calculations+1
+    return{x=parent.x+n.rect.x,y=parent.y+n.rect.y,w=n.rect.w,h=n.rect.h,s=parent.s}
+  end
+  M.Draw("BuffWindow",p,inst,{x=10,y=20,w=100,h=50,s=1},R)
+  equal(calculations,2)
+  local clips=events("clip")
+  equal(#clips,1);equal(clips[1][2],18);equal(clips[1][3],25)
+  S.frame=2;S.events={}
+  M.Draw("BuffWindow",p,inst,{x=25,y=40,w=100,h=50,s=1},R)
+  equal(calculations,2,"moving a window reuses authored slot intersections")
+  clips=events("clip")
+  equal(#clips,1);equal(clips[1][2],33);equal(clips[1][3],45)
+  S.shown.AbsoluteBuffGroup=false;S.frame=3;S.events={}
+  M.Draw("BuffWindow",p,inst,{x=25,y=40,w=100,h=50,s=1},R)
+  equal(calculations,2);equal(#events("clip"),0,"ancestor visibility remains live")
+  S.shown.AbsoluteBuffGroup=true;S.frame=4;S.events={}
+  M.Draw("BuffWindow",p,inst,{x=25,y=40,w=101,h=50,s=1},R)
+  equal(calculations,4,"resizing re-resolves geometry")
+  equal(#events("clip"),1);equal(S.clipDepth,0)
+  R.Geometry=nil
+end
+
+-- The optional mask projects coverage to live controls while preserving
+-- nested ancestors and supplemental effects beyond the first machine word.
+do
+  reset();local p=plan();local inst=instance()
+  local group=node("Screen","TargetIconRows")
+  local used=node("Button","Buff63");local empty=node("Button","Buff2")
+  local irrelevant=node("Label","Unrelated")
+  group.children={used,empty};p.children={group,irrelevant}
+  local low,high=1<<63,1<<(70-64)
+  hs.UI.buffs.Occupied=function(screen)
+    equal(screen,"TargetWindow")
+    return low,high
+  end
+  local originalSlot=hs.UI.buffs.Slot
+  local slotReads=0
+  hs.UI.buffs.Slot=function(screen,child,...)
+    check(child=="Buff63"or child=="Buff70","empty slots avoid native reads")
+    slotReads=slotReads+1
+    return originalSlot(screen,child,...)
+  end
+  S.buffs["TargetWindow:Buff63"]={44,100000,"Signed lower word",true}
+  S.buffs["TargetWindow:Buff70"]={45,100000,"Second word",true}
+  local visits=0
+  R.VisitChildren=function(_,root,_,_,visit,options)
+    visits=visits+1
+    check(options.nodes[root]and options.nodes[group]and options.nodes[used])
+    check(not options.nodes[empty]and not options.nodes[irrelevant])
+    visit(used)
+  end
+  local w,h=M.Size("TargetWindow",p,inst,R)
+  equal(visits,1);equal(slotReads,0)
+  M.Draw("TargetWindow",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(S.drawn.children[3].name,"Buff70")
+  equal(slotReads,2)
+  low,high=0,0;S.frame=2
+  M.Draw("TargetWindow",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(visits,1,"an empty target bypasses coverage")
+  equal(slotReads,2,"clearing live occupancy takes effect on the next draw")
+  hs.UI.buffs.Occupied=nil;hs.UI.buffs.Slot=originalSlot;R.VisitChildren=nil
+end
+
+-- Empty buttons and their labels keep their authored layout but never enter
+-- the paint path. A target click invalidates earlier reads in the same draw.
+do
+  reset();local p,inst=plan(),instance()
+  local first=node("Button","Buff0")
+  local later=node("Button","Buff4")
+  local health=node("Gauge","TargetHP",0,0,72,12,6)
+  local label=node("Label","BW_Buff4_Label",0,0,30,12,504)
+  local low,reads=0,0
+  local originalClick=windows.ClickChild
+  windows.ClickChild=function(...)
+    low=1<<4
+    S.buffs["TargetWindow:Buff4"]={57,100000,"Fresh effect",false}
+    return originalClick(...)
+  end
+  hs.UI.buffs.Occupied=function()reads=reads+1;return low,0 end
+  S.click=true
+  local probe={Draw=function(screen,_,_,client,_,skip)
+    local before=reads
+    check(skip(screen,first),"empty first slot skips paint")
+    check(skip(screen,later),"sibling shares the native snapshot")
+    equal(reads,before+1,"no repeating native poll per empty control")
+    check(not skip(screen,health),"target health still owns its input")
+    M.DrawControl(screen,health,client,inst,R)
+    check(not skip(screen,later),"later controls observe the change made by target input")
+    equal(reads,before+2)
+    return true
+  end}
+  M.Draw("TargetWindow",p,inst,box,probe)
+  windows.ClickChild=originalClick;low=0
+  probe.Draw=function(screen,_,_,_,_,skip)
+    check(skip(screen,label),"unoccupied spell names also skip paint")
+    hs.UI.buffs.Occupied=function()return nil end
+    M.Click()
+    check(not skip(screen,label),"unknown occupancy preserves legacy painting")
+    return true
+  end
+  M.Draw("BuffWindow",p,inst,box,probe)
+  hs.UI.buffs.Occupied=nil
+end
+
+-- Fixed coverage reuses authored clipping while accepting live visibility
+-- changes. Supplemental buttons remain reachable on older clients.
+do
+  reset();local p,inst=plan(),instance()
+  p._packColorsNormalized=true
+  local panel=node("Screen","BuffPanel",10,0,60,40)
+  panel.children={node("Button","Buff0",56,0,20,12),node("Button","Buff1",60,0,20,12)}
+  p.children={panel}
+  S.buffs["BuffWindow:Buff0"]={44,100000,"Partly visible",true}
+  S.buffs["BuffWindow:Buff1"]={45,100000,"Outside parent",true}
+  local calls=0
+  local compact=setmetatable({RetainLayout=function()end,VisitChildren=function()error("fixed coverage walked the renderer")end,
+    Geometry=function(n,parent)
+      calls=calls+1
+      local at=n.rect
+      return{x=parent.x+at.x,y=parent.y+at.y,w=at.w,h=at.h,s=parent.s}
+    end},{__index=R})
+  M.Draw("BuffWindow",p,inst,box,compact)
+  equal(S.drawn.children[2].name,"Buff1")
+  equal(S.drawn.children[1].children[1],panel.children[1],"partly visible authored slot is retained")
+  local measured=calls
+  S.frame=2;S.shown.BuffPanel=false
+  M.Draw("BuffWindow",p,inst,box,compact)
+  equal(S.drawn.children[2].name,"Buff0","hidden ancestor leaves a supplemental slot")
+  equal(S.drawn.children[3].name,"Buff1")
+  -- Test the retained size query alone, because changing supplemental nodes
+  -- may also rebuild the separate decoration intersections at paint time.
+  local measuredAfterPaint=calls
+  S.frame=3;S.shown.BuffPanel=true
+  local _,height=M.Size("BuffWindow",p,inst,compact)
+  check(height>50);equal(calls,measuredAfterPaint,"layout bounds remain retained across occupancy and visibility")
+  S.frame=4;p.rect.w=p.rect.w+1
+  M.Size("BuffWindow",p,inst,compact)
+  equal(calls,measuredAfterPaint+3,"new dimensions acquire new bounds")
+  check(measured>=3)
+end
+
+-- Passive buff windows paint artwork continuously. The normal mouse item is
+-- restored on entry, and also remains registered for a held item's release.
+do
+  reset();local p,inst=plan(),instance()
+  p._packColorsNormalized=true;p.children={node("Button","Buff0")}
+  S.buffs["BuffWindow:Buff0"]={44,100000,"Ward",true}
+  S.windowHovered=false;S.hover=false
+  M.Draw("BuffWindow",p,inst,box,R)
+  check(S.animations[1]);equal(S.last,nil)
+  S.frame=2;S.windowHovered=true;S.active=true;S.hover=true
+  M.Draw("BuffWindow",p,inst,box,R)
+  equal(S.last,"##source-status:BuffWindow:Buff0");check(S.tooltip:find("Ward",1,true))
+  S.frame=3;S.windowHovered=false;S.active=false;S.hover=false;S.last=nil
+  M.Draw("BuffWindow",p,inst,box,R)
+  equal(S.last,"##source-status:BuffWindow:Buff0","release remains registered outside the window")
+  S.frame=4;S.last=nil
+  M.Draw("BuffWindow",p,inst,box,R)
+  equal(S.last,nil,"passive items stop when the hold clears")
 end
 
 -- Source measurement owns wrapping/SnapToChildren; do not replace it with a guessed linear layout.
@@ -220,6 +497,102 @@ do
   equal(w,120);equal(h,240);equal(reads,1);equal(#S.events,0)
   local cw,ch=M.ContentSize("CastSpellWnd",p,inst,R);equal(cw,120);equal(ch,240)
   R.MeasureChildren=nil
+end
+
+-- Packed spell layouts retain coverage and snapping while usable gem visibility stays stable.
+do
+  reset()
+  local p=plan({},100,50);p._packColorsNormalized=true
+  local tile=node("TileLayoutBox","GemTiles",0,0,100,50);tile.fields.SnapToChildren=true
+  local gem=node("SpellGem","CSPW_Spell0")
+  local holder=node("StaticAnimation","Holder")
+  local book=node("Button","CSPW_SpellBookV")
+  p.children={tile,book};tile.children={gem,holder}
+  for n=0,11 do S.shown["CSPW_Spell"..n]=n==0 end
+  local rawShown=windows.ChildShown
+  local nextOrientation=false
+  p.children[3]=node("Screen","CSPW_HorizontalOrientationBook")
+  windows.ChildShown=function(screen,child)
+    if child=="CSPW_HorizontalOrientationBook"then return nextOrientation end
+    return rawShown(screen,child)
+  end
+  S.gems.CSPW_Spell0={shown=true}
+  local localR,measures,visits={},0,0
+  for key,value in pairs(R)do localR[key]=value end
+  function localR.RetainLayout()end
+  function localR.MeasureChildren(_,_,_,at)
+    measures=measures+1
+    return at.w,nextOrientation and 90 or 75
+  end
+  function localR.VisitChildren(_,_,_,_,visit,options)
+    visits=visits+1
+    check(options.nodes[p] and options.nodes[tile] and options.nodes[gem] and options.nodes[book])
+    equal(options.nodes[holder],nil,"decorative pieces do not require replacement coverage")
+    visit(gem);visit(book)
+  end
+  local inst=instance()
+  local w,h=M.Size("CastSpellWnd",p,inst,localR)
+  equal(w,100);equal(h,75);equal(visits,1);equal(measures,1)
+  M.ContentSize("CastSpellWnd",p,inst,localR);equal(measures,2)
+  S.frame=2;S.gems.CSPW_Spell0.tooltip="A live spell";S.gems.CSPW_Spell0.tex=41
+  M.Draw("CastSpellWnd",p,inst,{x=10,y=10,w=w,h=h,s=1},localR)
+  equal(S.images[1][1],41,"reused geometry never retains spell artwork")
+  M.ContentSize("CastSpellWnd",p,inst,localR)
+  equal(visits,1);equal(measures,2)
+  S.frame=3;nextOrientation=true
+  w,h=M.Size("CastSpellWnd",p,inst,localR)
+  equal(h,90);equal(visits,2);equal(measures,3)
+  S.frame=4;S.shown.CSPW_Spell1=true;S.gems.CSPW_Spell1={shown=true}
+  w,h=M.Size("CastSpellWnd",p,inst,localR)
+  M.Draw("CastSpellWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},localR)
+  equal(S.drawn.children[4].name,"CSPW_Spell1","new usable gems trigger coverage for a missing authored slot")
+  equal(visits,3);equal(measures,4)
+  windows.ChildShown=rawShown
+end
+
+-- Passive packed gem frames still draw live artwork. A right press stays in
+-- the interaction path until its hold/release completes outside that frame.
+do
+  reset()
+  local p=plan();p._packColorsNormalized=true
+  local gem=node("SpellGem","CSPW_Spell0");gem._packColorsNormalized=true
+  local book=node("Button","CSPW_SpellBookV");book._packColorsNormalized=true
+  local art=node("StaticAnimation","GemArtwork");art._packColorsNormalized=true;art.fields.Visible=false
+  p.children={gem,book,art}
+  for slot=0,11 do S.shown["CSPW_Spell"..slot]=slot==0 end
+  S.gems.CSPW_Spell0={shown=true,tex=99};S.book={45}
+  local originalShown,originalDraw,originalRetain=windows.ChildShown,R.Draw,R.RetainLayout
+  local gemReads=0
+  windows.ChildShown=function(screen,child)
+    if child=="GemArtwork"then error("static art has no native visibility")end
+    if child=="CSPW_Spell0"then gemReads=gemReads+1 end
+    return originalShown(screen,child)
+  end
+  function R.RetainLayout()end
+  -- The mock renderer invokes the presenter visibility before painting.
+  function R.Draw(screen,source,inst,at,adapter)
+    equal(M.Shown(screen,gem),true)
+    equal(M.Shown(screen,art),false)
+    return originalDraw(screen,source,inst,at,adapter)
+  end
+  local inst=instance()
+  local at={x=0,y=0,w=100,h=50,s=1}
+  local visit=R.VisitChildren
+  R.VisitChildren=function(_,_,_,_,callback)callback(gem);callback(book)end
+  S.windowHovered=false;S.hover=false
+  M.Draw("CastSpellWnd",p,inst,at,R)
+  equal(S.hit,nil);equal(S.images[1][1],99);equal(gemReads,1)
+  S.frame=2;S.windowHovered=true;S.hover=true;S.right=true;S.down=true
+  M.Draw("CastSpellWnd",p,inst,at,R)
+  equal(events("gemClick")[1][3],"rightdown")
+  S.frame=3;S.windowHovered=false;S.hover=false;S.right=false;S.time=.6
+  M.Draw("CastSpellWnd",p,inst,at,R)
+  equal(events("gemClick")[2][3],"rightheld")
+  S.frame=4;S.down=false;S.released=true
+  M.Draw("CastSpellWnd",p,inst,at,R)
+  equal(events("gemClick")[3][3],"rightupheld");equal(events("gemClick")[3][4],true)
+  R.VisitChildren,R.Draw,R.RetainLayout=visit,originalDraw,originalRetain
+  windows.ChildShown=originalShown
 end
 
 -- A fixed-height scrolling source keeps its window size and exposes measured virtual content.
@@ -289,6 +662,29 @@ do
   reset();n,b,inst=gemFixture();S.gems.CSPW_Spell0.tex=nil
   M.DrawControl("CastSpellWnd",n,b,inst,R)
   equal(#S.text,0,"empty gem does not duplicate authored slot labels")
+end
+do
+  reset();local n,b,inst=gemFixture();local record,reads=nil,0
+  local originalInfo,originalOverlay=spells.GemInfo,spells.GemOverlay
+  spells.GemInfo=function(_,name,into,y0,y1)
+    reads=reads+1
+    equal(name,"CSPW_Spell0");equal(y0,204);equal(y1,228)
+    if record then equal(into,record,"the native call reuses the gem record")end
+    record=into
+    into.shown,into.tex,into.tintA=true,S.gems[name].tex,.75
+    into.top,into.overlay=S.overlay,S.overlay and .5 or nil
+    into.coolA=S.overlay and .6 or nil
+    return into
+  end
+  spells.GemOverlay=function()error("modern GemInfo already supplied the cooldown")end
+  S.overlay=215
+  M.DrawControl("CastSpellWnd",n,b,inst,R)
+  equal(events("fill")[1][3],215);equal(events("fill")[1][9],.6)
+  S.overlay=nil;S.frame=S.frame+1
+  M.DrawControl("CastSpellWnd",n,b,inst,R)
+  equal(#events("fill"),1,"an idle gem clears the previous frame's cooldown")
+  equal(reads,2)
+  spells.GemInfo,spells.GemOverlay=originalInfo,originalOverlay
 end
 
 -- Quick outside release does not forget; held release keeps the shown spell display.
@@ -386,10 +782,13 @@ do
     S.shown[n.name]=true
   end
   local originalVisit,originalMeasure=R.VisitChildren,R.MeasureChildren
-  R.MeasureChildren=function(_,source,_,at)equal(#source.children,20);return at.w,695 end
+  local extentWalks=0
+  R.MeasureChildren=function(_,source,_,at)
+    extentWalks=extentWalks+1;equal(#source.children,20);return at.w,695
+  end
   R.VisitChildren=function(_,source,_,at,visit,opts)
     equal(source,p);equal(at.h,80,"source anchors use the viewport size")
-    equal(opts.clip.h,695,"coverage includes reachable scroll content")
+    check(opts.clip.h>=695,"coverage includes reachable scroll content")
     for _,n in ipairs(source.children)do
       visit(n,{x=10,y=n.anchors.top,w=at.w-20,h=30,s=1})
     end
@@ -399,8 +798,10 @@ do
   M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
   equal(#S.drawn.children,20,"all20 authored rows remain; no 12px duplicates are appended")
   equal(S.drawn.children[20],p.children[20]);equal(p.children[20].anchors.top,665)
+  equal(extentWalks,0)
   local cw,ch=M.ContentSize("ExtendedTargetWnd",p,inst,R)
   equal(cw,120);equal(ch,695,"the last live row remains reachable through the scroll child")
+  equal(extentWalks,1)
   R.VisitChildren,R.MeasureChildren=originalVisit,originalMeasure
 end
 do
@@ -426,13 +827,216 @@ do
   local anchored=node("Gauge","ETW_Gauge0",0,0,0,0,42)
   local p=plan({},100,50);p.children={anchored}
   local originalVisit=R.VisitChildren
-  R.VisitChildren=function(_,_,_,_,visit)visit(anchored,{x=20,y=0,w=80,h=35,s=1})end
+  local width,coverageWalks=80,0
+  R.VisitChildren=function(_,_,_,_,visit)
+    coverageWalks=coverageWalks+1;visit(anchored,{x=20,y=0,w=width,h=35,s=1})
+  end
   local inst=instance();local w,h=M.Size("ExtendedTargetWnd",p,inst,R)
   M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
-  local extra=S.drawn.children[2]
+  local prepared=S.drawn;local extra=prepared.children[2]
   equal(extra.rect.w,80);equal(extra.rect.h,35,"new slots inherit resolved anchor size, not a12px placeholder")
   equal(extra.gaugeEqType,43);equal(anchored.rect.w,0)
+  S.frame=2
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(S.drawn,prepared,"matching live extras reuse the prepared graph")
+  S.frame=3;width=70
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  check(S.drawn~=prepared);equal(S.drawn.children[2].rect.w,70)
+  S.frame=4;S.shown.ETW_Gauge1=false
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(S.drawn,p,"removed live slots stop enlarging the layout")
+  local previousWalks=coverageWalks
+  S.frame=5;S.shown.ETW_Gauge0=false
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(S.drawn,p,"the empty window still draws the authored graph")
+  equal(coverageWalks,previousWalks,"an empty window skips the replacement coverage walk")
+  S.frame=6;S.shown.ETW_Gauge1=true
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(S.drawn.children[2].name,"ETW_Gauge1","a newly active slot still gets an appended row")
+  equal(coverageWalks,previousWalks+1)
   R.VisitChildren=originalVisit
+end
+-- Complex packed Extended Target layouts retain the dormant extent and continue to draw
+-- their authored compound gauge aliases. Opening a native slot invalidates the extent.
+do
+  reset()
+  for row=0,19 do S.shown["ETW_Gauge"..row]=false end
+  local p=plan({},100,50);p._packColorsNormalized=true
+  local nested=node("Screen","DecorativeGaugeWrap",0,80,100,25)
+  local alias=node("Gauge","ETW_Gauge0_1A",2,0,70,20,42);alias._packColorsNormalized=true
+  local twin=node("Gauge","ETW_Gauge0_1B",75,0,20,20,42);twin._packColorsNormalized=true
+  nested.children={alias,twin};p.children={nested};S.hover=false
+  local localR,measures,visits,gauges,painted={},0,0,0,0
+  for key,value in pairs(R)do localR[key]=value end
+  function localR.RetainLayout()end
+  function localR.MeasureChildren()
+    measures=measures+1
+    return 100,S.shown.ETW_Gauge0 and 130 or 105
+  end
+  function localR.VisitChildren(_,_,_,_,visit)
+    visits=visits+1;visit(alias)
+  end
+  function localR.PaintGauge(_,n,_,_,state)
+    check(n==alias or n==twin)
+    equal(state.fraction,S.shown.ETW_Gauge0 and .5 or nil)
+    painted=painted+1
+  end
+  local originalPaintGauge=R.PaintGauge
+  R.PaintGauge=localR.PaintGauge
+  local rawGauge=hs.UI.character.Gauge
+  hs.UI.character.Gauge=function(kind)gauges=gauges+1;return rawGauge(kind)end
+  local inst=instance()
+  local w,h=M.ContentSize("ExtendedTargetWnd",p,inst,localR)
+  equal(w,100);equal(h,105);equal(measures,1);equal(visits,0)
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},localR)
+  equal(painted,2);equal(gauges,1,"compound gauges share the live fallback value")
+  S.frame=2
+  w,h=M.ContentSize("ExtendedTargetWnd",p,inst,localR)
+  equal(h,105);equal(measures,1);equal(visits,0)
+  S.frame=3;S.shown.ETW_Gauge0=true;S.gauges={[42]={.5,"Current target",500}}
+  w,h=M.ContentSize("ExtendedTargetWnd",p,inst,localR)
+  equal(h,130);equal(measures,2);equal(visits,1)
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},localR)
+  equal(painted,4);equal(gauges,2);equal(S.drawn,p)
+  R.PaintGauge=originalPaintGauge
+  hs.UI.character.Gauge=rawGauge
+end
+-- An absent compound gauge is skipped outside the window while a held
+-- fragment still receives release after the pointer leaves it.
+do
+  reset()
+  for row=0,19 do S.shown["ETW_Gauge"..row]=false end
+  local p=plan({},100,50);p._packColorsNormalized=true
+  local inner=node("Gauge","ETW_Gauge0_1A",2,0,50,12,42);inner._packColorsNormalized=true
+  local outer=node("Gauge","ETW_Gauge0_1B",25,0,25,12,42);outer._packColorsNormalized=true
+  local wrapper=node("Screen","LodidodiClip",0,0,25,12);wrapper.children={inner}
+  local unavailable=node("Button","ETW_Role1");unavailable._packColorsNormalized=true
+  local decoration=node("StaticAnimation","Decoration")
+  p.children={wrapper,outer,unavailable,decoration}
+  local retainLayout,paintGauge=R.RetainLayout,R.PaintGauge
+  local retained=0
+  function R.RetainLayout()retained=retained+1 end
+  function R.PaintGauge()end
+  local inst=instance()
+  local at={x=0,y=0,w=100,h=50,s=1}
+  S.windowHovered=false;S.hover=false
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  local projected=S.drawn
+  equal(#projected.children,1)
+  equal(projected.children[1],decoration);equal(#p.children,4);equal(retained,1)
+  S.frame=2
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(S.drawn,projected);equal(retained,1,"static geometry stays retained across idle frames")
+  S.frame=3;S.windowHovered=true;S.hover=true;S.active=true;S.right=true
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(S.drawn,p)
+  equal(events("click")[1][3],"ETW_Role0","hovered compound aliases retain their context menu")
+  S.frame=4;S.windowHovered=false;S.hover=false;S.active=false;S.right=false;S.click=true
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(S.drawn,p,"register the active alias through release outside the window")
+  S.frame=5;S.click=false
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(S.drawn,projected)
+  S.frame=6;S.gauges={[42]={.4,"Live target",400}}
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(#S.drawn.children,3,"real gauge artwork remains visible outside the hovered window")
+  equal(S.drawn.children[1],wrapper);equal(S.drawn.children[2],outer)
+  R.RetainLayout,R.PaintGauge=retainLayout,paintGauge
+end
+-- Fixed populated layouts retain coverage while re-reading the live gauges
+-- and visibility-dependent children on every draw.
+do
+  reset()
+  for row=0,19 do S.shown["ETW_Gauge"..row]=row==0 end
+  local p=plan({},100,50);p._packColorsNormalized=true
+  local wrap=node("Screen","FixedHealth")
+  local health=node("Gauge","ETW_Gauge0",0,0,80,12,42);health._packColorsNormalized=true
+  local decoration=node("StaticText","Decoration")
+  p.children={wrap,decoration};wrap.children={health}
+  local retain,visit,draw,paint=R.RetainLayout,R.VisitChildren,R.Draw,R.PaintGauge
+  local originalShown=windows.ChildShown
+  local coverageReads,shownReads=0,0
+  windows.ChildShown=function(screen,child)
+    if child=="ETW_Gauge0"then shownReads=shownReads+1 end
+    return originalShown(screen,child)
+  end
+  function R.RetainLayout()end
+  function R.VisitChildren(_,_,_,_,callback,options)
+    coverageReads=coverageReads+1
+    check(options.nodes[p] and options.nodes[wrap] and options.nodes[health])
+    equal(options.nodes[decoration],nil)
+    callback(health,{x=0,y=0,w=80,h=12,s=1})
+  end
+  function R.PaintGauge(_,n,_,_,value,options)
+    if n==health then S.latestHealth=value.fraction;S.captionOverride=options and options.caption end
+  end
+  function R.Draw(screen,source,inst,at,adapter)
+    equal(M.Shown(screen,health),true)
+    return draw(screen,source,inst,at,adapter)
+  end
+  local inst=instance()
+  local at={x=0,y=0,w=100,h=50,s=1}
+  S.windowHovered=false;S.hover=false;S.gauges={[42]={.45,"Target",450}}
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(coverageReads,1);equal(shownReads,1);equal(S.latestHealth,.45);equal(S.hit,nil)
+  S.frame=2;S.gauges[42]={.75,"Target",750};health.fields.TextOffsetY=8000
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(coverageReads,1);equal(shownReads,2);equal(S.latestHealth,.75);equal(S.hit,nil)
+  equal(S.captionOverride,"","only a caption beyond the client's clipping rectangle is skipped")
+  S.frame=3;S.shown.ETW_Gauge1=true;S.windowHovered=true;S.hover=true;S.right=true
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(coverageReads,2);equal(S.drawn.children[3].name,"ETW_Gauge1")
+  equal(events("click")[1][3],"ETW_Role0","populated rows retain their native context action")
+  S.frame=4;at.h=8100;S.right=false
+  M.Draw("ExtendedTargetWnd",p,inst,at,R)
+  equal(S.captionOverride,nil,"the authored caption returns when its coordinates enter the viewport")
+  R.RetainLayout,R.VisitChildren,R.Draw,R.PaintGauge=retain,visit,draw,paint
+  windows.ChildShown=originalShown
+end
+do
+  reset()
+  for row=0,19 do S.shown["ETW_Gauge"..row]=false end
+  local p=plan({},100,50);p._packColorsNormalized=true;p.fields.Style_VScroll=true
+  local first=node("Gauge","ETW_Gauge0",10,20,80,20,42)
+  local last=node("Gauge","ETW_Gauge12",10,100,80,20,54)
+  local mana=node("Gauge","ETW_ManaGauge12",10,120,80,12,74)
+  first._packColorsNormalized=true;last._packColorsNormalized=true;mana._packColorsNormalized=true
+  p.children={first,last,mana}
+  local flatR,geometryReads={},0
+  for key,value in pairs(R)do flatR[key]=value end
+  function flatR.Geometry(n,at)
+    geometryReads=geometryReads+1
+    return{x=at.x+n.rect.x,y=at.y+n.rect.y,w=n.rect.w,h=n.rect.h}
+  end
+  function flatR.VisitChildren()error("flat coverage should not repeat the authored walk")end
+  function flatR.MeasureChildren()error("flat extents should not repeat the authored walk")end
+  local inst=instance()
+  local _,h=M.ContentSize("ExtendedTargetWnd",p,inst,flatR)
+  equal(h,50,"role and resource controls cannot expand the empty window")
+  S.shown.ETW_Gauge12=true;S.shown.ETW_ManaGauge12=false
+  _,h=M.ContentSize("ExtendedTargetWnd",p,inst,flatR)
+  equal(h,120,"scroll extent observes the live row even after same-frame sizing")
+  S.shown.ETW_ManaGauge12=true
+  _,h=M.ContentSize("ExtendedTargetWnd",p,inst,flatR)
+  equal(h,132,"secondary visibility still controls its own scroll extent")
+  equal(geometryReads,3,"live extent changes reuse the authored geometry")
+  S.frame=S.frame+1
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=100,h=132,s=1},flatR)
+  equal(S.drawn,p,"reachable offscreen health rows retain their authored layout")
+  S.shown.ETW_Gauge2=true
+  S.frame=S.frame+1
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=100,h=132,s=1},flatR)
+  equal(S.drawn.children[4].name,"ETW_Gauge2","a missing live row still receives an appended control")
+  equal(S.drawn.children[4].rect.w,80,"the appended row inherits its authored sibling dimensions")
+
+  flatR.Draw=function()
+    equal(M.Shown("ExtendedTargetWnd",mana),true,"the full numeric suffix identifies the live slot")
+    S.shown.ETW_Gauge12=false
+    M.Click()
+    equal(M.Shown("ExtendedTargetWnd",mana),false,"actions invalidate canonical row visibility immediately")
+    return true
+  end
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=100,h=132,s=1},flatR)
 end
 local GR={};for key,value in pairs(R)do GR[key]=value end
 do
@@ -444,6 +1048,7 @@ do
     local collapsed=child.anchors and child.anchors.explicit.right
     return{x=parent.x+child.rect.x,y=parent.y+child.rect.y,w=collapsed and 0 or child.rect.w,h=collapsed and 0 or child.rect.h,s=1}
   end
+  renderer.MeasureText=function()error("fixed group layouts do not probe font metrics")end
   local prepared=M.GroupLayout(p,inst,renderer)
   local at=renderer.Geometry(prepared.children[1],{x=0,y=0})
   equal(at.w,100);equal(at.h,23,"Takus's measured fixed HP cell must also be drawable")
@@ -534,6 +1139,73 @@ local function collect(p)
     for _,child in ipairs(n.children or{})do visit(child)end
   end
   visit(p);return out
+end
+do
+  reset();S.hover=false
+  local p=plan();p.children={node("Gauge","Gauge1",0,0,60,10,11),
+    node("Gauge","ManaGauge1",0,10,60,10,31),node("Gauge","PetGauge1",0,20,60,10,17),
+    node("Gauge","GW_Gauge1",0,30,60,8,11),node("Gauge","CustomHP",0,38,60,8,11)}
+  local inst=instance();local snapshots,dragChecks,retained=0,0,0
+  inst.hud={DragItem=function()dragChecks=dragChecks+1;return false end}
+  local hp=720
+  hs.UI.character.GroupGauges=function(row)
+    equal(row,1);snapshots=snapshots+1
+    return hp,-2,310,-1,"Member",""
+  end
+  windows.ChildGauge=function(_,child)
+    if child=="CustomHP"then return .25,"Native override",.2,.4,.6 end
+  end
+  local painted={}
+  local groupRenderer={}
+  for key,value in pairs(GR) do groupRenderer[key]=value end
+  groupRenderer.RetainLayout=function()retained=retained+1 end
+  groupRenderer.PaintGauge=function(_,n,_,_,view)
+    painted[#painted+1]={name=n.name,value=view.fraction,caption=view.caption,r=view.tint and view.tint[1]}
+  end
+  groupRenderer.Draw=function(screen,prepared,owner,at)
+    for _,n in ipairs(prepared.children)do M.DrawControl(screen,n,groupRenderer.Geometry(n,at),owner,groupRenderer)end
+    hp=250;M.Click();M.DrawControl(screen,prepared.children[1],groupRenderer.Geometry(prepared.children[1],at),owner,groupRenderer)
+    return true
+  end
+  check(M.Draw("GroupWindow",p,inst,{x=0,y=0,w=100,h=50,s=1},groupRenderer))
+  equal(painted[1].value,.72);equal(painted[1].caption,"Member")
+  equal(painted[2].value,1);equal(painted[2].r,128/255)
+  equal(painted[3].value,nil,"an absent pet contributes neither a track nor a caption")
+  equal(painted[4].value,.72,"aliased HP tracks share the member snapshot")
+  equal(painted[5].value,.25);equal(painted[5].caption,"Native override");equal(painted[5].r,.2)
+  equal(painted[6].value,.25,"an action refreshes the row snapshot immediately")
+  equal(snapshots,2);equal(dragChecks,2,"idle row controls share one drag check per draw scope")
+  equal(retained,1);M.GroupLayout(p,inst,groupRenderer,100,50,1);equal(retained,1)
+  hs.UI.character.GroupGauges=nil;windows.ChildGauge=nil
+end
+do
+  reset();local p=plan();p._packColorsNormalized=true
+  p.children={node("Gauge","Gauge1",0,0,60,10,11)}
+  local inst=instance()
+  S.windowHovered,S.hover=false,false
+  M.Draw("GroupWindow",p,inst,box,GR)
+  check(S.paint[1]);equal(S.last,nil,"passive group draws without creating row input items")
+  S.frame=2;S.windowHovered,S.hover,S.active=true,true,true
+  M.Draw("GroupWindow",p,inst,box,GR)
+  equal(S.last,"##source-status:GroupWindow:Gauge1")
+  S.frame=3;S.windowHovered,S.hover,S.active,S.click=false,false,false,true;S.last=nil
+  M.Draw("GroupWindow",p,inst,box,GR)
+  equal(S.last,"##source-status:GroupWindow:Gauge1","group row receives a held release outside the window")
+  equal(events("click")[1][3],"Gauge1")
+  S.frame=4;S.click=false;S.last=nil
+  M.Draw("GroupWindow",p,inst,box,GR)
+  equal(S.last,nil);equal(#events("click"),1)
+end
+do
+  reset();local p=groups("compact");local inst=instance();inst.profile={source="nemesis-stock"}
+  local measure=GR.MeasureText
+  local delta=0
+  GR.MeasureText=function(_,node,text)return #tostring(text)*7+delta*node.font,12 end
+  local first=M.GroupLayout(p,inst,GR)
+  equal(M.GroupLayout(p,inst,GR),first,"matching font metrics reuse group layout")
+  delta=1
+  check(M.GroupLayout(p,inst,GR)~=first,"font metric changes reflow the group layout")
+  GR.MeasureText=measure
 end
 do
   reset();members();local p=plan({},147,260);p.children={}

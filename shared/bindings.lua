@@ -3,11 +3,30 @@
 local API = hs.UI
 local B = {}
 
+local presenterKeys={"hailstone_skin_status_presenters","hailstone_skin_presenters","hailstone_skin_model_presenters"}
+local activeScreen,activePresenter
 local function presenter(screen)
-  for _,key in ipairs({"hailstone_skin_status_presenters","hailstone_skin_presenters","hailstone_skin_model_presenters"}) do
+  local scoped=activeScreen~=nil and screen==activeScreen
+  if scoped and activePresenter~=nil then return activePresenter or nil end
+  for _,key in ipairs(presenterKeys) do
     local value=rawget(_G,key)
-    if value and value.Handles and value.Handles(screen) then return value end
+    if value and value.Handles and value.Handles(screen) then
+      if scoped then activePresenter=value end
+      return value
+    end
   end
+  if scoped then activePresenter=false end
+end
+
+-- Resolve lazily inside the protected traversal. A nested screen gets its
+-- own binding while each presenter still reads current state from the host.
+function B.PushPresenter(screen)
+  local previousScreen,previousOwner=activeScreen,activePresenter
+  if screen~=activeScreen then activeScreen,activePresenter=screen,nil end
+  return previousScreen,previousOwner
+end
+function B.PopPresenter(screen,owner)
+  activeScreen,activePresenter=screen,owner
 end
 
 function B.DrawControl(screen,node,box,instance,renderer)
@@ -44,8 +63,13 @@ function B.Function(module, member)
 end
 
 function B.Call(module, member, ...)
-  local fn = B.Function(module, member)
-  if fn then return fn(...) end
+  -- Capability checks use B.Function. Runtime calls use the current guarded
+  -- facade entry directly, including any live hook dispatcher.
+  local methods=API[module]
+  local fn=methods and rawget(methods,member)
+  -- Optional methods on older facades still use capability detection.
+  if type(fn)~="function" then fn=B.Function(module,member) end
+  if type(fn)=="function" then return fn(...) end
 end
 
 function B.Id(node) return tostring(node.name or node.item or "") end
@@ -93,8 +117,13 @@ end
 function B.Gauge(screen, node)
   local fraction, text, r, g, b = B.Call("windows", "ChildGauge", screen, B.Id(node))
   local raw
-  if fraction == nil and tonumber(node.gaugeEqType or node.eqType) then
-    fraction, text, raw, r, g, b = B.Call("character", "Gauge", tonumber(node.gaugeEqType or node.eqType))
+  if fraction==nil then
+    local kind=tonumber(node.gaugeEqType or node.eqType)
+    if kind then
+      local owner=screen=="PlayerWindow" and presenter(screen)
+      if owner and owner.CharacterGauge then fraction,text,raw,r,g,b=owner.CharacterGauge(kind)
+      else fraction,text,raw,r,g,b=B.Call("character","Gauge",kind) end
+    end
   end
   -- The host already converts special negative bands to their actual fill/tint.
   -- Only -1 means the gauge must draw nothing, including its track and caption.

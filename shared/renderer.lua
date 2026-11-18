@@ -4,13 +4,70 @@ local B = dofile("lib/pack_bindings.lua")
 local R = {}
 local instances = {} -- private to this renderer module/environment; never write a plugin's inherited globals
 local unpack = table.unpack
+local EMPTY = {} -- read-only default for missing source tables
 local WHITE = {1, 1, 1, 1}
+local retainedGroups=setmetatable({},{__mode="k"})
 local DEFAULT = {text={0.92,0.92,0.9,1}, disabled={0.5,0.5,0.5,1}, background={0.08,0.08,0.09,0.96},
                  border={0.42,0.42,0.4,1}, hp={0.68,0.13,0.1,1}, mana={0.12,0.25,0.72,1}}
 local supported = {Screen=true, Page=true, TabBox=true, Label=true, StaticText=true, Button=true, Gauge=true,
   InvSlot=true, SpellGem=true, HotButton=true, Editbox=true, Slider=true, Listbox=true, Combobox=true,
   STMLbox=true, StaticAnimation=true, StaticTintedBlendAnimation=true, StaticFrame=true, StaticHeader=true,
   LayoutBox=true, HorizontalLayoutBox=true, VerticalLayoutBox=true, TileLayoutBox=true, TemplateContainer=true}
+
+-- Placement entries are private to a traversal. A synchronous presenter may
+-- borrow its draw rectangles. General draws and visitors still own theirs.
+local placementPool,activePlacements={},{}
+local activeFrame,paintFilter,borrowDrawRects
+local drawClipDepth=0
+local function borrowPlacements()
+  local depth=#activePlacements+1
+  local scratch=placementPool[depth]
+  if not scratch then
+    scratch={items={},flow={},flexible={},ordered={},records={}}
+    if depth<=16 then placementPool[depth]=scratch end
+  end
+  activePlacements[depth]=scratch
+  return scratch
+end
+local function clearList(list)
+  for i=#list,1,-1 do list[i]=nil end
+end
+local function releasePlacements()
+  local depth=#activePlacements
+  local scratch=activePlacements[depth]
+  activePlacements[depth]=nil
+  if #scratch.items>512 then
+    placementPool[depth]=nil
+    return -- do not retain unusually large scratch arrays
+  end
+  for i=#scratch.items,1,-1 do
+    local entry=scratch.items[i]
+    if entry.rect and entry.rect==entry.scratchRect then entry.rect.paintedChromeNode=nil end
+    entry.node,entry.rect,entry.under=nil,nil,nil
+    scratch.items[i]=nil
+  end
+  clearList(scratch.flow);clearList(scratch.flexible);clearList(scratch.ordered)
+end
+local function presenterCall(screen,fn,...)
+  local placementDepth=#activePlacements
+  local clipDepth=drawClipDepth
+  local previousScreen,previousOwner=B.PushPresenter(screen)
+  local outerFrame=activeFrame
+  if not outerFrame then
+    local getFrameCount=rawget(ui,"GetFrameCount")
+    if getFrameCount then activeFrame=getFrameCount() end
+  end
+  local ok,result=pcall(fn,...)
+  activeFrame=outerFrame
+  B.PopPresenter(previousScreen,previousOwner)
+  -- Restore only clips and traversal storage acquired by this scope. A
+  -- presenter can catch a nested draw failure and continue its own draw.
+  while drawClipDepth>clipDepth do
+    ui.PopClipRect();drawClipDepth=drawClipDepth-1
+  end
+  while #activePlacements>placementDepth do releasePlacements() end
+  return ok,result
+end
 
 local function number(value, default)
   local n = tonumber(value)
@@ -19,13 +76,16 @@ local function number(value, default)
 end
 local function clamp(value, low, high) return math.max(low, math.min(high, value)) end
 local function truth(value) return value == true or value == 1 or value == "true" end
-local function color(value, default)
-  if type(value) ~= "table" then return default or WHITE end
+local function components(value)
   local r,g,b,a = number(value.r or value.R or value[1]), number(value.g or value.G or value[2]),
     number(value.b or value.B or value[3]), value.a or value.Alpha or value[4]
   if a~=nil then a=number(a) end
   local unit = math.max(r,g,b, a or 0) > 1 and 255 or 1
-  return {r/unit,g/unit,b/unit,(a == nil and unit or a)/unit}
+  return r/unit,g/unit,b/unit,(a == nil and unit or a)/unit
+end
+local function color(value, default)
+  if type(value) ~= "table" then return default or WHITE end
+  return {components(value)}
 end
 local function flag(group, member) return ui[group] and ui[group][member] or 0 end
 local function emit(instance, key, message)
@@ -83,12 +143,30 @@ local function inflate(node,depth)
   return result
 end
 
+-- A prepared plan may register after its final layout changes. Retained
+-- geometry is relative to the parent. Visibility and input stay live.
+function R.RetainLayout(node)
+  local source=node.children
+  if not source or #source==0 then return end
+  if retainedGroups[node] and retainedGroups[node].source==source then return end
+  local kind=node.type
+  local layout=(node.fields or EMPTY).Layout
+  local flow=layout and layout~="" or kind=="HorizontalLayoutBox" or kind=="VerticalLayoutBox" or kind=="TileLayoutBox"
+  local leaves=true
+  for _,child in ipairs(source)do
+    if child.type=="Screen" or child.type=="Page" or child.children and #child.children>0 then leaves=false end
+    R.RetainLayout(child)
+  end
+  if #source<=512 then retainedGroups[node]={source=source,flow=flow,leaves=leaves} end
+end
+
 function R.New(profile)
   profile = profile or {}
   local key = tostring(profile.id or profile.source or profile) .. "\n" .. tostring(profile.index)
     .. "\n" .. tostring(profile.revision or profile.generation or "")
   if instances[key] then return instances[key] end
-  local instance = {profile=profile, messages={}, folded={}, plans={}, textures={}, controls={}, preflight={},buckets={},baseBuckets={}}
+  local instance = {profile=profile, messages={}, folded={}, plans={}, textures={}, controls={}, preflight={},buckets={},baseBuckets={},
+    chromeMetrics=setmetatable({},{__mode="k"}),mergedTemplates={}}
   instance.dataRoot=type(profile.index)=="string" and profile.index:match("^(lib/layouts)/") or "lib/compiled"
   local index, why = load(instance, profile.index or "lib/compiled/index.lua")
   if index and profile.source~=nil and (type(profile.source)~="string" or type(index.skin)~="string"
@@ -175,6 +253,10 @@ function R.Resolve(screen, instance)
     for _,child in ipairs(node.children or {}) do hydrate(child) end
   end
   hydrate(plan)
+  if instance.index.encoding=="node-tuples-v1" and instance.index.portable==1 then R.RetainLayout(plan) end
+  -- These are the renderer's stable authored plans. Prepared presenter copies
+  -- can change size, artwork and fields and must use live measurements.
+  instance.chromeMetrics[plan]={}
   instance.plans[alias] = plan
   return plan
 end
@@ -205,6 +287,8 @@ end
 local function template(instance, reference, depth)
   if type(reference)=="table" then return reference.fields or reference end
   if not reference or reference=="" then return nil end
+  local cache=not depth and instance.index.portable==1 and instance.mergedTemplates
+  if cache and cache[reference] then return cache[reference] end
   depth = depth or 0
   if depth > 8 then emit(instance,"template-cycle:"..reference,"Cyclic artwork template: "..reference); return nil end
   local entry = find(instance,"templates",reference)
@@ -212,22 +296,29 @@ local function template(instance, reference, depth)
   local fields = entry.fields or entry
   if fields.Template and fields.Template~=reference then
     local base = template(instance,fields.Template,depth+1)
-    if base then local merged = {}; for k,v in pairs(base) do merged[k]=v end; for k,v in pairs(fields) do merged[k]=v end; return merged end
+    if base then
+      local merged={}
+      for k,v in pairs(base) do merged[k]=v end
+      for k,v in pairs(fields) do merged[k]=v end
+      if cache then cache[reference]=merged end
+      return merged
+    end
   end
   return fields
 end
 local function nodeTemplate(instance, node, role)
-  local a,f = node.art or {}, node.fields or {}
+  local a,f = node.art or EMPTY, node.fields or EMPTY
+  local selected=template(instance,a.drawTemplate) or template(instance,f[role.."DrawTemplate"])
+    or template(instance,a.template)
+  if selected then return selected end
   local chosen
   if role=="Gauge" then
     local entry=(instance.style.gauges or {})[gaugeRole(node.name)]
     chosen=type(entry)=="table" and entry.template or entry
   end
-  return template(instance,a.drawTemplate) or template(instance,f[role.."DrawTemplate"])
-    or template(instance,a.template) or template(instance,chosen) or template(instance,selector(instance,role:lower()))
+  return template(instance,chosen) or template(instance,selector(instance,role:lower()))
 end
-local function frame(instance, animation, at)
-  local entry = find(instance,"animations",animation)
+local function frame(entry, at)
   if not entry then return nil end
   local frames = entry.frames or {}
   if #frames==0 then return nil end
@@ -245,12 +336,11 @@ local sharedImages={
   ["uifiles/qqcustom-stock/cs_buttons.bmp"]={path="uifiles/qqui-stock/CS_Buttons.bmp",w=256,h=256},
   ["uifiles/qqui-stock/buff_background.tga"]={path="uifiles/DuxaUI-stock/Buff_Background.tga",w=64,h=128},
 }
-local function image(instance, name)
+local function image(instance, name, clock)
   local entry = find(instance,"images",name)
   if not entry or not (entry.path or entry.interface_path) then
     emit(instance,"image:"..tostring(name),"Missing compiled image reference: "..tostring(name)); return nil
   end
-  local clock=ui.GetFrameCount()
   local cacheKey=entry.interface_path or entry.path
   local cached=instance.textures[cacheKey]
   if cached and cached.frame==clock then return cached.texture,cached.w,cached.h end
@@ -266,101 +356,260 @@ local function image(instance, name)
         .."; using compatible shared artwork: "..shared.path)
     end
   end
-  instance.textures[cacheKey]={frame=clock,texture=texture,w=w,h=h}
+  if not cached then cached={};instance.textures[cacheKey]=cached end
+  cached.frame,cached.texture,cached.w,cached.h=clock,texture,w,h
   if not texture then emit(instance,"image:"..name,"Missing artwork: "..tostring(entry.path or entry.interface_path)); return nil end
   return texture,w,h
 end
 
-function R.Animation(instance, name, rect, tint, at)
-  if type(name)~="string" or name=="" or rect.w<=0 or rect.h<=0 then return false end
+local function finite(value)
+  local n=tonumber(value)
+  return n and n==n and n~=math.huge and n~=-math.huge and n or nil
+end
+local function resolveAnimation(instance,name,at,clock)
   local animation=find(instance,"animations",name)
   if animation and truth(animation.grid) then
     emit(instance,"grid:"..name,"Grid artwork requires a resolved host cell: "..name)
     return false -- ItemIcon/ChildArt/GemInfo provide actual cells; never paint a whole item atlas.
   end
-  local part=frame(instance,name,at)
+  local part=frame(animation,at)
   local imageName=part and part.image or name
-  local texture,w,h=image(instance,imageName)
-  if not texture or not w or not h or w<=0 or h<=0 then return false end
-  local crop=part and part.rect or {x=0,y=0,w=w,h=h}
-  local function finite(value) local n=tonumber(value);return n and n==n and n~=math.huge and n~=-math.huge and n or nil end
-  local cx,cy=finite(crop.x),finite(crop.y)
-  local cw,ch=finite(crop.w),finite(crop.h)
-  if not cx or not cy or not cw or not ch or cx<0 or cy<0 or cw<=0 or ch<=0 or cx+cw>w or cy+ch>h then
-    emit(instance,"crop:"..tostring(name),"Artwork crop is outside its actual texture: "..tostring(name));return false
+  local texture,tw,th=image(instance,imageName,clock)
+  if not texture or not tw or not th or tw<=0 or th<=0 then return false end
+  local u0,v0,u1,v1=0,0,1,1
+  local crop=part and part.rect
+  if crop then
+    local cx,cy=finite(crop.x),finite(crop.y)
+    local cw,ch=finite(crop.w),finite(crop.h)
+    if not cx or not cy or not cw or not ch or cx<0 or cy<0 or cw<=0 or ch<=0 or cx+cw>tw or cy+ch>th then
+      emit(instance,"crop:"..name,"Artwork crop is outside its actual texture: "..name);return false
+    end
+    u0,v0,u1,v1=cx/tw,cy/th,(cx+cw)/tw,(cy+ch)/th
   end
-  local c=color(tint)
-  ui.DrawImage(texture,rect.x,rect.y,rect.x+rect.w,rect.y+rect.h,
-    cx/w,cy/h,(cx+cw)/w,(cy+ch)/h,unpack(c))
+  return texture,u0,v0,u1,v1
+end
+local function drawAnimation(instance, name, x, y, w, h, tint, at, fill, vertical, opacity)
+  if type(name)~="string" or name=="" or w<=0 or h<=0 then return false end
+  local clock=activeFrame or ui.GetFrameCount()
+  local texture,u0,v0,u1,v1
+  if not at and instance.index.portable==1 then
+    -- Packaged artwork resolves to one image cell per frame, even when it
+    -- animates. Keep dimensions and UV lookups shared with sibling controls.
+    local sprites=instance.spriteFrames
+    if not sprites then sprites={};instance.spriteFrames=sprites end
+    local sprite=sprites[name]
+    if not sprite then sprite={};sprites[name]=sprite end
+    if sprite.clock~=clock then
+      sprite.texture,sprite.u0,sprite.v0,sprite.u1,sprite.v1=resolveAnimation(instance,name,nil,clock)
+      sprite.clock=clock
+    end
+    texture,u0,v0,u1,v1=sprite.texture,sprite.u0,sprite.v0,sprite.u1,sprite.v1
+  else texture,u0,v0,u1,v1=resolveAnimation(instance,name,at,clock) end
+  if not texture then return false end
+  if fill and fill<1 then
+    if vertical then
+      y,h=y+h*(1-fill),h*fill
+      v0=v1-(v1-v0)*fill
+    else
+      w=w*fill
+      u1=u0+(u1-u0)*fill
+    end
+  end
+  if tint~=WHITE and type(tint)=="table" then
+    local r,g,b,a=components(tint)
+    ui.DrawImage(texture,x,y,x+w,y+h,u0,v0,u1,v1,r,g,b,a*(opacity or 1))
+  else ui.DrawImage(texture,x,y,x+w,y+h,u0,v0,u1,v1,1,1,1,opacity or 1) end
   return true
 end
-local function natural(instance, animation)
-  local part=frame(instance,animation,0)
+function R.Animation(instance, name, area, tint, at)
+  if type(name)~="string" or name=="" then return false end
+  return drawAnimation(instance,name,area.x,area.y,area.w,area.h,tint,at)
+end
+local function naturalSize(instance, animation)
+  local part=frame(find(instance,"animations",animation),0)
   if part then return math.max(0,number(part.rect.w)),math.max(0,number(part.rect.h)) end
   local entry=find(instance,"images",animation)
   return entry and math.max(0,number(entry.width or entry.declaredWidth)) or 0,
     entry and math.max(0,number(entry.height or entry.declaredHeight)) or 0
 end
+local function natural(instance,animation)
+  if type(animation)~="string" or animation=="" then return 0,0 end
+  if instance.index.portable~=1 then return naturalSize(instance,animation) end
+  local sizes=instance.naturalSizes
+  if not sizes then sizes={};instance.naturalSizes=sizes end
+  local size=sizes[animation]
+  if not size then
+    size={naturalSize(instance,animation)}
+    sizes[animation]=size
+  end
+  return size[1],size[2]
+end
 local function rect(x,y,w,h) return {x=x,y=y,w=math.max(0,w),h=math.max(0,h)} end
+
+local function framePieces(instance,f,box,scale,edgesOnly,piece)
+  local x,y,w,h=box.x,box.y,box.w,box.h
+  local function size(name) local a,b=natural(instance,name);return a*scale,b*scale end
+  local tl,tr,bl,br=f.TopLeft,f.TopRight,f.BottomLeft,f.BottomRight
+  local ol,ot=number(f.OverlapLeft)*scale,number(f.OverlapTop)*scale
+  local oright,ob=number(f.OverlapRight)*scale,number(f.OverlapBottom)*scale
+  local center=f.Middle or f.Center
+  local noCaps=not tl and not tr and not bl and not br
+    and not f.LeftTop and not f.LeftBottom and not f.RightTop and not f.RightBottom
+  -- Three-piece horizontal/vertical templates use the full destination cross
+  -- axis, while retaining the end pieces' natural length on the stretch axis.
+  if noCaps and not f.Top and not f.Bottom then
+    local lw,rw=size(f.Left),size(f.Right)
+    piece(f.Left,x,y,lw,h)
+    if not edgesOnly then piece(center,x+lw-ol,y,w-lw-rw+ol+oright,h) end
+    piece(f.Right,x+w-rw,y,rw,h)
+    return
+  end
+  if noCaps and not f.Left and not f.Right then
+    local _,th=size(f.Top);local _,bh=size(f.Bottom)
+    piece(f.Top,x,y,w,th)
+    if not edgesOnly then piece(center,x,y+th-ot,w,h-th-bh+ot+ob) end
+    piece(f.Bottom,x,y+h-bh,w,bh)
+    return
+  end
+
+  local tlw,tlh=size(tl);local trw,trh=size(tr)
+  local blw,blh=size(bl);local brw,brh=size(br)
+  local lw,rw=size(f.Left),size(f.Right)
+  local _,th=size(f.Top);local _,bh=size(f.Bottom)
+  local ltw,lth=size(f.LeftTop);local lbw,lbh=size(f.LeftBottom)
+  local rtw,rth=size(f.RightTop);local rbw,rbh=size(f.RightBottom)
+  -- Caps are independent artwork. Only the middle strips stretch.
+  local leftTop,leftBottom=tlh+lth,blh+lbh
+  local rightTop,rightBottom=trh+rth,brh+rbh
+  piece(tl,x,y,tlw,tlh)
+  piece(f.Top,x+tlw-ol,y,w-tlw-trw+ol+oright,th)
+  piece(tr,x+w-trw,y,trw,trh)
+  piece(f.Left,x,y+leftTop-ot,lw,h-leftTop-leftBottom+ot+ob)
+  if not edgesOnly then piece(center,x+lw-ol,y+th-ot,w-lw-rw+ol+oright,h-th-bh+ot+ob) end
+  piece(f.Right,x+w-rw,y+rightTop-ot,rw,h-rightTop-rightBottom+ot+ob)
+  piece(bl,x,y+h-blh,blw,blh)
+  piece(f.Bottom,x+blw-ol,y+h-bh,w-blw-brw+ol+oright,bh)
+  piece(br,x+w-brw,y+h-brh,brw,brh)
+  piece(f.LeftTop,x,y+tlh,ltw,lth)
+  piece(f.LeftBottom,x,y+h-blh-lbh,lbw,lbh)
+  piece(f.RightTop,x+w-rtw,y+trh,rtw,rth)
+  piece(f.RightBottom,x+w-rbw,y+h-brh-rbh,rbw,rbh)
+end
+local function frameInstructions(instance,reference,f,box,scale,edgesOnly)
+  -- A named packaged frame's artwork geometry is static at a fixed screen
+  -- rectangle. Keep only those quads. Images, animation and tints are live.
+  if instance.dataRoot~="lib/layouts" or type(reference)~="string" then return nil end
+  local all=instance.frameInstructions
+  if not all then all={};instance.frameInstructions=all end
+  local variants=all[reference]
+  if not variants then variants={};all[reference]=variants end
+  edgesOnly=not not edgesOnly
+  for _,entry in ipairs(variants) do
+    if entry.x==box.x and entry.y==box.y and entry.w==box.w and entry.h==box.h
+        and entry.scale==scale and entry.edges==edgesOnly then
+      return entry.quads
+    end
+  end
+  local quads={}
+  framePieces(instance,f,box,scale,edgesOnly,function(name,x,y,w,h)
+    if type(name)=="string" and name~="" and w>0 and h>0 then
+      quads[#quads+1]={name,x,y,w,h}
+    end
+  end)
+  -- A continuously moving or resizing window must not grow the plan cache.
+  local nextSlot=variants.nextSlot or 1
+  variants[nextSlot]={x=box.x,y=box.y,w=box.w,h=box.h,scale=scale,edges=edgesOnly,quads=quads}
+  variants.nextSlot=nextSlot%16+1
+  return quads
+end
+local compileImageQuads,drawImageQuads=rawget(ui,"CompileImageQuads"),rawget(ui,"DrawImageQuads")
+local function buildFrameBatch(instance,quads,clock)
+  local definitions,textures,slots,sources={},{},{},{}
+  for _,q in ipairs(quads)do
+    local name,x,y,w,h=q[1],q[2],q[3],q[4],q[5]
+    local animation=find(instance,"animations",name)
+    if animation and (truth(animation.grid) or #(animation.frames or EMPTY)>1)then return false end
+    local part=frame(animation,0)
+    local imageName=part and part.image or name
+    local slot=slots[imageName]
+    if not slot then
+      local texture,aw,ah=image(instance,imageName,clock)
+      if not texture then return nil end
+      slot=#sources+1;slots[imageName]=slot
+      sources[slot]={imageName,aw,ah}
+    end
+    local texture,u0,v0,u1,v1=resolveAnimation(instance,name,0,clock)
+    if not texture then return nil end
+    local n=#definitions
+    definitions[n+1],definitions[n+2],definitions[n+3]=slot,x,y
+    definitions[n+4],definitions[n+5],definitions[n+6]=x+w,y+h,u0
+    definitions[n+7],definitions[n+8],definitions[n+9]=v0,u1,v1
+  end
+  local program=compileImageQuads(definitions)
+  if program then return {program=program,sources=sources,textures=textures} end
+  return false
+end
+
+local function paintFrameBatch(instance,quads,tint)
+  local clock=activeFrame or ui.GetFrameCount()
+  local batch=quads.batch
+  if batch==nil then
+    batch=buildFrameBatch(instance,quads,clock)
+    quads.batch=batch
+  end
+  if not batch then return false end
+  -- A retained frame has only sprite geometry. Acquire its atlas handles
+  -- again with the current host lease and recompile if the dimensions changed.
+  for i,source in ipairs(batch.sources)do
+    local texture,w,h=image(instance,source[1],clock)
+    if not texture or w~=source[2] or h~=source[3] then
+      quads.batch=nil
+      return false
+    end
+    batch.textures[i]=texture
+  end
+  if tint~=WHITE and type(tint)=="table"then
+    return drawImageQuads(batch.program,batch.textures,components(tint))
+  end
+  return drawImageQuads(batch.program,batch.textures,1,1,1,1)
+end
+
+local function paintFrame(instance,f,box,tint,scale,edgesOnly,quads)
+  local any=false
+  if quads then
+    if #quads>=3 and compileImageQuads and drawImageQuads and instance.index.portable==1
+        and paintFrameBatch(instance,quads,tint) then return true end
+    for _,q in ipairs(quads) do
+      if drawAnimation(instance,q[1],q[2],q[3],q[4],q[5],tint) then any=true end
+    end
+  else
+    framePieces(instance,f,box,scale,edgesOnly,function(name,x,y,w,h)
+      if drawAnimation(instance,name,x,y,w,h,tint) then any=true end
+    end)
+  end
+  return any
+end
 
 function R.Frame(instance, reference, box, tint, scale, edgesOnly)
   local f=template(instance,reference)
   if not f or box.w<=0 or box.h<=0 then return false end
   scale=math.max(0,number(scale,1))
   local x,y,w,h=box.x,box.y,box.w,box.h
-  local function size(name) local a,b=natural(instance,name);return a*scale,b*scale end
-  local tl,tr,bl,br=f.TopLeft,f.TopRight,f.BottomLeft,f.BottomRight
-  local tlw,tlh=size(tl);local trw,trh=size(tr)
-  local blw,blh=size(bl);local brw,brh=size(br)
-  local lw=size(f.Left);local rw=size(f.Right)
-  local _,th=size(f.Top);local _,bh=size(f.Bottom)
-  local ltw,lth=size(f.LeftTop);local lbw,lbh=size(f.LeftBottom)
-  local rtw,rth=size(f.RightTop);local rbw,rbh=size(f.RightBottom)
-  local ol,ot=number(f.OverlapLeft)*scale,number(f.OverlapTop)*scale
-  local oright,ob=number(f.OverlapRight)*scale,number(f.OverlapBottom)*scale
-  -- Caps are independent artwork. Only the middle strips stretch; a wide
-  -- ornamental corner must never widen a narrow vertical strip or its caps.
-  local leftTop=tlh+lth;local leftBottom=blh+lbh
-  local rightTop=trh+rth;local rightBottom=brh+rbh
-  local parts={{tl,rect(x,y,tlw,tlh)},
-    {f.Top,rect(x+tlw-ol,y,w-tlw-trw+ol+oright,th)},
-    {tr,rect(x+w-trw,y,trw,trh)},
-    {f.Left,rect(x,y+leftTop-ot,lw,h-leftTop-leftBottom+ot+ob)},
-    {f.Middle or f.Center,rect(x+lw-ol,y+th-ot,w-lw-rw+ol+oright,h-th-bh+ot+ob),true},
-    {f.Right,rect(x+w-rw,y+rightTop-ot,rw,h-rightTop-rightBottom+ot+ob)},
-    {bl,rect(x,y+h-blh,blw,blh)},
-    {f.Bottom,rect(x+blw-ol,y+h-bh,w-blw-brw+ol+oright,bh)},
-    {br,rect(x+w-brw,y+h-brh,brw,brh)},
-    {f.LeftTop,rect(x,y+tlh,ltw,lth)},
-    {f.LeftBottom,rect(x,y+h-blh-lbh,lbw,lbh)},
-    {f.RightTop,rect(x+w-rtw,y+trh,rtw,rth)},
-    {f.RightBottom,rect(x+w-rbw,y+h-brh-rbh,rbw,rbh)}}
-  -- Three-piece horizontal/vertical templates use the full destination cross
-  -- axis, while retaining the end pieces' natural length on the stretch axis.
-  if not tl and not tr and not bl and not br and not f.Top and not f.Bottom
-      and not f.LeftTop and not f.LeftBottom and not f.RightTop and not f.RightBottom then
-    parts={{f.Left,rect(x,y,lw,h)},{f.Middle or f.Center,rect(x+lw-ol,y,w-lw-rw+ol+oright,h),true},
-      {f.Right,rect(x+w-rw,y,rw,h)}}
-  elseif not tl and not tr and not bl and not br and not f.Left and not f.Right
-      and not f.LeftTop and not f.LeftBottom and not f.RightTop and not f.RightBottom then
-    parts={{f.Top,rect(x,y,w,th)},{f.Middle or f.Center,rect(x,y+th-ot,w,h-th-bh+ot+ob),true},
-      {f.Bottom,rect(x,y+h-bh,w,bh)}}
-  end
-  local any=false
+  local quads=frameInstructions(instance,reference,f,box,scale,edgesOnly)
   ui.PushClipRect(x,y,x+w,y+h,true)
-  local ok,why=pcall(function()
-    for _,p in ipairs(parts) do
-      if not (edgesOnly and p[3])
-          and R.Animation(instance,p[1],p[2],tint) then any=true end
-    end
-  end)
+  local ok,result=pcall(paintFrame,instance,f,box,tint,scale,edgesOnly,quads)
   ui.PopClipRect()
-  if not ok then error(why,0) end
-  return any
+  if not ok then error(result,0) end
+  return result
 end
 
 local function filled(box,c) if box.w>0 and box.h>0 then ui.DrawRectFilled(box.x,box.y,box.x+box.w,box.y+box.h,unpack(c)) end end
 local function border(box,c) ui.DrawRect(box.x,box.y,box.x+box.w,box.y+box.h,c[1],c[2],c[3],c[4],0,1) end
+
+local function cooldown(box,top,r,g,b,a)
+  local bottom=box.y+box.h
+  if top<bottom and box.w>0 then ui.DrawRectFilled(box.x,math.max(top,box.y),box.x+box.w,bottom,r,g,b,a) end
+end
 
 local healthLow = {0.82, 0.22, 0.18, 1}
 local healthMid = {0.82, 0.57, 0.16, 1}
@@ -440,6 +689,7 @@ end
 -- Nominal pixel heights of the host's public ui1..ui6 font indices. Keeping
 -- these in design pixels avoids measuring a previous window's font scale.
 local chromeFontHeights={10,12,13,14,16,20}
+local titleParts={"Left","Middle","Right","TopLeft","Top","TopRight"}
 local function chromeFont(plan,instance,override)
   local selected=number(override or (plan or {}).font,0)
   if not chromeFontHeights[selected] then selected=number((instance.style.fonts or {}).title,3) end
@@ -450,8 +700,7 @@ end
 -- Physical pixels, relative to a complete source window's outer rectangle.
 -- Decorative corner widths do not become client padding: the native edge
 -- strips define the left/right margins, while the title reserves its height.
-function R.ChromeInsets(plan,instance,scale,opts)
-  scale=math.max(0,number(scale,1))
+local function measureChrome(plan,instance,scale,override)
   local f=windowTemplate(plan,instance) or {}
   local b=windowFlag(plan,"Style_Border",true) and template(instance,f.Border) or nil
   local t=windowFlag(plan,"Style_Titlebar",false) and template(instance,f.Titlebar) or nil
@@ -465,13 +714,13 @@ function R.ChromeInsets(plan,instance,scale,opts)
   end
   local titleHeight,titleLeft,titleRight=0,0,0
   if t then
-    for _,name in ipairs({"Left","Middle","Right","TopLeft","Top","TopRight"}) do
+    for _,name in ipairs(titleParts) do
       local _,h=size(t[name]);titleHeight=math.max(titleHeight,h)
     end
     titleLeft=size(t.Left or t.TopLeft);titleRight=size(t.Right or t.TopRight)
   end
   local titleArtHeight=titleHeight
-  local selectedFont,fontHeight=chromeFont(plan,instance,opts and opts.font)
+  local selectedFont,fontHeight=chromeFont(plan,instance,override)
   -- A short strip is ornament, not a request for seven-pixel text. Reserve a
   -- readable selected-font band; never enlarge or squash the strip itself.
   if titleArtHeight>0 then titleHeight=math.max(titleArtHeight,(fontHeight+4)*scale) end
@@ -486,6 +735,23 @@ function R.ChromeInsets(plan,instance,scale,opts)
     end
   end
   return result
+end
+function R.ChromeInsets(plan,instance,scale,opts)
+  scale=math.max(0,number(scale,1))
+  local override=opts and opts.font
+  local memo=instance.chromeMetrics and instance.chromeMetrics[plan]
+  if not memo then return measureChrome(plan,instance,scale,override) end
+  -- These metrics depend on authored frame rectangles and font indices. The
+  -- portable resource index is replaced on reload; scale/font are live inputs.
+  local frame=instance.index.portable~=1 and ui.GetFrameCount() or nil
+  -- Keep the normal design size and the effective screen scale separately.
+  local key=scale==1 and "design" or "scaled"
+  local entry=memo[key]
+  if entry and entry.frame==frame and entry.scale==scale and entry.font==override then return entry.metrics end
+  if not entry then entry={};memo[key]=entry end
+  entry.metrics=measureChrome(plan,instance,scale,override)
+  entry.frame,entry.scale,entry.font=frame,scale,override
+  return entry.metrics
 end
 
 -- Pure drawing only. The owner registers movement/close inputs before calling
@@ -531,55 +797,92 @@ function R.WindowChrome(plan,title,outer,instance,opts)
   return metrics
 end
 
-function R.Geometry(node,parent)
-  local n,a,f=node.rect or {},node.anchors or {},node.fields or {}
+local function specified(explicit,fields,side,field)
+  return explicit[side]==true or (explicit[side]==nil and number(fields[field])~=0)
+end
+function R.Geometry(node,parent,measured)
+  local n,a,f=node.rect or EMPTY,node.anchors or EMPTY,node.fields or EMPTY
   local s=parent.s or 1
   local x,y,w,h=number(n.x)*s,number(n.y)*s,number(n.w)*s,number(n.h)*s
-  local e=a.explicit or {}
-  local function specified(side,field) return e[side]==true or (e[side]==nil and number(f[field])~=0) end
-  if specified("left","LeftAnchorOffset") then x=(a.leftToLeft==false and parent.w or 0)+number(a.left)*(a.leftToLeft==false and -s or s)
+  local e=a.explicit or EMPTY
+  if specified(e,f,"left","LeftAnchorOffset") then x=(a.leftToLeft==false and parent.w or 0)+number(a.left)*(a.leftToLeft==false and -s or s)
   elseif a.leftToLeft==false then x=parent.w+x end
-  if specified("top","TopAnchorOffset") then y=(a.topToTop==false and parent.h or 0)+number(a.top)*(a.topToTop==false and -s or s)
+  if specified(e,f,"top","TopAnchorOffset") then y=(a.topToTop==false and parent.h or 0)+number(a.top)*(a.topToTop==false and -s or s)
   elseif a.topToTop==false then y=parent.h+y end
-  if specified("right","RightAnchorOffset") or a.rightToLeft==false then
+  if specified(e,f,"right","RightAnchorOffset") or a.rightToLeft==false then
     local right=(a.rightToLeft==false and parent.w or 0)+number(a.right)*(a.rightToLeft==false and -s or s)
     w=right-x
   end
-  if specified("bottom","BottomAnchorOffset") or a.bottomToTop==false then
+  if specified(e,f,"bottom","BottomAnchorOffset") or a.bottomToTop==false then
     local bottom=(a.bottomToTop==false and parent.h or 0)+number(a.bottom)*(a.bottomToTop==false and -s or s)
     h=bottom-y
   end
-  if #(node.children or {})>0 and (node.type=="Page" or node.type=="LayoutBox" or node.type=="TemplateContainer"
+  if (w==0 or h==0) and node.children and #node.children>0
+      and (node.type=="Page" or node.type=="LayoutBox" or node.type=="TemplateContainer"
       or node.type=="HorizontalLayoutBox" or node.type=="VerticalLayoutBox" or node.type=="TileLayoutBox") then
     if w==0 then w=math.max(0,parent.w-x) end
     if h==0 then h=math.max(0,parent.h-y) end
   end
+  if measured then
+    measured.x,measured.y,measured.w,measured.h,measured.s=parent.x+x,parent.y+y,math.max(0,w),math.max(0,h),s
+    return measured
+  end
   return {x=parent.x+x,y=parent.y+y,w=math.max(0,w),h=math.max(0,h),s=s}
 end
+
+local sourceGeometry,sourceHostRect=R.Geometry,B.UseHostRect
 
 local function font(instance, node)
   local value=number(node.font,3)
   if value<1 or value>6 then emit(instance,"font:"..value,"Unsupported source font "..value.."; using host font 3"); return 3 end
   return math.floor(value)
 end
-local function text(instance, node, box, value, tint, fitHeight)
+local drawTextInRect=rawget(ui,"DrawTextInRect")
+local textLayouts=setmetatable({},{__mode="k"})
+local function textLayout(instance,node)
+  local f=node.fields or EMPTY
+  local retained=node._packColorsNormalized and instance.index.portable==1
+  local cached=retained and textLayouts[node]
+  if cached and cached.fields==f and cached.font==node.font and cached.kind==node.type then
+    return cached.face,cached.align,cached.middle,cached.dx,cached.dy
+  end
+  local button=node.type=="Button"
+  local buttonRight=button and truth(f.TextAlignRight)
+  local center=truth(f.Style_HCenter) or truth(f.AlignCenter) or f.Align=="Center" or button and truth(f.TextAlignCenter)
+  local right=truth(f.Style_RightJustify) or truth(f.AlignRight) or f.Align=="Right"
+  local middle=truth(f.Style_VCenter) or button and truth(f.TextAlignVCenter)
+  local face=font(instance,node)
+  local align=buttonRight and 2 or center and 1 or right and 2 or 0
+  local dx=button and number(f.TextOffsetX) or 0
+  local dy=button and number(f.TextOffsetY) or 0
+  if retained then
+    textLayouts[node]={fields=f,font=node.font,kind=node.type,face=face,align=align,middle=middle,dx=dx,dy=dy}
+  end
+  return face,align,middle,dx,dy
+end
+local function text(instance, node, box, value, tint, fitHeight, offsetX, offsetY)
   value=tostring(value or ""); if value=="" then return end
-  ui.PushFont(font(instance,node))
+  local face,align,middle,dx,dy=textLayout(instance,node)
+  local r,g,b,a=components(type(tint)=="table" and tint or instance.palette.text)
+  local x,y=box.x+(offsetX or 0),box.y+(offsetY or 0)
+  local scale=box.s or 1
+  dx,dy=dx*scale,dy*scale
+  if drawTextInRect then
+    drawTextInRect(face,value,x,y,box.w,box.h,align,middle,fitHeight,dx,dy,r,g,b,a)
+    return
+  end
+  ui.PushFont(face)
   -- HUD helpers already apply the window's font scale; multiplying it by layout scale repeats that scale.
-  local tw,th=ui.CalcTextSize(value)
+  local tw,th
+  if fitHeight or align~=0 or middle then tw,th=ui.CalcTextSize(value) end
   local size
   if fitHeight and box.h>0 and th>box.h then
     size=box.h;tw=tw*box.h/th;th=box.h
   end
-  local f=node.fields or {}; local x,y=box.x,box.y
-  local button=node.type=="Button"
-  if button and truth(f.TextAlignRight) then x=x+box.w-tw
-  elseif truth(f.Style_HCenter) or truth(f.AlignCenter) or f.Align=="Center" or button and truth(f.TextAlignCenter) then x=x+(box.w-tw)/2
-  elseif truth(f.Style_RightJustify) or truth(f.AlignRight) or f.Align=="Right" then x=x+box.w-tw end
-  if truth(f.Style_VCenter) or button and truth(f.TextAlignVCenter) then y=y+(box.h-th)/2 end
-  if button then x=x+number(f.TextOffsetX)*(box.s or 1);y=y+number(f.TextOffsetY)*(box.s or 1) end
-  local c=color(tint,instance.palette.text)
-  ui.DrawText(x,y,c[1],c[2],c[3],c[4],value,size)
+  if align==1 then x=x+(box.w-tw)/2
+  elseif align==2 then x=x+box.w-tw end
+  if middle then y=y+(box.h-th)/2 end
+  ui.DrawText(x+dx,y+dy,r,g,b,a,value,size)
   ui.PopFont()
 end
 function R.MeasureText(instance,node,value)
@@ -593,7 +896,7 @@ function R.PaintText(screen,node,box,instance,value)
   local caption,tint=B.Text(screen,node)
   local enabled=B.State(screen,node)
   text(instance,node,box,value~=nil and value or caption,enabled==false and instance.palette.disabled
-    or B.Color(screen,node) or tint or color((node.colors or {}).TextColor,instance.palette.text))
+    or B.Color(screen,node) or tint or (node.colors or EMPTY).TextColor)
   local mx,my=ui.GetMousePos()
   if mx>=box.x and mx<box.x+box.w and my>=box.y and my<box.y+box.h then
     local tip=B.Tooltip(screen,node);if tip~="" then ui.SetTooltip(tip) end
@@ -609,7 +912,9 @@ local function decalRect(node,box)
   return {x=box.x+x,y=box.y+y,w=math.max(0,w),h=math.max(0,h),s=s}
 end
 local function point(box) ui.SetCursorScreenPos(box.x,box.y) end
+local hitRect=rawget(ui,"HitRect")
 local function hit(id,box,enabled)
+  if hitRect then return hitRect(id,box.x,box.y,box.w,box.h,enabled~=false) end
   point(box); ui.BeginDisabled(enabled==false)
   local clicked=ui.InvisibleButton(id,math.max(1,box.w),math.max(1,box.h))
   local hover,active=ui.IsItemHovered(),ui.IsItemActive()
@@ -626,9 +931,10 @@ local function state(instance,screen,node)
   if not record then record={};instance.controls[key]=record end
   return record
 end
+local visibilityNode={name="/visibility"}
 function R.TrackWindow(screen,shown,instance)
   if not screen then return end
-  local record=state(instance,screen,{name="/visibility"})
+  local record=state(instance,screen,visibilityNode)
   local frame=ui.GetFrameCount()
   -- Inherited presenters may return before calling HUD while hidden. A gap in
   -- draws is therefore also an opening transition, without polling or changing
@@ -646,35 +952,40 @@ local function consumeRight(instance)
   end
 end
 
-local function buttonArt(instance,node,box,hover,pressed,checked,enabled,tint,overrides)
+local function buttonPart(f,state,suffix)
+  local value=f[state..suffix]
+  return type(value)=="string" and value~="" and value or nil
+end
+local function buttonStateArt(f,suffix,down,hover,enabled)
+  if not f then return nil end
+  if not enabled then
+    return down and buttonPart(f,"PressedDisabled",suffix) or buttonPart(f,"Disabled",suffix)
+      or buttonPart(f,"Normal",suffix)
+  end
+  return down and (hover and buttonPart(f,"PressedFlyby",suffix) or buttonPart(f,"Pressed",suffix))
+    or hover and buttonPart(f,"Flyby",suffix) or buttonPart(f,"Normal",suffix)
+end
+local function buttonArt(instance,node,box,hover,pressed,checked,enabled,tint,skipBackground,skipDecal,liveIcon)
   local f=nodeTemplate(instance,node,"Button")
-  local function selected(suffix)
-    if not f then return nil end
-    local function art(state)
-      local value=f[state..suffix]
-      return type(value)=="string" and value~="" and value or nil
+  local down=pressed or checked
+  if not skipBackground then
+    local base=buttonStateArt(f,"",down,hover,enabled)
+    if liveIcon and base then
+      local name=base:lower()
+      if name=="rediconbackground" or name=="blueiconbackground" then
+        -- A live item over an empty buff prototype uses a neutral item well.
+        local placeholder=find(instance,"animations",f.NormalDecal)
+        if placeholder and truth(placeholder.grid) then base="A_InvSlot" end
+      end
     end
-    local down=pressed or checked
-    if not enabled then
-      return down and art("PressedDisabled") or art("Disabled") or art("Normal")
+    if not R.Animation(instance,base,box,tint) then
+      filled(box,pressed and instance.palette.border or instance.palette.background);border(box,instance.palette.border)
     end
-    return down and (hover and art("PressedFlyby") or art("Pressed"))
-      or hover and art("Flyby") or art("Normal")
   end
-  overrides=overrides or {}
-  local base=selected("")
-  local placeholder=f and find(instance,"animations",f.NormalDecal)
-  local baseName=type(base)=="string" and base:lower()
-  local replacePlaceholder=overrides.liveIcon and placeholder and truth(placeholder.grid)
-    and (baseName=="rediconbackground" or baseName=="blueiconbackground")
-  -- BuffIcons is a source prototype, not an item's backdrop. An actual live
-  -- item cell uses the selected skin's neutral item well; explicit host buff
-  -- backgrounds and independent pressed/hover artwork retain their meaning.
-  if replacePlaceholder then base="A_InvSlot" end
-  if not overrides.background and not R.Animation(instance,base,box,tint) then
-    filled(box,pressed and instance.palette.border or instance.palette.background);border(box,instance.palette.border)
+  if not skipDecal then
+    local decal=buttonStateArt(f,"Decal",down,hover,enabled)
+    if decal then R.Animation(instance,decal,decalRect(node,box),tint) end
   end
-  if not overrides.decal then R.Animation(instance,selected("Decal"),decalRect(node,box),tint) end
 end
 
 local function sliderArt(instance,node,box,fraction,hover,pressed,enabled)
@@ -703,18 +1014,18 @@ local function sliderArt(instance,node,box,fraction,hover,pressed,enabled)
     or rect(box.x+(box.w-knob)*fraction,box.y,knob,box.h)
   if not R.Animation(instance,art,handle) then filled(handle,instance.palette.border) end
 end
-local dynamicArt,phases
+local dynamicArt,paintDynamicArt,phases
 local function drawButton(instance,screen,node,box,captionOverride)
   local enabled,checked,_,_,action=B.State(screen,node)
   local clicked,hover,pressed=hit("##pack:"..B.Id(node),box,enabled or action)
   local background=dynamicArt(instance,screen,node,box,"background")
-  local decal=table.pack(B.Call("windows","ChildArt",screen,B.Id(node),"decal"))
-  local hasDecal=decal[1]~=nil
-  local liveIcon=hasDecal and decal[1]~=false and type(decal[1])~="string"
-  buttonArt(instance,node,box,hover,pressed,checked,enabled,nil,{background=background,decal=hasDecal,liveIcon=liveIcon})
-  dynamicArt(instance,screen,node,box,"decal",decal)
+  local decal,u0,v0,u1,v1=B.Call("windows","ChildArt",screen,B.Id(node),"decal")
+  local hasDecal=decal~=nil
+  local liveIcon=hasDecal and decal~=false and type(decal)~="string"
+  buttonArt(instance,node,box,hover,pressed,checked,enabled,nil,background,hasDecal,liveIcon)
+  paintDynamicArt(instance,screen,node,box,"decal",decal,u0,v0,u1,v1)
   local top,r,g,b,a=B.Call("spells","ButtonCoolDown",screen,B.Id(node),box.y,box.y+box.h)
-  if top then filled(rect(box.x,math.max(top,box.y),box.w,math.max(0,box.y+box.h-math.max(top,box.y))),{r or 0,g or 0,b or 0,a or 0.6}) end
+  if top then cooldown(box,top,r or 0,g or 0,b or 0,a or 0.6) end
   local caption=captionOverride
   if caption==nil then caption=B.Text(screen,node) end
   text(instance,node,box,caption,enabled and B.Color(screen,node) or instance.palette.disabled)
@@ -740,56 +1051,85 @@ function R.DrawButton(screen,node,box,instance,caption)
   return drawButton(instance,screen,node,box,caption)
 end
 
-local function gaugeArt(instance,node,box,fraction,tint,alpha)
-  if box.w <= 0 or box.h <= 0 then return end
+local function gaugeArt(instance,node,x,y,w,h,s,fraction,tint,alpha,f)
+  if w <= 0 or h <= 0 then return end
   alpha=number(alpha,1)
-  local function faded(value)
-    local c=color(value);return {c[1],c[2],c[3],c[4]*alpha}
-  end
-  local f=nodeTemplate(instance,node,"Gauge")
+  if f==nil then f=nodeTemplate(instance,node,"Gauge") end
   local background = f and f.Background
   -- A fill-only gauge can overlay a different track. A lines-only template
   -- may be just a frame. Missing parts in either must remain transparent.
-  if not f or (background and background ~= "" and not R.Animation(instance,background,box,{1,1,1,alpha})) then
-    filled(box,faded(instance.palette.background))
+  if not f or (background and background ~= "" and not drawAnimation(instance,background,x,y,w,h,WHITE,nil,nil,nil,alpha)) then
+    local r,g,b,a=components(instance.palette.background)
+    ui.DrawRectFilled(x,y,x+w,y+h,r,g,b,a*alpha)
   end
   fraction=clamp(number(fraction),0,1)
   if fraction > 0 then
-    local vertical=truth((node.fields or {}).Vertical)
-    local clip=vertical and rect(box.x,box.y+box.h*(1-fraction),box.w,box.h*fraction) or rect(box.x,box.y,box.w*fraction,box.h)
-    ui.PushClipRect(clip.x,clip.y,clip.x+clip.w,clip.y+clip.h,true)
+    local vertical=truth((node.fields or EMPTY).Vertical)
     local fill=tint or instance.palette[gaugeRole(node.name)] or instance.palette.hp
+    if type(fill)~="table" then fill=WHITE end
     local fillArt = f and (f.Fill or f.Gauge)
-    if not f or (fillArt and fillArt ~= "" and not R.Animation(instance,fillArt,box,faded(fill))) then
-      filled(box,faded(fill))
+    if not f or fillArt and fillArt~="" then
+      if not f or not drawAnimation(instance,fillArt,x,y,w,h,fill,nil,fraction,vertical,alpha) then
+        local x1=x+w*(vertical and 1 or fraction)
+        local y0=y+(vertical and h*(1-fraction) or 0)
+        local r,g,b,a=components(fill)
+        ui.DrawRectFilled(x,y0,x1,y+h,r,g,b,a*alpha)
+      end
     end
-    if f and truth((node.fields or {}).DrawLinesFill) then R.Animation(instance,f.LinesFill,box,faded(color((node.colors or {}).LinesFillTint,tint))) end
-    ui.PopClipRect()
+    if f and truth((node.fields or EMPTY).DrawLinesFill) then
+      local ink=(node.colors or EMPTY).LinesFillTint
+      drawAnimation(instance,f.LinesFill,x,y,w,h,type(ink)=="table" and ink or tint,nil,fraction,vertical,alpha)
+    end
   end
   if f then
-    R.Animation(instance,f.Lines,box,{1,1,1,alpha}); R.Frame(instance,f.Border,box,{1,1,1,alpha},box.s)
-    local lw=natural(instance,f.EndCapLeft);local rw=natural(instance,f.EndCapRight);local s=box.s or 1
-    R.Animation(instance,f.EndCapLeft,rect(box.x,box.y,math.min(box.w,lw*s),box.h),{1,1,1,alpha})
-    R.Animation(instance,f.EndCapRight,rect(box.x+math.max(0,box.w-rw*s),box.y,math.min(box.w,rw*s),box.h),{1,1,1,alpha})
+    if f.Lines then drawAnimation(instance,f.Lines,x,y,w,h,WHITE,nil,nil,nil,alpha) end
+    if f.Border then R.Frame(instance,f.Border,rect(x,y,w,h),alpha==1 and WHITE or {1,1,1,alpha},s) end
+    if f.EndCapLeft then
+      local lw=natural(instance,f.EndCapLeft)
+      drawAnimation(instance,f.EndCapLeft,x,y,math.min(w,lw*s),h,WHITE,nil,nil,nil,alpha)
+    end
+    if f.EndCapRight then
+      local rw=natural(instance,f.EndCapRight)
+      drawAnimation(instance,f.EndCapRight,x+math.max(0,w-rw*s),y,math.min(w,rw*s),h,WHITE,nil,nil,nil,alpha)
+    end
   end
 end
-function R.GaugeTrackRect(node, box, instance)
-  local fields = node.fields or {}
-  local scale = box.s or 1
-  local art = nodeTemplate(instance, node, "Gauge") or {}
-  local _, height = natural(instance, art.Background)
-  if height == 0 then _, height = natural(instance, art.Fill or art.Gauge or art.Lines) end
-  local x = number(fields.GaugeOffsetX) * scale
-  local y = number(fields.GaugeOffsetY) * scale
-  local track = rect(box.x + x, box.y + y, box.w - x, box.h - y)
-  track.s = scale
-  if height > 0 then track.h = math.min(track.h, height * scale) end
-  return track
+local gaugeLayouts=setmetatable({},{__mode="k"})
+local function gaugeLayout(instance,node)
+  local fields = node.fields or EMPTY
+  local retained=node._packColorsNormalized and instance.index.portable==1
+  local cached=retained and gaugeLayouts[node]
+  if cached and cached.instance==instance and cached.fields==fields and cached.art==node.art then
+    return cached.template,cached.height,cached.x,cached.y
+  end
+  local art=nodeTemplate(instance,node,"Gauge")
+  local sprites=art or EMPTY
+  local _,height=natural(instance,sprites.Background)
+  if height==0 then _,height=natural(instance,sprites.Fill or sprites.Gauge or sprites.Lines) end
+  local x,y=number(fields.GaugeOffsetX),number(fields.GaugeOffsetY)
+  if retained then
+    gaugeLayouts[node]={instance=instance,fields=fields,art=node.art,template=art,height=height,x=x,y=y}
+  end
+  return art,height,x,y
+end
+local function gaugeTrack(box,height,x,y)
+  local scale=box.s or 1
+  x,y=x*scale,y*scale
+  local w,h=math.max(0,box.w-x),math.max(0,box.h-y)
+  if height>0 then h=math.min(h,height*scale) end
+  return box.x+x,box.y+y,w,h,scale
+end
+function R.GaugeTrackRect(node,box,instance)
+  local _,height,offsetX,offsetY=gaugeLayout(instance,node)
+  local x,y,w,h,s=gaugeTrack(box,height,offsetX,offsetY)
+  return {x=x,y=y,w=w,h=h,s=s}
 end
 
-local function drawGauge(instance,screen,node,box,options)
-  local fraction,caption,tint=B.Gauge(screen,node)
-  options=options or {}
+local function drawGauge(instance,screen,node,box,options,live)
+  options=options or EMPTY
+  local fraction,caption,tint
+  if live then fraction,caption,tint=live.fraction,live.caption,live.tint
+  else fraction,caption,tint=B.Gauge(screen,node) end
   if options.fraction~=nil then fraction=options.fraction end
   if options.caption~=nil then caption=options.caption
   elseif node.sourceGaugeCaption~=nil then caption=node.sourceGaugeCaption end
@@ -803,17 +1143,24 @@ local function drawGauge(instance,screen,node,box,options)
     if remaining<0.25 then alpha=0.825+0.175*math.cos(ui.GetTime()*10) end
     caption=string.format("%d%%",math.floor(remaining*100+0.5))
   end
-  local f=node.fields or {};local s=box.s or 1
+  local f=node.fields or EMPTY;local s=box.s or 1
   if not options.textOnly then
-    local track=R.GaugeTrackRect(node,box,instance)
-    local palette = instance.palette[gaugeRole(node.name)] or instance.palette.hp
-    gaugeArt(instance,node,track,fraction,tint or color((node.colors or {}).FillTint,palette),alpha)
+    local art,height,offsetX,offsetY=gaugeLayout(instance,node)
+    local x,y,w,h=gaugeTrack(box,height,offsetX,offsetY)
+    if not tint then
+      local palette=instance.palette[gaugeRole(node.name)] or instance.palette.hp
+      local tintColor=(node.colors or EMPTY).FillTint
+      tint=type(tintColor)=="table" and tintColor or palette
+    end
+    gaugeArt(instance,node,x,y,w,h,s,fraction,tint,alpha,art or false)
   end
   if caption~="" then
-    local label=rect(box.x+number(f.TextOffsetX)*s,box.y+number(f.TextOffsetY)*s,box.w,box.h)
-    text(instance,node,label,caption,B.Color(screen,node,"text")
-      or color((node.colors or {}).TextColor,instance.palette.text),screen=="BreathWindow")
+    text(instance,node,box,caption,B.Color(screen,node,"text") or (node.colors or EMPTY).TextColor,
+      screen=="BreathWindow",number(f.TextOffsetX)*s,number(f.TextOffsetY)*s)
   end
+end
+function R.PaintGauge(screen,node,box,instance,live,options)
+  drawGauge(instance,screen,node,box,options,live)
 end
 
 phases=function(instance,screen,node,box,click)
@@ -859,60 +1206,73 @@ local function drawSlot(instance,screen,node,box)
   end
 end
 local function drawGem(instance,screen,node,box)
+  local child=B.Id(node)
   local enabled=B.State(screen,node)
-  local clicked,hover=hit("##gem:"..B.Id(node),box,enabled)
-  local info=B.Call("spells","GemInfo",screen,B.Id(node)) or {}
+  local clicked,hover=hit("##gem:"..child,box,enabled)
+  local rec=state(instance,screen,node)
+  if not rec.gemInfo then rec.gemInfo={} end
+  local info=B.Call("spells","GemInfo",screen,child,rec.gemInfo,box.y,box.y+box.h) or EMPTY
   buttonArt(instance,node,box,hover,ui.IsItemActive(),false,enabled)
   if type(info.tex)=="string" then R.Animation(instance,info.tex,box,{info.tintR or 1,info.tintG or 1,info.tintB or 1,info.tintA or 1})
   elseif info.tex then ui.DrawImage(info.tex,box.x,box.y,box.x+box.w,box.y+box.h,info.u0 or 0,info.v0 or 0,info.u1 or 1,info.v1 or 1,
       info.tintR or 1,info.tintG or 1,info.tintB or 1,info.tintA or 1) end
-  local top,r,g,b,a=B.Call("spells","GemOverlay",screen,B.Id(node),box.y,box.y+box.h)
-  if top then filled(rect(box.x,math.max(top,box.y),box.w,box.y+box.h-math.max(top,box.y)),{r or 0,g or 0,b or 0,a or 0.65}) end
+  local top,r,g,b,a=info.top,info.coolR,info.coolG,info.coolB,info.coolA
+  if not top and (info~=rec.gemInfo or info.overlay~=nil) then
+    top,r,g,b,a=B.Call("spells","GemOverlay",screen,child,box.y,box.y+box.h)
+  end
+  if top then cooldown(box,top,r or 0,g or 0,b or 0,a or 0.65) end
+  local tip=info.tooltip
   local dragged=B.Drag(screen,node)
-  if clicked and enabled and not dragged then B.Call("spells","GemClick",B.Id(node),"left") end
+  if clicked and enabled and not dragged then B.Call("spells","GemClick",child,"left") end
   if enabled then
-    local rec=state(instance,screen,node)
-    if ui.IsItemClicked(ui.Mouse.Right) then rec.right={start=ui.GetTime(),held=false};B.Call("spells","GemClick",B.Id(node),"rightdown");consumeRight(instance) end
+    if ui.IsItemClicked(ui.Mouse.Right) then rec.right={start=ui.GetTime(),held=false};B.Call("spells","GemClick",child,"rightdown");consumeRight(instance) end
     if rec.right then
       if ui.IsMouseDown(ui.Mouse.Right) and not rec.right.held and ui.GetTime()-rec.right.start>=0.5 then
-        rec.right.held=true;B.Call("spells","GemClick",B.Id(node),"rightheld")
+        rec.right.held=true;B.Call("spells","GemClick",child,"rightheld")
       end
-      if ui.IsMouseReleased(ui.Mouse.Right) then B.Call("spells","GemClick",B.Id(node),rec.right.held and "rightupheld" or "rightup",not hover);rec.right=nil
+      if ui.IsMouseReleased(ui.Mouse.Right) then B.Call("spells","GemClick",child,rec.right.held and "rightupheld" or "rightup",not hover);rec.right=nil
       elseif not ui.IsMouseDown(ui.Mouse.Right) then rec.right=nil end
     end
   end
-  if hover then local tip=info.tooltip or B.Tooltip(screen,node);if tip~="" then ui.SetTooltip(tip) end end
+  if hover then tip=tip or B.Tooltip(screen,node);if tip~="" then ui.SetTooltip(tip) end end
 end
 
+local hotCountLabel={font=1,fields={Style_RightJustify=true}}
 local function drawHot(instance,screen,node,box)
+  local child=B.Id(node)
+  local rec=state(instance,screen,node)
   local targetScreen,targetId
   if B.HotTarget then targetScreen,targetId=B.HotTarget(screen,node) end
-  targetScreen,targetId=targetScreen or screen,targetId or B.Id(node)
-  local info=B.Call("hotbars","Info",targetScreen,targetId) or {}
+  targetScreen,targetId=targetScreen or screen,targetId or child
+  if not rec.hotInfo then rec.hotInfo={} end
+  local info=B.Call("hotbars","Info",targetScreen,targetId,rec.hotInfo) or EMPTY
   local enabled=info.enabled~=false
-  local clicked,hover,pressed=hit("##hot:"..B.Id(node),box,enabled)
+  local clicked,hover,pressed=hit("##hot:"..child,box,enabled)
   buttonArt(instance,node,box,hover,pressed,info.checked,enabled)
-  local tint=info.tint or {1,1,1,info.iconAlpha or 1}
-  if type(info.tex)=="string" then R.Animation(instance,info.tex,box,tint)
-  elseif info.tex then ui.DrawImage(info.tex,box.x,box.y,box.x+box.w,box.y+box.h,info.u0 or 0,info.v0 or 0,info.u1 or 1,info.v1 or 1,unpack(tint))
+  local tint=info.tint
+  if type(info.tex)=="string" then R.Animation(instance,info.tex,box,tint or (info.iconAlpha and {1,1,1,info.iconAlpha} or WHITE))
+  elseif info.tex then
+    local r,g,b,a=1,1,1,info.iconAlpha or 1
+    if tint then r,g,b,a=unpack(tint) end
+    ui.DrawImage(info.tex,box.x,box.y,box.x+box.w,box.y+box.h,info.u0 or 0,info.v0 or 0,info.u1 or 1,info.v1 or 1,r,g,b,a)
   else text(instance,node,box,info.label or "",info.social and info.color or nil) end
   if info.cooldown~=nil then
     local top=box.y+box.h*clamp(info.cooldown,0,1)
-    filled(rect(box.x,top,box.w,math.max(0,box.y+box.h-top)),{0,0,0,0.6})
+    cooldown(box,top,0,0,0,0.6)
   end
   if info.social and info.faceCooldown and info.faceCooldown>0 then
     local top=box.y+box.h*(1-clamp(info.faceCooldown,0,1))
-    filled(rect(box.x,top,box.w,box.y+box.h-top),{0,0,0,0.5})
+    cooldown(box,top,0,0,0,0.5)
   end
   if info.overlay and info.overlay~="" then
-    text(instance,{font=1,fields={Style_RightJustify=true}},
+    text(instance,hotCountLabel,
       rect(box.x,box.y+math.max(0,box.h-14*box.s),box.w,14*box.s),info.overlay)
   end
   local key=B.Call("windows","Text",targetScreen,targetId)
-  if key and key~="" then text(instance,{font=1,fields={Style_RightJustify=true}},box,key,instance.palette.disabled) end
-  local rec=state(instance,screen,node)
+  if key and key~="" then text(instance,hotCountLabel,box,key,instance.palette.disabled) end
+  local tip=info.tooltip or info.label
   if ui.IsItemClicked(ui.Mouse.Left) then rec.dragged=false end
-  if enabled and B.Drag(targetScreen,targetScreen==screen and targetId==B.Id(node) and node or {name=targetId}) then rec.dragged=true end
+  if enabled and B.Drag(targetScreen,targetScreen==screen and targetId==child and node or {name=targetId}) then rec.dragged=true end
   if clicked and enabled and not rec.dragged then B.Call("hotbars","Click",targetScreen,targetId,"left")
   elseif enabled and B.Call("cursor","HoldingButton") and ui.IsMouseReleased(ui.Mouse.Left) and hover then
     B.Call("hotbars","Click",targetScreen,targetId,"left")
@@ -930,26 +1290,34 @@ local function drawHot(instance,screen,node,box)
     elseif not ui.IsMouseDown(ui.Mouse.Right) then rec.right=nil end
   end
   if hover and not ui.IsMouseDown(ui.Mouse.Right) then
-    local tip=info.tooltip or info.label or B.Tooltip(screen,node)
+    tip=tip or B.Tooltip(screen,node)
     if tip and tip~="" then ui.SetTooltip(tip) end
   end
 end
 
+local styleColors={
+  {"Text","text"},{"TextDisabled","disabled"},{"FrameBg","field"},{"Button","background"},
+  {"ButtonHovered","border"},{"ButtonActive","border"},{"Header","border"},{"HeaderHovered","border"},
+  {"HeaderActive","border"},{"Border","outline"},
+}
+local roundingVars={"FrameRounding","WindowRounding","ChildRounding","PopupRounding","TabRounding","GrabRounding","ScrollbarRounding"}
 function R.PushStyle(instance)
   local token={colors=0,vars=0}
   local p=instance.palette
-  local field={}; local outline={}
-  for i=1,3 do
-    field[i]=p.background[i]*0.9+p.text[i]*0.1
-    outline[i]=p.background[i]*0.68+p.text[i]*0.32
+  for _,entry in ipairs(styleColors) do
+    local name,role=entry[1],entry[2]
+    if ui.Col and ui.Col[name] then
+      if role=="field" or role=="outline" then
+        local bg,text=p.background,p.text
+        local base,ink=.9,.1
+        if role=="outline" then base,ink=.68,.32 end
+        ui.PushStyleColor(ui.Col[name],bg[1]*base+text[1]*ink,
+          bg[2]*base+text[2]*ink,bg[3]*base+text[3]*ink,1)
+      else ui.PushStyleColor(ui.Col[name],unpack(p[role])) end
+      token.colors=token.colors+1
+    end
   end
-  field[4],outline[4]=1,1
-  for _,entry in ipairs({{"Text",p.text},{"TextDisabled",p.disabled},{"FrameBg",field},
-      {"Button",p.background},{"ButtonHovered",p.border},{"ButtonActive",p.border},
-      {"Header",p.border},{"HeaderHovered",p.border},{"HeaderActive",p.border},{"Border",outline}}) do
-    if ui.Col and ui.Col[entry[1]] then ui.PushStyleColor(ui.Col[entry[1]],unpack(entry[2]));token.colors=token.colors+1 end
-  end
-  for _,name in ipairs({"FrameRounding","WindowRounding","ChildRounding","PopupRounding","TabRounding","GrabRounding","ScrollbarRounding"}) do
+  for _,name in ipairs(roundingVars) do
     if ui.StyleVar and ui.StyleVar[name] then ui.PushStyleVar(ui.StyleVar[name],0);token.vars=token.vars+1 end
   end
   return token
@@ -1115,12 +1483,70 @@ local function drawStml(instance,screen,node,box)
 end
 
 local drawNode
-local function placements(instance,screen,node,box)
-  local all={};local s=box.s or 1;local f=node.fields or {}
-  local resource=find(instance,"templates",f.Layout);local strategy=resource and (resource.fields or {}) or {}
+local function childGeometry(screen,child,box,scale,measured)
+  -- Model rectangles describe the built-in presentation, not the selected
+  -- author's layout. Only an explicit dynamic adapter may borrow them.
+  if B.UseHostRect and B.UseHostRect(screen,child)==true then
+    local x,y,w,h,_,anchorRight,anchorBottom=B.Call("windows","ChildRect",screen,B.Id(child))
+    if x~=nil then
+      local dx,dy=number(x)*scale,number(y)*scale
+      local width=anchorRight~=nil and math.max(0,box.w-dx-number(anchorRight)*scale) or number(w)*scale
+      local height=anchorBottom~=nil and math.max(0,box.h-dy-number(anchorBottom)*scale) or number(h)*scale
+      if measured then
+        measured.x,measured.y,measured.w,measured.h,measured.s=box.x+dx,box.y+dy,width,height,scale
+        return measured,true
+      end
+      return {x=box.x+dx,y=box.y+dy,w=width,h=height,s=scale},true
+    end
+  end
+  return R.Geometry(child,box,measured),false
+end
+local function appendPlacement(scratch,screen,child,box,scale,measure,spot)
+  local index=#scratch.items+1
+  local pooled=index<=512
+  local item=scratch.records[index]
+  if not item then
+    item={}
+    if pooled then scratch.records[index]=item end
+  end
+  local measured
+  if measure and pooled then
+    measured=item.scratchRect
+    if not measured then measured={};item.scratchRect=measured end
+  end
+  local at,live
+  if spot then
+    at=measured or {}
+    at.x,at.y,at.w,at.h,at.s=box.x+spot.x,box.y+spot.y,spot.w,spot.h,scale
+  else at,live=childGeometry(screen,child,box,scale,measured) end
+  item.node,item.rect=child,at
+  scratch.items[index]=item
+  return item,at,live
+end
+local function pastTileEdge(value,edge,n)
+  -- Repeated additions and the independently scaled client edge can differ
+  -- by a few double-precision ulps at an exact fit. This error bound stays
+  -- far below a physical pixel and does not admit a genuinely wider piece.
+  local epsilon=8*2.220446049250313e-16*(n+2)*math.max(1,math.abs(value),math.abs(edge))
+  return value>edge+epsilon
+end
+local function resolvePlacements(instance,screen,node,box,measure,visibility,only)
+  local source=node.children
+  if not source or #source==0 then return EMPTY end
+  local scratch=borrowPlacements()
+  local all=scratch.items;local s=box.s or 1;local f=node.fields or EMPTY
+  local resource=find(instance,"templates",f.Layout);local strategy=resource and resource.fields or EMPTY
   local horizontal=node.type=="HorizontalLayoutBox" or resource and resource.type=="LayoutHorizontal"
   local vertical=node.type=="VerticalLayoutBox" or resource and resource.type=="LayoutVertical"
   local tile=node.type=="TileLayoutBox"
+  if not horizontal and not vertical and not tile then
+    for i,child in ipairs(source) do
+      if (not only or only[child]) and (visibility and visibility[i] or not visibility and B.Shown(screen,child)) then
+        appendPlacement(scratch,screen,child,box,s,measure)
+      end
+    end
+    return all,nil,nil,nil,scratch
+  end
   local linear=node.type=="HorizontalLayoutBox" or node.type=="VerticalLayoutBox"
   local strategyFlow=resource and (resource.type=="LayoutHorizontal" or resource.type=="LayoutVertical") and not linear
   local padding=number(strategy.Padding)*s
@@ -1129,48 +1555,34 @@ local function placements(instance,screen,node,box)
   local gap=number(f.Spacing,5)*s;local secondary=number(f.SecondarySpacing,5)*s
   local horizontalFirst=f.HorizontalFirst~=false
   local record=state(instance,screen,node);record.flowSizes=record.flowSizes or {}
-  local flow={}
-  local sizePiece=tile and truth(f.FirstPieceTemplate) and (node.children or {})[1]
-  local first=sizePiece and {w=number((sizePiece.rect or {}).w)*s,h=number((sizePiece.rect or {}).h)*s}
-  for _,child in ipairs(node.children or {}) do
+  local flow=scratch.flow
+  local sizePiece=tile and truth(f.FirstPieceTemplate) and source[1]
+  local first=sizePiece and {w=number((sizePiece.rect or EMPTY).w)*s,h=number((sizePiece.rect or EMPTY).h)*s}
+  for i,child in ipairs(source) do
     -- FirstPieceTemplate is also a real first gem/buff in many layouts. Only
     -- a model's explicit visibility rule may hide a nonsemantic prototype.
-    if B.Shown(screen,child) then
-      local at=R.Geometry(child,box)
-      -- Model rectangles describe the built-in presentation, not the selected
-      -- author's layout. Only an explicit dynamic adapter may borrow them.
-      local x,y,w,h,relative,anchorRight,anchorBottom
-      if B.UseHostRect and B.UseHostRect(screen,child)==true then
-        x,y,w,h,relative,anchorRight,anchorBottom=B.Call("windows","ChildRect",screen,B.Id(child))
-      end
-      local live=x~=nil
-      if live then
-        at={x=box.x+number(x)*s,y=box.y+number(y)*s,w=number(w)*s,h=number(h)*s,s=s}
-        if anchorRight~=nil then at.w=math.max(0,box.w-number(x)*s-number(anchorRight)*s) end
-        if anchorBottom~=nil then at.h=math.max(0,box.h-number(y)*s-number(anchorBottom)*s) end
-      end
-      local item={node=child,rect=at,live=live}
-      local cf=child.fields or {}
+    if visibility and visibility[i] or not visibility and B.Shown(screen,child) then
+      local item,at,live=appendPlacement(scratch,screen,child,box,s,measure)
+      local cf=child.fields or EMPTY
       if not live and (tile or horizontal and cf.UseInLayoutHorizontal~=false or vertical and cf.UseInLayoutVertical~=false) then
         -- A named layout strategy positions existing child windows. Their
         -- anchors may supply the entire size (a spell-gem tile has no Size).
         -- Concrete layout boxes instead start with their pieces' natural sizes.
-        local natural=child.rect or {}
+        local natural=child.rect or EMPTY
         if not strategyFlow then at.w=math.max(0,number(natural.w)*s);at.h=math.max(0,number(natural.h)*s) end
         local saved=record.flowSizes[B.Id(child)]
         if saved then if vertical then at.h=saved*s else at.w=saved*s end end
         flow[#flow+1]=item
       end
-      all[#all+1]=item
     end
   end
   local x,y,rowHeight,columnWidth=left,top,0,0
   local availableW,availableH=math.max(0,box.w-left-right),math.max(0,box.h-top-bottom)
   if strategyFlow then
-    local flexible,fixed={},0
+    local flexible,fixed=scratch.flexible,0
     for _,item in ipairs(flow)do
-      local at,cf=item.rect,item.node.fields or {}
-      local natural=item.node.rect or {}
+      local at,cf=item.rect,item.node.fields or EMPTY
+      local natural=item.node.rect or EMPTY
       local resizeMain=vertical and truth(strategy.ResizeVertical)or horizontal and truth(strategy.ResizeHorizontal)
       local stretchMain=truth(cf.AutoStretch)or vertical and truth(cf.AutoStretchVertical)or horizontal and truth(cf.AutoStretchHorizontal)
       local naturalMain=number(vertical and natural.h or horizontal and natural.w)
@@ -1188,7 +1600,7 @@ local function placements(instance,screen,node,box)
       local available=vertical and availableH or availableW
       local share=math.max(0,available-fixed-gap*math.max(0,#flow-1))/#flexible
       for _,item in ipairs(flexible)do
-        local cf=item.node.fields or {}
+        local cf=item.node.fields or EMPTY
         local minimum=number(vertical and cf.MinVSize or horizontal and cf.MinHSize)*s
         local maximum=number(vertical and cf.MaxVSize or horizontal and cf.MaxHSize)*s
         local value=math.max(minimum,share)
@@ -1196,13 +1608,6 @@ local function placements(instance,screen,node,box)
         if vertical then item.rect.h=value else item.rect.w=value end
       end
     end
-  end
-  local function pastTileEdge(value,edge,n)
-    -- Repeated additions and the independently scaled client edge can differ
-    -- by a few double-precision ulps at an exact fit. This error bound stays
-    -- far below a physical pixel and does not admit a genuinely wider piece.
-    local epsilon=8*2.220446049250313e-16*(n+2)*math.max(1,math.abs(value),math.abs(edge))
-    return value>edge+epsilon
   end
   for n,item in ipairs(flow) do
     local at=item.rect
@@ -1226,7 +1631,76 @@ local function placements(instance,screen,node,box)
     if vertical or tile and not horizontalFirst then y=y+at.h+gap else x=x+at.w+gap end
     rowHeight=math.max(rowHeight,at.h);columnWidth=math.max(columnWidth,at.w)
   end
-  return all,linear and f.Style_Dividers~=false and flow or nil,vertical,record
+  return all,linear and f.Style_Dividers~=false and flow or nil,vertical,record,scratch
+end
+
+local function retainedGroup(node)
+  local group=retainedGroups[node]
+  if group and group.source==node.children and B.UseHostRect==sourceHostRect and R.Geometry==sourceGeometry then
+    return group
+  end
+end
+
+local function relativePlacements(group,instance,screen,node,box)
+  local scale=box.s or 1
+  local current=group.current
+  if not current or current.instance~=instance or current.w~=box.w or current.h~=box.h or current.s~=scale then
+    current={instance=instance,w=box.w,h=box.h,s=scale,positions={}}
+    group.current=current
+    if not group.flow then
+      local origin={x=0,y=0,w=box.w,h=box.h,s=scale}
+      for i,child in ipairs(group.source)do
+        local spot=sourceGeometry(child,origin)
+        spot.node=child;current.positions[i]=spot
+      end
+    end
+  end
+  if not group.flow then return current end
+
+  local record=state(instance,screen,node)
+  local changed=current.dirty or current.record~=record or current.revision~=record.flowRevision
+  local shown=current.shown or {}
+  for i,child in ipairs(group.source)do
+    local visible=B.Shown(screen,child)
+    if shown[i]~=visible then current.dirty=true;shown[i]=visible;changed=true end
+  end
+  if changed then
+    local origin={x=0,y=0,w=box.w,h=box.h,s=scale}
+    local entries,flow,vertical,_,scratch=resolvePlacements(instance,screen,node,origin,true,shown)
+    local positions={}
+    local byItem=flow and {}
+    for i,item in ipairs(entries)do
+      local at=item.rect
+      local spot={node=item.node,x=at.x,y=at.y,w=at.w,h=at.h}
+      positions[i]=spot
+      if byItem then byItem[item]=spot end
+    end
+    if flow then
+      for i,item in ipairs(flow)do byItem[item].divider=i end
+    end
+    if scratch then releasePlacements() end
+    current.positions,current.shown,current.record,current.revision=positions,shown,record,record.flowRevision
+    current.vertical,current.dividers=vertical,flow~=nil
+    current.dirty=nil
+  end
+  return current
+end
+
+local function placements(instance,screen,node,box,measure,only,borrowed)
+  local group=retainedGroup(node)
+  if not group then return resolvePlacements(instance,screen,node,box,measure,nil,only) end
+  local layout=relativePlacements(group,instance,screen,node,box)
+  local scratch=borrowPlacements()
+  local scale=box.s or 1
+  local flow=layout.dividers and not measure and not only and scratch.flow
+  for _,spot in ipairs(layout.positions)do
+    local child=spot.node
+    if (not only or only[child]) and (group.flow or B.Shown(screen,child)) then
+      local item=appendPlacement(scratch,screen,child,box,scale,measure or borrowed,spot)
+      if flow and spot.divider then flow[spot.divider]=item end
+    end
+  end
+  return scratch.items,flow,layout.vertical,layout.record,scratch
 end
 
 function R.MeasureChildren(screen,plan,instance,box)
@@ -1234,14 +1708,16 @@ function R.MeasureChildren(screen,plan,instance,box)
   local right,bottom=box.x,box.y
   local function visit(node,parent,depth)
     if depth>64 then error("Source measurement exceeds the depth limit",0) end
-    local entries=placements(instance,screen,node,parent)
+    local entries,_,_,_,scratch=placements(instance,screen,node,parent,true)
     for _,entry in ipairs(entries) do
       local at=entry.rect
       right=math.max(right,at.x+at.w);bottom=math.max(bottom,at.y+at.h)
-      if #(entry.node.children or {})>0 then visit(entry.node,at,depth+1) end
+      if entry.node.children and #entry.node.children>0 then visit(entry.node,at,depth+1) end
     end
+    if scratch then releasePlacements() end
   end
-  visit(plan,box,0)
+  local ok,why=presenterCall(screen,visit,plan,box,0)
+  if not ok then error(why,0) end
   return math.max(0,right-box.x),math.max(0,bottom-box.y)
 end
 local function dividers(instance,screen,node,box,flow,vertical,record)
@@ -1263,8 +1739,12 @@ local function dividers(instance,screen,node,box,flow,vertical,record)
       local minA=number(vertical and af.MinVSize or af.MinHSize,1)*s
       local minB=number(vertical and bf.MinVSize or bf.MinHSize,1)*s
       local delta=clamp(position-drag.start,minA-drag.first,math.max(minA-drag.first,drag.second-minB))
-      record.flowSizes[B.Id(before.node)]=(drag.first+delta)/s
-      record.flowSizes[B.Id(after.node)]=(drag.second-delta)/s
+      local firstId,secondId=B.Id(before.node),B.Id(after.node)
+      local first,second=(drag.first+delta)/s,(drag.second-delta)/s
+      if record.flowSizes[firstId]~=first or record.flowSizes[secondId]~=second then
+        record.flowSizes[firstId],record.flowSizes[secondId]=first,second
+        record.flowRevision=(record.flowRevision or 0)+1
+      end
     elseif record.divider and record.divider.index==n and not ui.IsMouseDown(ui.Mouse.Left) then record.divider=nil end
   end
 end
@@ -1272,24 +1752,46 @@ end
 -- without painting, creating input items, or dispatching control actions.
 function R.VisitChildren(screen,plan,instance,box,visit,opts)
   opts=opts or{}
+  -- When requested, project onto a set of controls and their ancestors. A
+  -- flow group still positions every visible sibling before projection.
+  local only,nodesOnly=opts.nodes,opts.nodesOnly
   local count=0
   local function walk(parent,at,clip,depth)
     if depth>64 then return end
-    local entries=placements(instance,screen,parent,at)
+    local group=nodesOnly and retainedGroup(parent)
+    if group and group.leaves and not group.flow then
+      if clip.w<=0 or clip.h<=0 then return end
+      local current=relativePlacements(group,instance,screen,parent,at)
+      local left,top=clip.x,clip.y
+      local right,bottom=left+clip.w,top+clip.h
+      for _,spot in ipairs(current.positions)do
+        local n=spot.node
+        if (not only or only[n]) and B.Shown(screen,n) then
+          count=count+1;if count>8192 then break end
+          local x,y=at.x+spot.x,at.y+spot.y
+          if spot.w>0 and spot.h>0 and x<right and x+spot.w>left and y<bottom and y+spot.h>top then visit(n) end
+        end
+      end
+      return
+    end
+    -- A node-only visitor cannot hold a rectangle, so the traversal can
+    -- borrow the same private rectangles used by measurement.
+    local entries,_,_,_,scratch=placements(instance,screen,parent,at,nodesOnly,only)
     for _,entry in ipairs(entries)do
-      count=count+1;if count>8192 then return end
+      count=count+1;if count>8192 then break end
       local n,r=entry.node,entry.rect
       local x,y=math.max(clip.x,r.x),math.max(clip.y,r.y)
       local right,bottom=math.min(clip.x+clip.w,r.x+r.w),math.min(clip.y+clip.h,r.y+r.h)
-      if r.w>0 and r.h>0 and right>x and bottom>y then
-        local visible={x=x,y=y,w=right-x,h=bottom-y,s=r.s}
-        visit(n,r,visible)
-        if n.type=="TabBox"then
-          local record=state(instance,screen,n)
-          local picked=B.Call("windows","TabPage",screen,B.Id(n))
-          if picked==nil then picked=record.page or 0 end
+      if (not only or only[n]) and r.w>0 and r.h>0 and right>x and bottom>y then
+        local tab=n.type=="TabBox"
+        local nested=n.children and #n.children>0
+        local visible
+        if not nodesOnly or tab or nested then visible={x=x,y=y,w=right-x,h=bottom-y,s=r.s} end
+        if nodesOnly then visit(n) else visit(n,r,visible) end
+        if tab then
           local pages=n.children or{}
           local function pageChildren(page)
+            if only and not only[page] then return end
             local header=number((n.fields or{}).TabHeight,22)*r.s
             local body={x=r.x,y=r.y+header,w=r.w,h=math.max(0,r.h-header),s=r.s}
             local cy=math.max(visible.y,body.y)
@@ -1298,43 +1800,87 @@ function R.VisitChildren(screen,plan,instance,box,visit,opts)
           end
           if opts.allPages then
             for _,page in ipairs(pages)do pageChildren(page)end
-          elseif pages[picked+1]then pageChildren(pages[picked+1])end
-        else walk(n,r,visible,depth+1)end
+          else
+            local picked=B.Call("windows","TabPage",screen,B.Id(n))
+            if picked==nil then picked=state(instance,screen,n).page or 0 end
+            if pages[picked+1]then pageChildren(pages[picked+1])end
+          end
+        elseif nested then walk(n,r,visible,depth+1)end
       end
     end
+    if scratch then releasePlacements() end
   end
   -- A scrollable root's content may extend past its viewport. Geometry still
   -- uses the authored client box; nested containers retain their own clips.
-  walk(plan,box,opts.clip or box,0)
+  local ok,why=presenterCall(screen,walk,plan,box,opts.clip or box,0)
+  if not ok then error(why,0) end
 end
-local function children(instance,screen,node,box)
-  local ordered,over={},{}
-  local entries,flow,vertical,record=placements(instance,screen,node,box)
-  for _,entry in ipairs(entries) do
-    local list=B.Call("windows","ChildUnder",screen,B.Id(entry.node)) and ordered or over
-    list[#list+1]=entry
+local function fixedChildren(instance,screen,node,group,box)
+  local scale=box.s or 1
+  local current=relativePlacements(group,instance,screen,node,box)
+  local scratch=borrowPlacements()
+  local visible,under=scratch.flow,scratch.ordered
+  for _,spot in ipairs(current.positions)do
+    if B.Shown(screen,spot.node) then visible[#visible+1]=spot end
   end
-  for _,entry in ipairs(over)do ordered[#ordered+1]=entry end
+  for i,spot in ipairs(visible)do
+    if B.Call("windows","ChildUnder",screen,B.Id(spot.node)) then
+      under[#under+1]=spot
+      visible[i]=false
+    end
+  end
+  if #under>0 then
+    for _,spot in ipairs(visible)do if spot then under[#under+1]=spot end end
+  else under=visible end
+  -- Only the scoped pack painters borrow this rectangle. Nested draws take
+  -- another scratch depth; ordinary adapters can keep their own rectangle.
+  local borrowed=borrowDrawRects and scratch.paintRect
+  if borrowDrawRects and not borrowed then borrowed={};scratch.paintRect=borrowed end
+  for _,spot in ipairs(under)do
+    if spot.w>0 and spot.h>0 and (not paintFilter or not paintFilter(screen,spot.node)) then
+      local at=borrowed or {}
+      at.x,at.y,at.w,at.h,at.s=box.x+spot.x,box.y+spot.y,spot.w,spot.h,scale
+      drawNode(instance,screen,spot.node,at,true)
+    end
+  end
+  releasePlacements()
+end
+
+local function children(instance,screen,node,box)
+  local group=retainedGroup(node)
+  if group and group.leaves and not group.flow then
+    return fixedChildren(instance,screen,node,group,box)
+  end
+  local entries,flow,vertical,record,scratch=placements(instance,screen,node,box,false,nil,borrowDrawRects)
+  if not scratch then return end
+  local ordered
+  for _,entry in ipairs(entries) do
+    if B.Call("windows","ChildUnder",screen,B.Id(entry.node)) then
+      ordered=scratch.ordered
+      entry.under=true
+      ordered[#ordered+1]=entry
+    end
+  end
+  if ordered then
+    for _,entry in ipairs(entries)do if not entry.under then ordered[#ordered+1]=entry end end
+  else ordered=entries end
   -- Child window backgrounds belong behind sibling controls, even when the
   -- source lists an anchored layout screen after its target gauges/labels.
   -- Preserve the authored ordering of all input items and child contents.
   for _,entry in ipairs(ordered)do
     local child,at=entry.node,entry.rect
     if (child.type=="Screen"or child.type=="Page")and at.w>0 and at.h>0 and B.Shown(screen,child)then
-      ui.PushClipRect(at.x,at.y,at.x+at.w,at.y+at.h,true)
-      local ok,painted=pcall(R.PaintControl,screen,child,at,instance)
-      ui.PopClipRect()
-      if not ok then error(painted,0)end
+      ui.PushClipRect(at.x,at.y,at.x+at.w,at.y+at.h,true);drawClipDepth=drawClipDepth+1
+      local painted=R.PaintControl(screen,child,at,instance)
+      ui.PopClipRect();drawClipDepth=drawClipDepth-1
       if painted then at.paintedChromeNode=child end
     end
   end
   for _,entry in ipairs(ordered)do drawNode(instance,screen,entry.node,entry.rect) end
   dividers(instance,screen,node,box,flow,vertical,record)
+  releasePlacements()
 end
-dynamicArt=function(instance,screen,node,box,part,supplied)
-  local value,u0,v0,u1,v1
-  if supplied then value,u0,v0,u1,v1=table.unpack(supplied,1,5)
-  else value,u0,v0,u1,v1=B.Call("windows","ChildArt",screen,B.Id(node),part) end
+paintDynamicArt=function(instance,screen,node,box,part,value,u0,v0,u1,v1)
   if value==false then return true end -- the model explicitly draws nothing
   if value==nil then return false end
   if part=="decal" then box=decalRect(node,box) end
@@ -1342,6 +1888,9 @@ dynamicArt=function(instance,screen,node,box,part,supplied)
   if type(value)=="string" then R.Animation(instance,value,box,B.Color(screen,node,part));return true end
   ui.DrawImage(value,box.x,box.y,box.x+box.w,box.y+box.h,u0 or 0,v0 or 0,u1 or 1,v1 or 1,1,1,1,1)
   return true
+end
+dynamicArt=function(instance,screen,node,box,part)
+  return paintDynamicArt(instance,screen,node,box,part,B.Call("windows","ChildArt",screen,B.Id(node),part))
 end
 local function drawTabs(instance,screen,node,box)
   local record=state(instance,screen,node)
@@ -1391,19 +1940,7 @@ local function controlEvents(instance,screen,node,box)
   tooltip(screen,node)
 end
 
-drawNode=function(instance,screen,node,box)
-  if box.w<=0 or box.h<=0 or not B.Shown(screen,node) then return end
-  local x0,y0,x1,y1=box.x,box.y,box.x+box.w,box.y+box.h
-  if node.type=="Gauge" then
-    -- A source gauge can deliberately place its caption outside its track.
-    -- Retain the enclosing client clip while allowing the authored text offset.
-    local fields=node.fields or {};local s=box.s or 1
-    local dx,dy=number(fields.TextOffsetX)*s,number(fields.TextOffsetY)*s
-    x0,y0=math.min(x0,x0+dx),math.min(y0,y0+dy)
-    x1,y1=math.max(x1,x1+dx),math.max(y1,y1+dy)
-  end
-  ui.PushClipRect(x0,y0,x1,y1,true)
-  local ok,why=pcall(function()
+local function paintNode(instance,screen,node,box)
   if B.DrawControl and B.DrawControl(screen,node,box,instance,R)==true then return end
   local kind=node.type
   if kind=="Label" or kind=="StaticText" or kind=="StaticHeader" then
@@ -1416,7 +1953,10 @@ drawNode=function(instance,screen,node,box)
       if enabled and events.right and ui.IsItemClicked(ui.Mouse.Right) then B.Click(screen,node,"right");consumeRight(instance) end
       tooltip(screen,node)
     end
-    local caption,tint=B.Text(screen,node);text(instance,node,box,caption,not enabled and instance.palette.disabled or B.Color(screen,node) or tint or color((node.colors or {}).TextColor,instance.palette.text))
+    local caption,tint=B.Text(screen,node)
+    if caption~="" then
+      text(instance,node,box,caption,not enabled and instance.palette.disabled or B.Color(screen,node) or tint or (node.colors or EMPTY).TextColor)
+    end
   elseif kind=="Button" then drawButton(instance,screen,node,box)
   elseif kind=="Gauge" then drawGauge(instance,screen,node,box);controlEvents(instance,screen,node,box)
   elseif kind=="InvSlot" then drawSlot(instance,screen,node,box)
@@ -1440,28 +1980,46 @@ drawNode=function(instance,screen,node,box)
     children(instance,screen,node,box)
   else children(instance,screen,node,box) end
   if B.AfterControl then B.AfterControl(screen,node,box,instance,R) end
-  end)
-  ui.PopClipRect()
-  if not ok then error(why,0) end
+end
+
+drawNode=function(instance,screen,node,box,filtered)
+  if not filtered and paintFilter and paintFilter(screen,node) then return end
+  if box.w<=0 or box.h<=0 or not B.Shown(screen,node) then return end
+  local x0,y0,x1,y1=box.x,box.y,box.x+box.w,box.y+box.h
+  if node.type=="Gauge" then
+    -- A source gauge can deliberately place its caption outside its track.
+    -- Retain the enclosing client clip while allowing the authored text offset.
+    local fields=node.fields or EMPTY;local s=box.s or 1
+    local dx,dy=number(fields.TextOffsetX)*s,number(fields.TextOffsetY)*s
+    x0,y0=math.min(x0,x0+dx),math.min(y0,y0+dy)
+    x1,y1=math.max(x1,x1+dx),math.max(y1,y1+dy)
+  end
+  ui.PushClipRect(x0,y0,x1,y1,true);drawClipDepth=drawClipDepth+1
+  paintNode(instance,screen,node,box)
+  ui.PopClipRect();drawClipDepth=drawClipDepth-1
 end
 
 -- Specialized presenters retain the same geometry and artwork while owning a
 -- control's full domain interaction (chat, buffs, inventory drag/drop, etc.).
 -- This helper deliberately creates no input item and dispatches no action.
+local nestedChrome=setmetatable({},{__mode="k"})
 function R.PaintControl(screen,node,box,instance,options)
-  options=options or {}
+  options=options or EMPTY
   local kind=node.type
   if kind=="Gauge" then drawGauge(instance,screen,node,box,options)
   elseif kind=="Label" or kind=="StaticText" or kind=="StaticHeader" then
     local caption,tint=B.Text(screen,node)
     text(instance,node,box,options.caption~=nil and options.caption or caption,
-      options.tint or B.Color(screen,node) or tint or color((node.colors or {}).TextColor,instance.palette.text))
+      options.tint or B.Color(screen,node) or tint or (node.colors or EMPTY).TextColor)
   elseif kind=="Button" or kind=="InvSlot" or kind=="HotButton" or kind=="SpellGem" then
-    local enabled,checked=B.State(screen,node)
-    if options.enabled~=nil then enabled=options.enabled end
-    if options.checked~=nil then checked=options.checked end
+    local enabled,checked=options.enabled,options.checked
+    if enabled==nil or checked==nil then
+      local liveEnabled,liveChecked=B.State(screen,node)
+      if enabled==nil then enabled=liveEnabled end
+      if checked==nil then checked=liveChecked end
+    end
     buttonArt(instance,node,box,options.hovered==true,options.active==true,checked,enabled,options.tint,
-      {decal=options.skipDecal==true})
+      false,options.skipDecal==true)
     if options.caption~=nil then text(instance,node,box,options.caption,options.tint) end
   elseif kind=="StaticAnimation" or kind=="StaticTintedBlendAnimation" then
     if not options.skipDecal then
@@ -1483,17 +2041,31 @@ function R.PaintControl(screen,node,box,instance,options)
     if not reference or reference==""or not template(instance,reference)then return false end
     local bordered,titled,transparent=truth(fields.Style_Border),truth(fields.Style_Titlebar),truth(fields.Style_Transparent)
     if transparent and not bordered and not titled then return false end
-    local own={};for key,value in pairs(node)do own[key]=value end
-    own.fields=setmetatable({Style_Border=bordered,Style_Titlebar=titled,Style_Transparent=transparent},{__index=fields})
-    own.art={drawTemplate=reference}
+    local own=nestedChrome[node]
+    local close=fields.Style_Closebox
+    if not own or own.art.drawTemplate~=reference or own.font~=node.font or own.colors~=node.colors
+        or own.fields.Style_Border~=bordered or own.fields.Style_Titlebar~=titled
+        or own.fields.Style_Transparent~=transparent or own.fields.Style_Closebox~=close then
+      own={name=node.name,font=node.font,colors=node.colors,art={drawTemplate=reference},fields={
+        Style_Border=bordered,Style_Titlebar=titled,Style_Transparent=transparent,Style_Closebox=close}}
+      nestedChrome[node]=own
+    end
+    if instance.index.portable==1 and not instance.chromeMetrics[own] then instance.chromeMetrics[own]={} end
     R.WindowChrome(own,node.text,box,instance,{close=false,alpha=options.alpha})
   else return false end
   return true
 end
 
-function R.DrawChildren(screen,plan,instance,box)
+local function drawChildren(instance,screen,plan,box)
   if plan.type=="Page"then R.PaintControl(screen,plan,box,instance)end
-  return children(instance,screen,plan,box)
+  children(instance,screen,plan,box)
+end
+function R.DrawChildren(screen,plan,instance,box)
+  local previous=borrowDrawRects
+  borrowDrawRects=false
+  local ok,why=presenterCall(screen,drawChildren,instance,screen,plan,box)
+  borrowDrawRects=previous
+  if not ok then error(why,0) end
 end
 
 function R.CanDraw(plan,instance,screen)
@@ -1534,7 +2106,7 @@ function R.CanDraw(plan,instance,screen)
   return ok,why
 end
 
-function R.Draw(screen,plan,instance,target,adapter)
+function R.Draw(screen,plan,instance,target,adapter,skipPaint)
   local ok,why
   if adapter~=nil then
     if type(adapter)~="table" or type(adapter.CanDraw)~="function" then
@@ -1560,7 +2132,13 @@ function R.Draw(screen,plan,instance,target,adapter)
   target.s=target.s or target.scale or 1
   local token=R.PushStyle(instance)
   ui.PushClipRect(target.x,target.y,target.x+target.w,target.y+target.h,true)
-  local success,drawError=pcall(children,instance,screen,plan,target)
+  -- Presenters can omit known empty controls after resolving layout, leaving
+  -- flow membership, clipping, coverage and later controls' state intact.
+  local outerPaintFilter,outerBorrowed=paintFilter,borrowDrawRects
+  paintFilter=skipPaint
+  borrowDrawRects=adapter and adapter.BorrowsDrawRects==true and instance.index.portable==1
+  local success,drawError=presenterCall(screen,children,instance,screen,plan,target)
+  paintFilter,borrowDrawRects=outerPaintFilter,outerBorrowed
   ui.PopClipRect();R.PopStyle(token)
   if owned then
     local x,y=ui.GetWindowPos();local w,h=ui.GetWindowSize();B.Call("windows","Placed",screen,x,y,w,h,true)
@@ -1626,7 +2204,7 @@ function R.StyleTheme(T,instance)
   end
   T.Bar=function(key,x0,y0,x1,y1,s,fraction,tint,opts)
     opts=opts or {};local box={x=x0,y=y0,w=x1-x0,h=y1-y0,s=s}
-    gaugeArt(instance,{name=key,type="Gauge",fields={}},box,fraction,tint,opts.alpha)
+    gaugeArt(instance,{name=key,type="Gauge"},box.x,box.y,box.w,box.h,box.s,fraction,tint,opts.alpha)
     local f=opts.font or (instance.style.fonts or {}).small or 2
     local c=color(opts.textColor,instance.palette.text);local ink={c[1],c[2],c[3],c[4]*number(opts.alpha,1)}
     if opts.center then text(instance,{font=f,fields={Style_HCenter=true,Style_VCenter=true}},box,opts.center,ink) end

@@ -71,11 +71,98 @@ dofile=function(path)if modules[path]then return modules[path]end;return origina
 rawset(_G,"hailstone_skin_presenters",nil)
 local P=originalDofile(root.."/shared/source_presenters.lua")
 local B=modules["lib/pack_bindings.lua"]
+do
+  local old=rawget(_G,"hailstone_skin_status_presenters")
+  local lookups,visible=0,true
+  rawset(_G,"hailstone_skin_status_presenters",{
+    Handles=function(screen)lookups=lookups+1;return screen=="Outer"or screen=="Inner"end,
+    Shown=function(screen)return screen=="Outer" and visible end,
+  })
+  local screen,owner=B.PushPresenter("Outer")
+  eq(lookups,0)
+  eq(B.Shown("Outer",{}),true)
+  visible=false
+  eq(B.Shown("Outer",{}),false);eq(lookups,1)
+  local outer,outerOwner=B.PushPresenter("Inner")
+  eq(B.Shown("Inner",{}),false);eq(lookups,2)
+  B.PopPresenter(outer,outerOwner)
+  eq(B.Shown("Outer",{}),false);eq(lookups,2)
+  B.PopPresenter(screen,owner)
+  eq(B.Shown("Outer",{}),false);eq(lookups,3)
+  rawset(_G,"hailstone_skin_status_presenters",old)
+end
+do
+  local originalSupport,originalGauge=hs.UI.Supports,hs.UI.character.Gauge
+  local probes=0
+  hs.UI.Supports=function()probes=probes+1;return true end
+  eq(B.Function("character","Gauge"),originalGauge);eq(probes,1)
+  eq(B.Call("character","Gauge",1),.5);eq(probes,1)
+  hs.UI.character.Gauge=function()return .25 end
+  eq(B.Call("character","Gauge",1),.25)
+  hs.UI.character.Gauge=nil
+  eq(B.Call("character","Gauge",1),nil);eq(probes,2)
+  hs.UI.Supports,hs.UI.character.Gauge=originalSupport,originalGauge
+end
 for _,screen in ipairs({"InventoryWindow","PlayerWindow","HotButtonWnd","HotButtonWnd10","Chat32","ItemDisplayWindow#6"})do eq(P.Handles(screen),true)end
 eq(P.Handles("OtherWindow"),false)
+do
+  local originalGauge=hs.UI.character.Gauge
+  local originalChild=hs.UI.windows.ChildGauge
+  local originalClick=hs.UI.windows.ClickChild
+  local originalShown=hs.UI.windows.ChildShown
+  local reads,hp=0,.25
+  local visibilityReads,visible=0,true
+  hs.UI.character.Gauge=function(kind)eq(kind,1);reads=reads+1;return hp,"HP" end
+  hs.UI.windows.ChildGauge=function(_,name)if name=="NativeGauge"then return .75,"Override" end end
+  hs.UI.windows.ChildShown=function(_,name)
+    visibilityReads=visibilityReads+1
+    if name=="PlayerHP" then return visible end
+  end
+  hs.UI.windows.ClickChild=function()hp=.5;visible=false;return true end
+  local player={type="Screen",rect={w=100,h=70}}
+  local box={x=0,y=0,w=100,h=70,s=1}
+  local titled={name="PlayerHP",eqType="1"}
+  local alias={name="PlayerHP overlay",eqType="1"}
+  eq(P.Draw("PlayerWindow",player,context.instance,box,{Draw=function(screen)
+    eq(B.Gauge(screen,titled),.25);eq(B.Gauge(screen,alias),.25);eq(reads,1)
+    eq(B.Shown(screen,titled),true);eq(B.Shown(screen,titled),true);eq(visibilityReads,1)
+    eq(B.Shown(screen,{name="AuthoredHidden",fields={Visible=false}}),false)
+    eq(B.Gauge(screen,{name="NativeGauge",eqType="1"}),.75);eq(reads,1)
+    eq(B.Click(screen,titled,"left"),true)
+    eq(B.Shown(screen,titled),false);eq(visibilityReads,3)
+    eq(B.Gauge(screen,alias),.5);eq(reads,2)
+    return true
+  end}),true)
+  hp=.625
+  eq(B.Gauge("PlayerWindow",alias),.625);eq(reads,3)
+  visible=true
+  eq(B.Shown("PlayerWindow",titled),true);eq(visibilityReads,4)
+  hs.UI.character.Gauge,hs.UI.windows.ChildGauge,hs.UI.windows.ClickChild=originalGauge,originalChild,originalClick
+  hs.UI.windows.ChildShown=originalShown
+end
 local plan={type="Screen",rect={w=300,h=200},children={}}
 for _,screen in ipairs({"InventoryWindow","PlayerWindow","HotButtonWnd","Chat1","ItemDisplayWindow"})do
   local ok=P.CanDraw(screen,plan,context.instance);eq(ok,true)
+end
+do
+  local queries,show=0,false
+  local original=hs.UI.windows.ChildShown
+  hs.UI.windows.ChildShown=function(_,name)
+    queries=queries+1
+    if name=="Deferred"then return show end
+  end
+  local nested={type="Screen",name="Deferred",children={{type="Gauge",name="PlayerHP"}}}
+  local packaged={type="Screen",_packColorsNormalized=true,children={nested}}
+  eq(P.CanDraw("PlayerWindow",packaged),true)
+  eq(P.CanDraw("PlayerWindow",packaged),true)
+  eq(queries,0)
+  eq(B.Shown("PlayerWindow",nested),false)
+  show=true
+  eq(B.Shown("PlayerWindow",nested),true)
+  local special={type="Screen",_packColorsNormalized=true,children={{type="Screen",name="Deferred",children={{type="Editbox"}}}}}
+  show=false;eq(P.CanDraw("PlayerWindow",special),true)
+  show=true;eq(P.CanDraw("PlayerWindow",special),false)
+  hs.UI.windows.ChildShown=original
 end
 local inventoryTabs=hs.UI.windows.TabPage
 hs.UI.windows.TabPage=function(_,name)if name=="IW_Subwindows"then return 0 end end
@@ -133,8 +220,13 @@ local R={Draw=function(screen,p,instance,content,adapter)
   eq(adapter,P);record("sourcebody",content.x,content.y,content.w,content.h,content.s);return true
 end,DrawChildren=function(screen,p)record("extra",p.children[1].name)end,
   PushStyle=function()record("chatstyle");return "style"end,PopStyle=function(token)eq(token,"style");record("endchatstyle")end}
+local ordinaryAudits=0
+R.VisitChildren=function()ordinaryAudits=ordinaryAudits+1 end
+eq(P.Draw("PlayerWindow",plan,context.instance,{x=12,y=30,w=300,h=200,s=1},R),true)
 local _,height=P.Size("Chat1",plan);eq(height,224)
 P.Draw("Chat1",plan,context.instance,{x=12,y=30,w=300,h=224,s=1},R)
+eq(ordinaryAudits,0)
+R.VisitChildren=nil
 local body;for _,call in ipairs(calls)do if call[1]=="sourcebody"then body=call end end
 eq(body[3],54);eq(body[5],200)
 eq(count("button"),2);eq(count("chatcombo"),0)
@@ -174,7 +266,8 @@ local authoredPlan={type="Screen",rect={x=11,y=13,w=300,h=200},fields={Style_Tit
 context.renderer=R
 R.Resolve=function()return authoredPlan end
 R.TrackWindow=function()end
-R.CanDraw=function()return false,"generic path must not replace the major presenter"end
+local genericAudits=0
+R.CanDraw=function()genericAudits=genericAudits+1;return false,"generic path must not replace the major presenter"end
 R.ChromeInsets=function(_,_,s)return {left=3*s,right=5*s,top=17*s,bottom=7*s,titleHeight=17*s}end
 R.WindowChrome=function(_,title,outer)
   record("chrome",outer.x,outer.y,outer.w,outer.h,outer.s)
@@ -186,6 +279,7 @@ ui.PopClipRect=function()clipDepth=clipDepth-1 end
 ui.MenuItem=function()return false end
 local base={T={Hit=function()return false end}}
 base.Window=function(screen,title,opts,body)
+  if hs.UI.windows.Shown(screen)==false then record("closed-window",screen,opts,body);return end
   nativeOptions=opts
   local w,h=opts.size(1.5)
   if savedSize and opts.grow then w,h=opts.grow(savedSize[1],savedSize[2],1.5)end
@@ -204,10 +298,25 @@ hs.UI.interfaces={LoadBase=function(path)eq(path,"lib/hud.lua");return base end}
 modules["lib/pack_context.lua"]=context
 modules["lib/pack_source_presenters.lua"]=P
 local hud=originalDofile(root.."/shared/hud.lua")
+do
+  local originalShown=hs.UI.windows.Shown
+  hs.UI.windows.Shown=function()return false end
+  local options={}
+  local body=function()error("closed window drew a body")end
+  hud.Window("FixtureClosed","Closed",options,body)
+  local closed=calls[#calls]
+  eq(closed[1],"closed-window");eq(closed[3],options);eq(closed[4],body)
+  eq(context.paths.FixtureClosed,nil)
+  hs.UI.windows.Shown=originalShown
+end
 local opts={size=function()sizes=sizes+1;return 500,600 end,resizable={240,180},
   place=function(W,H,w,h,s,x,y)return x,y end}
 hud.Dialog("ItemDisplayWindow","Item",opts,function()fallbacks=fallbacks+1 end)
 eq(sizes,1);eq(fallbacks,0);eq(panels,0);eq(context.paths.ItemDisplayWindow,"source")
+opts.bodyOnlySize=true
+hud.Dialog("ItemDisplayWindow","Item",opts,function()fallbacks=fallbacks+1 end)
+eq(sizes,1);eq(fallbacks,0)
+opts.bodyOnlySize=nil
 eq(context.sourceManagedPanel,nil);eq(clipDepth,0)
 for _,entry in ipairs(calls)do if entry[1]=="sourcebody"then body=entry end end
 eq(body[2],24.5);eq(body[3],55.5);eq(body[4],438);eq(body[5],264)
@@ -232,6 +341,7 @@ eq(chrome[3]+chrome[5]<=viewport.height,true)
 eq(chrome[6],body[6]);eq(math.abs(chrome[6]-702/506)<.000001,true)
 eq(authoredPlan.rect.h,506);eq(nativeOptions.fit,false)
 local restored=calls[#calls];eq(restored[1],"fontscale");eq(restored[2],1)
+eq(genericAudits,0)
 
 -- Scroll-capable authored bodies preserve their virtual extent when a player
 -- has saved a smaller frame; all child and font scopes close on draw failure.
@@ -330,8 +440,10 @@ eq(B.HotTarget("BandolierWnd",{type="HotButton",eqType="hotbutton/Bar 0/12"}),ni
 local flow={type="Screen",rect={w=100,h=100},children={}}
 for n=1,12 do flow.children[n]={type="HotButton",name="HB_Button"..n,rect={w=40,h=40},unreachable=n>=11}end
 local placedDraws,extraNames,extraNodes={},{},{}
+local coverageAudits=0
 local reach={ChromeInsets=function()return {left=10,right=10,top=10,bottom=10}end,
   VisitChildren=function(screen,p,owner,at,visit,options)
+    coverageAudits=coverageAudits+1
     eq(options.allPages,true)
     local function scan(node)
       for _,child in ipairs(node.children or {})do
@@ -346,7 +458,9 @@ local reach={ChromeInsets=function()return {left=10,right=10,top=10,bottom=10}en
 hs.UI.hotbars.Setting=function(_,key)if key=="PercentSize"then return 100 end;return true end
 local fw,fh=P.Size("HotButtonWnd4",flow,context.instance,reach)
 eq(fw,100);eq(fh,192) -- client80 fits one44px cell per row, not two from outer100
+eq(coverageAudits,1)
 P.Draw("HotButtonWnd4",flow,context.instance,{x=0,y=0,w=80,h=172,s=1},reach)
+eq(coverageAudits,2) -- one fresh host visibility pass during Draw
 eq(#extraNames,2);eq(extraNames[1],"HB_Button11");eq(extraNames[2],"HB_Button12")
 eq(placedDraws[#placedDraws].children[11].sourceReplaced,true)
 eq(P.Shown("HotButtonWnd4",placedDraws[#placedDraws].children[11]),false)
@@ -360,6 +474,101 @@ eq(lw,60);eq(lh,520)
 P.Draw("HotButtonWnd",legacy,context.instance,{x=0,y=0,w=40,h=520,s=1},reach)
 eq(#extraNames,2) -- all 12 authored identities already exist
 eq(placedDraws[#placedDraws].children[12].name,"HB1_Button12")
+do
+  local layout={}
+  local previous=coverageAudits
+  P.Size("HotButtonWnd",legacy,context.instance,reach,layout)
+  P.Draw("HotButtonWnd",legacy,context.instance,{x=0,y=0,w=40,h=520,s=1},reach,layout)
+  eq(coverageAudits,previous+1)
+  eq(layout.plan,nil)
+  P.Size("HotButtonWnd",legacy,context.instance,reach,layout)
+  frame=frame+1
+  P.Draw("HotButtonWnd",legacy,context.instance,{x=0,y=0,w=40,h=520,s=1},reach,layout)
+  eq(coverageAudits,previous+3)
+end
+do
+  local authored={type=legacy.type,rect=legacy.rect,children=legacy.children,_packColorsNormalized=true}
+  local layout={}
+  local box={x=0,y=0,w=40,h=520,s=1}
+  local previous=coverageAudits
+  for _=1,2 do
+    P.Size("HotButtonWnd",authored,context.instance,reach,layout)
+    P.Draw("HotButtonWnd",authored,context.instance,box,reach,layout)
+    frame=frame+1
+  end
+  eq(coverageAudits,previous+1) -- static packaged slots retain their coverage between frames
+  local setting=hs.UI.hotbars.Setting
+  hs.UI.hotbars.Setting=function(bar,key)
+    if key=="ShowSpinner"then return false end
+    return setting(bar,key)
+  end
+  P.Size("HotButtonWnd",authored,context.instance,reach,layout)
+  P.Draw("HotButtonWnd",authored,context.instance,box,reach,layout)
+  eq(coverageAudits,previous+2) -- changing chrome/slot configuration rebuilds the plan
+  hs.UI.hotbars.Setting=setting
+end
+do
+  -- Preparing a source graph resolves canonical slot identities once. Coverage
+  -- remains live for non-packaged/flow graphs without reparsing each slot on
+  -- every Size, Draw and visibility pass.
+  local authored={type="Screen",rect={w=60,h=520},children={}}
+  for n=1,12 do
+    authored.children[n]={type="HotButton",name="Legacy7_"..n,eqType="hotbutton/Bar 6/"..(n-1),rect={w=40,h=40}}
+  end
+  for _,node in ipairs({
+    {type="HotButton",name="Foreign",eqType="hotbutton/Bar 0/0"},
+    {type="HotButton",name="HB_Button99"},
+    {type="InvSlot",name="HB_InvSlot1"},{type="SpellGem",name="HB_SpellGem1"},
+    {type="Page",name="HB_VerticalBarPageButtons"},{type="Page",name="HB_HorizontalBarPageButtons"},
+    {type="Page",name="HB_HorizontalBarTemplate"},{type="Label",name="Decoration"},
+  })do node.rect={w=40,h=40};authored.children[#authored.children+1]=node end
+  local r={};for key,value in pairs(reach)do r[key]=value end
+  local target,setting,childShown=B.HotTarget,hs.UI.hotbars.Setting,hs.UI.windows.ChildShown
+  local parsed,percent,spinner=0,100,true
+  B.HotTarget=function(...)parsed=parsed+1;return target(...)end
+  hs.UI.hotbars.Setting=function(_,key)return key=="PercentSize"and percent or spinner end
+  local function paint()
+    P.Size("HotButtonWnd7",authored,context.instance,r)
+    P.Draw("HotButtonWnd7",authored,context.instance,{x=0,y=0,w=40,h=500,s=1},r)
+    return placedDraws[#placedDraws]
+  end
+  local prepared=paint()
+  eq(parsed,14)
+  eq(P.Shown("HotButtonWnd7",prepared.children[1]),nil)
+  for _,n in ipairs({15,16,18,19})do eq(P.Shown("HotButtonWnd7",prepared.children[n]),false)end
+  eq(P.Shown("HotButtonWnd7",prepared.children[17]),true)
+  eq(P.Shown("HotButtonWnd7",prepared.children[20]),nil)
+  prepared.children[1].sourceReplaced=true
+  eq(P.Shown("HotButtonWnd7",prepared.children[1]),false)
+  prepared.children[1].sourceReplaced=nil
+  hs.UI.windows.ChildShown=function()return false end
+  eq(B.Shown("HotButtonWnd7",prepared.children[1]),false)
+  hs.UI.windows.ChildShown=function()return true end
+  eq(B.Shown("HotButtonWnd7",prepared.children[1]),true)
+  frame=frame+1
+  eq(paint(),prepared);eq(parsed,14)
+  -- Settings stay live even within one frame, and a new renderer must not
+  -- inherit a grid prepared with another renderer's geometry/insets.
+  percent,spinner=150,false
+  local scaled=paint();eq(parsed,28);eq(scaled==prepared,false)
+  eq(scaled.children[1].rect.w,60)
+  eq(P.Shown("HotButtonWnd7",scaled.children[17]),false)
+  local chrome=r.ChromeInsets
+  r.ChromeInsets=function(...)return chrome(...)end
+  eq(paint()==scaled,false);eq(parsed,42)
+  B.HotTarget,hs.UI.hotbars.Setting,hs.UI.windows.ChildShown=target,setting,childShown
+end
+do
+  local setting=hs.UI.hotbars.Setting
+  hs.UI.hotbars.Setting=function(_,key)if key=="PercentSize"then return 100 end;return true end
+  settings["hud.perRow.HotButtonWnd2"]=nil
+  P.Size("HotButtonWnd2",hot,context.instance,hr)
+  P.Resize("HotButtonWnd2",hot,context.instance,hr,160,500)
+  eq(settings["hud.perRow.HotButtonWnd2"],4)
+  local w,h=P.Size("HotButtonWnd2",hot,context.instance,hr)
+  eq(w,160);eq(h,120)
+  hs.UI.hotbars.Setting=setting
+end
 local incomplete={type=legacy.type,rect=legacy.rect,children={table.unpack(legacy.children,1,11)}}
 P.Draw("HotButtonWnd",incomplete,context.instance,{x=0,y=0,w=40,h=564,s=1},reach)
 eq(#extraNames,3);eq(extraNames[3],"HB_Button12")
@@ -401,6 +610,41 @@ local inTabs={type="Screen",rect={w=100,h=100},children={}}
 for n=0,32 do inTabs.children[#inTabs.children+1]={type="InvSlot",name="InvSlot"..n,slot=n,rect={w=40,h=40},inactive=n==0}end
 fw,fh=P.Size("InventoryWindow",inTabs,context.instance,reach)
 eq(fh,100) -- allPages exposes the still-selectable inactive page, so no duplicate
+do
+  local hide=false
+  local previousShown=hs.UI.windows.ChildShown
+  hs.UI.windows.ChildShown=function(_,name)
+    if name=="Gear" then return not hide end
+  end
+  local audits=0
+  local geometry={ChromeInsets=reach.ChromeInsets,VisitChildren=function(screen,root,_,_,visit,opts)
+    audits=audits+1
+    eq(opts.allPages,true)
+    if B.Shown(screen,root.children[1])then
+      for _,child in ipairs(root.children[1].children)do visit(child) end
+    end
+  end}
+  local contents={type="Page",name="Gear",children=inTabs.children}
+  local fixed={type="Screen",rect=inTabs.rect,children={contents},_packColorsNormalized=true}
+  local _,height=P.Size("InventoryWindow",fixed,context.instance,geometry)
+  eq(height,100);eq(audits,1)
+  frame=frame+1
+  _,height=P.Size("InventoryWindow",fixed,context.instance,geometry)
+  eq(height,100);eq(audits,1)
+  hide=true
+  _,height=P.Size("InventoryWindow",fixed,context.instance,geometry)
+  eq(height>100,true);eq(audits,2)
+  hide=false
+  _,height=P.Size("InventoryWindow",fixed,context.instance,geometry)
+  eq(height,100);eq(audits,3)
+  geometry.ChromeInsets=function()return {left=3,right=7,top=8,bottom=9}end
+  P.Size("InventoryWindow",fixed,context.instance,geometry);eq(audits,4)
+  local dynamic={type="Screen",rect=fixed.rect,children={{type="TileLayoutBox",name="Gear",children=inTabs.children}},_packColorsNormalized=true}
+  P.Size("InventoryWindow",dynamic,context.instance,geometry)
+  P.Size("InventoryWindow",dynamic,context.instance,geometry)
+  eq(audits,6)
+  hs.UI.windows.ChildShown=previousShown
+end
 -- Use all twenty actual portable plans, with populated model contracts rather
 -- than empty startup windows. Text metrics here are deterministic fixtures;
 -- native ImGui/font/pixel acceptance is a separate CPU capture pass.
@@ -577,6 +821,22 @@ eq(changed~=other,true)
 fontFace="face-b"
 eq(P.ItemLayout("ItemDisplayWindow#2",cachePlan,cacheInstance,realR,400,200,1)~=changed,true)
 fontFace="face-a"
+do
+  local valueId="IDW_Row1Col3Value"
+  local labelId="IDW_Row1Col3Stat"
+  model.shown[labelId]=false
+  local original=hs.UI.windows.Text
+  hs.UI.windows.Text=function(screen,name)
+    assert(name~=valueId,"a hidden stat cannot allocate or read its value")
+    return original(screen,name)
+  end
+  local hidden=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)
+  model.text[valueId]="Changes behind the hidden stat"
+  eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1),hidden)
+  hs.UI.windows.Text=original
+  model.shown[labelId]=true
+  eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)~=hidden,true)
+end
 local recent=P.ItemLayout("ItemDisplayWindow#200",cachePlan,cacheInstance,realR,400,200,1)
 for n=201,212 do P.ItemLayout("ItemDisplayWindow#"..n,cachePlan,cacheInstance,realR,400,200,1)end
 eq(P.ItemLayout("ItemDisplayWindow#200",cachePlan,cacheInstance,realR,400,200,1)~=recent,true)
