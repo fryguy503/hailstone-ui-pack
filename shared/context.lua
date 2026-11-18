@@ -3,7 +3,7 @@
 local owned = rawget(_G, "hailstone_skin_context")
 if owned then return owned end
 local API = hs.UI
-assert(API and API.Supports("interfaces", "LoadBase") and API.Supports("interfaces", "LoadData"),
+assert(API and API.Supports("interfaces", "LoadBase"),
   "This UI needs a client with the modular interface base-import service")
 local renderer = dofile("lib/pack_renderer.lua")
 local profile = dofile("lib/pack_profile.lua")

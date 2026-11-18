@@ -18,15 +18,22 @@ local function apiModule(name,methods)
   api[name]=setmetatable(methods,{__index=function(_,key) error("Unregistered API "..name.."."..key) end})
 end
 api.Supports=function(module,member) return api[module]~=nil and (not member or rawget(api[module],member)~=nil) end
-apiModule("assets",{Image=function(path) record("asset",path)
+apiModule("assets",{InterfaceImage=function(path)
+  record("interfaceAsset",path)
+  if S.interfaceImages and S.interfaceImages[path] then return table.unpack(S.interfaceImages[path]) end
+end,Image=function(path) record("asset",path)
   if S.assetInfo and S.assetInfo[path]~=nil then
     local v=S.assetInfo[path];if v==false then return nil end;return table.unpack(v)
   end
   if path:find("missing",1,true) then return nil end;return S.imageHandle or "tex:"..path,64,32 end,
   ItemIcon=function(id)return "icon:"..id,0,0,1,1 end})
 apiModule("interfaces",{
- LoadBase=function()error("Compiled layouts must not use the code-base loader")end,
+ LoadBase=function(path)
+   if S.bundled then record("base",path);return parentFiles and parentFiles[path] end
+   error("Compiled layouts must not use the code-base loader")
+ end,
  LoadData=function(path,baseOnly)
+   check(not S.bundled,"Bundled layouts must never read private data")
    record("data",path,baseOnly==true,S.caller)
    local source=baseOnly and parentFiles or files
    return source and source[path]
@@ -138,7 +145,7 @@ dofile=function(path)
   if path=="lib/pack_bindings.lua" then return realDofile("shared/bindings.lua") end
   if path=="lib/pack_renderer.lua" then return realDofile("shared/renderer.lua") end
   if path=="lib/stml.lua" then return stml end
-  if files and files[path] then return files[path] end
+  if files and files[path] then if S.bundled then record("selected",path)end;return files[path] end
   error("Fixture file does not exist: "..path)
 end
 local function syntheticRenderer(renderer)
@@ -667,7 +674,7 @@ run("selected source identity cannot silently borrow an uncompiled parent's inde
   serial=serial+1;files={["lib/compiled/index.lua"]={version=2,skin="default",windows={Test="lib/compiled/windows/a.lua"}}}
   parentFiles={["lib/compiled/index.lua"]=files["lib/compiled/index.lua"]}
   local missing=R.New({id="missing-selected"..serial,source="aya-stock",index="lib/compiled/index.lua"})
-  equal(next(missing.index.windows),nil);check(R.Diagnostics(missing)[1]:find("missing for the selected source",1,true))
+  equal(next(missing.index.windows),nil);check(R.Diagnostics(missing)[1]:find("does not match the selected interface",1,true))
   files["lib/compiled/index.lua"]={version=2,skin="AYA-STOCK",windows={},images={},animations={},templates={}}
   local own=R.New({id="correct-selected"..serial,source="aya-stock",index="lib/compiled/index.lua"})
   check(own.index.windows.Test,"a verified selected index can still inherit sparse Default maps")
@@ -974,5 +981,51 @@ run("ambiguous same-name source atlases keep their diagnosed themed fallback",fu
   equal(R.Animation(I,"Sheet",box),false)
   local calls=0;for _,event in ipairs(S.events)do if event.kind=="asset"then calls=calls+1;equal(event.args[1],original)end end
   equal(calls,1);equal(#S.draws,0)
+end)
+run("packaged layouts load selected code and the approved default base",function()
+  S.bundled=true
+  local own="lib/layouts/windows/00112233445566778899aabb.lua"
+  local base="lib/layouts/windows/01112233445566778899aabb.lua"
+  local selected,shared=plan(),plan()
+  files={["lib/layouts/index.lua"]={version=2,storage="buckets-v1",windows={Selected=own}},
+    ["lib/layouts/buckets/00.lua"]={[own]=selected}}
+  parentFiles={["lib/layouts/index.lua"]={version=2,storage="buckets-v1",windows={Inherited=base}},
+    ["lib/layouts/buckets/01.lua"]={[base]=shared}}
+  local I=R.New({id="packaged",index="lib/layouts/index.lua"})
+  equal(R.Resolve("Selected",I),selected);equal(R.Resolve("Inherited",I),shared)
+  local baseIndex,baseBucket=false,false
+  for _,event in ipairs(S.events)do
+    check(event.kind~="data","the bundled loader does not inspect external data")
+    if event.kind=="base" then
+      baseIndex=baseIndex or event.args[1]=="lib/layouts/index.lua"
+      baseBucket=baseBucket or event.args[1]=="lib/layouts/buckets/01.lua"
+    end
+  end
+  check(baseIndex and baseBucket,"both inherited index and bucket use the approved base")
+end)
+run("bundled artwork takes precedence and is looked up once per frame",function()
+  local atlas="assets/"..string.rep("a",64)..".png"
+  local original="uifiles/test/atlas.tga"
+  local I=fixture({version=2,windows={},images={Sheet={path=original,interface_path=atlas}}})
+  S.interfaceImages={[atlas]={"bundled",64,32}}
+  check(R.Animation(I,"Sheet",box));check(R.Animation(I,"Sheet",box))
+  equal(S.draws[1][1],"bundled");equal(S.draws[2][1],"bundled")
+  local calls=0
+  for _,event in ipairs(S.events)do
+    check(event.kind~="asset","available bundled artwork needs no game-file lookup")
+    if event.kind=="interfaceAsset"then calls=calls+1;equal(event.args[1],atlas)end
+  end
+  equal(calls,1)
+  S.frame=S.frame+1;S.interfaceImages={};S.assetInfo={[original]={"game",64,32}};S.draws={}
+  check(R.Animation(I,"Sheet",box));equal(S.draws[1][1],"game","missing bundled art retains game fallback")
+end)
+run("older UI APIs keep game artwork without an InterfaceImage method",function()
+  local method=rawget(api.assets,"InterfaceImage");rawset(api.assets,"InterfaceImage",nil)
+  local ok,why=xpcall(function()
+    local atlas="assets/"..string.rep("b",64)..".png"
+    local I=fixture({version=2,windows={},images={Sheet={path="uifiles/test/atlas.tga",interface_path=atlas}}})
+    check(R.Animation(I,"Sheet",box));equal(S.draws[1][1],"tex:uifiles/test/atlas.tga")
+  end,debug.traceback)
+  rawset(api.assets,"InterfaceImage",method);assert(ok,why)
 end)
 print(string.format("Lua renderer: %d cases, %d assertions passed",passed,assertions))

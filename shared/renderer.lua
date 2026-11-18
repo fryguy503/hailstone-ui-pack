@@ -1,4 +1,4 @@
--- Lua presentation engine for locally compiled, data-only layouts.
+-- Lua presentation engine for bundled, data-only layouts.
 -- No XML reader and no interception of ui.window or plugin registrations.
 local B = dofile("lib/pack_bindings.lua")
 local R = {}
@@ -43,13 +43,23 @@ local function find(instance, category, name)
   end
   return folded[name:lower()]
 end
-local function load(instance, path)
-  if type(path) ~= "string" or not path:match("^lib/compiled/[%w_./-]+%.lua$")
+local function load(instance, path, baseOnly)
+  local root=instance.dataRoot or "lib/compiled"
+  if type(path) ~= "string" or path:sub(1,#root+1)~=root.."/"
+      or not path:match("^lib/[%w_./-]+%.lua$")
       or path:find("..",1,true) or path:find("//",1,true) then
-    return nil, "Invalid compiled-plan path"
+    return nil, "Invalid layout-data path"
   end
-  local ok, data = pcall(B.Call, "interfaces", "LoadData", path)
-  if not ok or type(data) ~= "table" then return nil, "Cannot load compiled plan: " .. path end
+  local ok,data
+  if root=="lib/layouts" then
+    if baseOnly then ok,data=pcall(B.Call,"interfaces","LoadBase",path)
+    else ok,data=pcall(dofile,path) end
+  else
+    -- Explicit developer profiles can still use the optional local data service.
+    -- Shipped profiles always use lib/layouts and never inspect stale ui-data.
+    ok,data=pcall(B.Call,"interfaces","LoadData",path,baseOnly==true)
+  end
+  if not ok or type(data) ~= "table" then return nil, "Cannot load packaged layout: " .. path end
   return data
 end
 local function inflate(node,depth)
@@ -79,16 +89,17 @@ function R.New(profile)
     .. "\n" .. tostring(profile.revision or profile.generation or "")
   if instances[key] then return instances[key] end
   local instance = {profile=profile, messages={}, folded={}, plans={}, textures={}, controls={}, preflight={},buckets={},baseBuckets={}}
+  instance.dataRoot=type(profile.index)=="string" and profile.index:match("^(lib/layouts)/") or "lib/compiled"
   local index, why = load(instance, profile.index or "lib/compiled/index.lua")
   if index and profile.source~=nil and (type(profile.source)~="string" or type(index.skin)~="string"
       or index.skin:lower()~=profile.source:lower()) then
-    why="Compiled layout data is missing for the selected source: "..tostring(profile.source)
+    why="Packaged layout data does not match the selected interface: "..tostring(profile.source)
     index=nil -- inherited Default data cannot stand in for an uncompiled selected skin
   end
   if index and (index.version == 1 or index.version == 2) then
-    if profile.id~="default" and B.Function("interfaces","LoadData") then
-      local ok,parent=pcall(B.Call,"interfaces","LoadData",profile.index or "lib/compiled/index.lua",true)
-      if ok and type(parent)=="table" and (parent.version==1 or parent.version==2) then
+    if profile.id~="default" and B.Function("interfaces",instance.dataRoot=="lib/layouts" and "LoadBase" or "LoadData") then
+      local parent=load(instance,profile.index or "lib/compiled/index.lua",true)
+      if type(parent)=="table" and (parent.version==1 or parent.version==2) then
         for _,category in ipairs({"windows","images","animations","templates","defaults","sources"}) do
           local merged,keys={},{}
           for name,value in pairs(parent[category] or {}) do merged[name]=value;keys[name:lower()]=name end
@@ -106,7 +117,7 @@ function R.New(profile)
     end
   else
     instance.index = {windows={},images={},animations={},templates={},style={}}
-    emit(instance,"compile",why or "Unsupported compiled-plan version; run the local layout compiler")
+    emit(instance,"layout",why or "Unsupported layout-data version; reinstall the UI pack in Add-ons")
   end
   instance.style = instance.index.style or {}
   for _,entry in pairs(instance.index.templates or {}) do
@@ -134,13 +145,12 @@ function R.Resolve(screen, instance)
   if instance.index.storage=="buckets-v1" then
     local hash=path:match("/([%x]+)%.lua$")
     if hash then
-      local bucket=string.format("lib/compiled/buckets/%02x.lua",tonumber(hash:sub(1,2),16)%32)
+      local bucket=string.format(instance.dataRoot.."/buckets/%02x.lua",tonumber(hash:sub(1,2),16)%32)
       if instance.buckets[bucket]==nil then instance.buckets[bucket]=load(instance,bucket) or false end
       plan=instance.buckets[bucket] and instance.buckets[bucket][path]
       if not plan then
         if instance.baseBuckets[bucket]==nil then
-          local ok,result=pcall(B.Call,"interfaces","LoadData",bucket,true)
-          instance.baseBuckets[bucket]=ok and type(result)=="table" and result or false
+          instance.baseBuckets[bucket]=load(instance,bucket,true) or false
         end
         plan=instance.baseBuckets[bucket] and instance.baseBuckets[bucket][path]
       end
@@ -235,14 +245,17 @@ local sharedImages={
 }
 local function image(instance, name)
   local entry = find(instance,"images",name)
-  if not entry or not entry.path then
+  if not entry or not (entry.path or entry.interface_path) then
     emit(instance,"image:"..tostring(name),"Missing compiled image reference: "..tostring(name)); return nil
   end
   local clock=ui.GetFrameCount()
-  local cached=instance.textures[entry.path]
+  local cacheKey=entry.interface_path or entry.path
+  local cached=instance.textures[cacheKey]
   if cached and cached.frame==clock then return cached.texture,cached.w,cached.h end
-  local texture,w,h = B.Call("assets","Image",entry.path)
-  local shared=not texture and sharedImages[entry.path:lower()]
+  local texture,w,h
+  if entry.interface_path then texture,w,h=B.Call("assets","InterfaceImage",entry.interface_path) end
+  if not texture and entry.path then texture,w,h=B.Call("assets","Image",entry.path) end
+  local shared=not texture and entry.path and sharedImages[entry.path:lower()]
   if shared then
     local fallback,fw,fh=B.Call("assets","Image",shared.path)
     if fallback and fw==shared.w and fh==shared.h then
@@ -251,8 +264,8 @@ local function image(instance, name)
         .."; using compatible shared artwork: "..shared.path)
     end
   end
-  instance.textures[entry.path]={frame=clock,texture=texture,w=w,h=h}
-  if not texture then emit(instance,"image:"..name,"Missing artwork: "..entry.path); return nil end
+  instance.textures[cacheKey]={frame=clock,texture=texture,w=w,h=h}
+  if not texture then emit(instance,"image:"..name,"Missing artwork: "..tostring(entry.path or entry.interface_path)); return nil end
   return texture,w,h
 end
 

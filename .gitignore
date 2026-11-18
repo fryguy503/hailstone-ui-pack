@@ -6,6 +6,8 @@ artifacts/
 .local/
 *.log
 *.png
+!/assets/*.png
 *.zip
 !/ui-pack-0.2.0-preview.1.zip
 !/ui-pack-0.2.0-preview.2.zip
+!/ui-pack-0.2.0-preview.3.zip

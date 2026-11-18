@@ -1,0 +1,2 @@
+-- Portable Hailstone UI presentation tables.
+return {["lib/layouts/windows/6d9e0dbd97116d4bf607e558.lua"]={"Screen","HB_HorizontalBarTemplate",false,false,{0,0,0,0},{true,false,true,false,0,0,1,12,15},"",3,{},{"","","",""},"",{AutoStretch=true,BottomAnchorToTop=false,LeftAnchorOffset=1,RightAnchorOffset=12,RightAnchorToLeft=false,UseInLayoutHorizontal=false,UseInLayoutVertical=false},{},nil,nil}}

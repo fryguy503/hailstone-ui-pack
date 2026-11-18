@@ -165,7 +165,7 @@ def compiled_files(seed: Path, addon_root: Path = ROOT) -> tuple[dict[str, Path]
     bundle = tool_module("local_bundle")
     for name, path, _, kind in payload:
         content = path.read_bytes()
-        if kind == "image":
+        if kind == "image" or kind == "code" and path.suffix == ".png":
             bundle._image(content, path.suffix.casefold())
         else:
             bundle._text(content)

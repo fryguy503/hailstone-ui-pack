@@ -10,11 +10,25 @@ SARS, Sparxx, Takus, Vert, WoW
 
 The empty Velious source folder is excluded by request. See [skins.json](skins.json).
 
-## How the conversion works
+## Install
 
-The installer reads the player's source layouts once and compiles them to Lua
-presentation data. The client loads Lua only; it does not load XML interfaces.
-Actions and state use the standard `hs.UI` API.
+Install `fryguy503/hailstone-ui-pack` through Hailstone's **Add-ons** window.
+Then choose a skin from the normal **User Interface** list at login or in
+Options. All twenty interfaces are included in the addon download.
+
+No Python, source-layout compiler, local installer, `/lua` command or Autorun
+entry is required. Updates and reinstalling use the same Add-ons window.
+Existing accounts, other addons, saved window positions and sizes remain intact.
+Use the frame menu's **Reset size** or **Reset position** to restore authored defaults.
+
+Use the modular Lua UI client described in [client requirements](client/README.md).
+UI addons have full client interface access; install only code you trust.
+
+## How the interfaces work
+
+The package includes its Lua presentation tables, PNG artwork and shared rendering helpers.
+The client loads Lua directly; it does not parse the source game's XML or build
+layouts in the player's data folder. Actions and state use the standard `hs.UI` API.
 
 Source presenters use the compiled control geometry for inventory, player,
 target, group, chat, hotbars, item displays, buffs, spell gems and extended
@@ -43,45 +57,18 @@ available; compatible shared resources are identified separately from originals.
 See [validation](docs/validation.md) and
 [acceptance](docs/acceptance.md).
 
-## Install
+## Package contents
 
-Use the modular Lua UI client with `hs.UI.interfaces.LoadBase` and `LoadData`.
-See [client requirements](client/README.md); a version string alone is insufficient.
+The root manifest names the matching `ui-pack-<version>.zip`. It contains twenty
+interface descriptors, shared Lua code, shared PNG artwork and bounded Lua layout
+modules under each interface's `lib/layouts/` directory. Missing layout modules
+or referenced image files prevent a
+release from being built. Normal startup never reads a private `ui-data/`
+conversion, so an earlier local conversion cannot silently replace the installed layouts.
 
-Extract the supplied **private compiled setup bundle**, run `Install-UI-Pack.cmd`,
-and choose the Hailstone data folder containing `globalconfig.ini` and `addons`,
-outside the source game folder. It contains all twenty local conversions and
-preserves existing account configuration and other addons.
-
-Or compile from your own client files:
-
-```powershell
-python tools/install.py --client-dir "C:\HailstoneData" --install-dir "C:\Hailstone" --game-dir "C:\Games\Client"
-```
-
-Restart Hailstone and choose a skin in its normal Interface list. Options shows
-the selected and loaded interface and any load failure. UI addons have **full
-client interface access**; install only code you trust.
-
-The installer verifies ownership before replacing files and refuses modified or
-unowned conflicts. It never writes to the source game folder. Compiled data lives
-in `ui-data/<stable-interface-id>/`, separately from addon code, and survives
-addon-manager code updates. Refresh original code without recompiling:
-
-```powershell
-python tools/install.py --client-dir "C:\HailstoneData" --runtime-only
-```
-
-## Portable addon and local data
-
-The root manifest and `ui-pack-0.2.0-preview.2.zip` contain original Lua code and
-descriptors only. Installing them registers the entries; source compilation is
-still required before loading. Source layouts, compiled player data, artwork,
-accounts and settings are excluded from the public repository and archive.
-
-To create a private compiled setup bundle, add
-`--archive "C:\TestPackages\Hailstone-UI-Pack-Local.zip"` during installation.
-Do not redistribute source-derived layouts or artwork without permission.
+Raw XML, accounts, server settings, private plugins, caches and logs are not
+addon payloads. Legacy local conversion and preview tools remain available to
+maintainers; they are not an installation step for players.
 
 ## Build and verify
 
@@ -105,5 +92,5 @@ inferred from this command. See [Windows test packaging](docs/windows-preview-pa
 ## License
 
 Original addon code and tools are MIT licensed. Built-in helpers are imported
-at runtime and retain the client's license. Game artwork and source layouts
-retain their owners' rights and are not supplied by this repository.
+at runtime and retain the client's license. Visual resources retain their
+respective rights; the addon code license does not relicense those resources.

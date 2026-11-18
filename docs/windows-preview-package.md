@@ -28,9 +28,14 @@ folder. Existing seed settings, accounts, server profiles, other addons, scripts
 logs, caches, maps and debug files are excluded. The original game installation
 is read-only and is never bundled.
 
-The private archive carries player-derived layouts and must not be published as
-the portable addon. The public portable addon contains original code only.
-The client API source remains a separate repository and PR.
+This legacy developer preview carries local conversion provenance and must not
+be published as the portable addon. The normal addon already contains the
+portable Lua layout set; users install it through Add-ons without this tool.
+The client API source remains a separate repository.
+
+This private workflow retains its 64 MiB payload limit. A full historical
+conversion plus the current portable companion can exceed that limit. Use normal
+addon installation for the portable pack rather than expanding the limit.
 
 The archive includes a preview README and a manifest with file hashes and the
 exact client revision. The browser helper is disabled in this test build.

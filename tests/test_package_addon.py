@@ -47,15 +47,35 @@ class PackageTests(unittest.TestCase):
             self.assertIn("caps none\n", text)
             self.assertNotIn("signature", text)
             with zipfile.ZipFile(archive) as z:
-                self.assertEqual(len(z.namelist()), 1 + 20 * (2 + len(packager.RUNTIME)))
+                self.assertEqual(len(z.namelist()), len(packager.sources(ROOT)))
+                self.assertGreater(len(z.namelist()), 1 + 20 * (2 + len(packager.RUNTIME)))
                 self.assertNotIn("init.lua", z.namelist())
                 self.assertIn("ui/DuxaUI-stock/ui.ini", z.namelist())
                 self.assertIn("ui/default/lib/pregame.lua", z.namelist())
                 self.assertIn("ui/default/lib/pack_source_windows.lua", z.namelist())
                 self.assertEqual(len([n for n in z.namelist() if n.endswith("/ui.ini")]), 20)
                 self.assertEqual(len([n for n in z.namelist() if n.endswith("/lib/pack_profile.lua")]), 20)
-                self.assertTrue(all(n == "LICENSE" or n.endswith(("/ui.ini", ".lua")) for n in z.namelist()))
+                self.assertEqual(sum(n.endswith("/lib/layouts/index.lua") for n in z.namelist()), 20)
+                self.assertGreater(sum("/lib/layouts/buckets/" in n for n in z.namelist()), 0)
+                inventory = json.loads((ROOT / "assets/manifest.json").read_text(encoding="utf-8"))
+                expected_images = {"ui/default/assets/" + name for name in inventory["assets"]}
+                self.assertTrue(expected_images, "the portable release must include its UI artwork")
+                self.assertEqual({name for name in z.namelist() if name.endswith(".png")}, expected_images)
+                notices = {"ui/default/THIRD_PARTY_NOTICES.md",
+                           "ui/default/licenses/Nemesis-GPL-2.0.txt"}
+                self.assertTrue(all(n == "LICENSE" or n in notices or n.endswith(("/ui.ini", ".lua"))
+                                    or n.startswith("ui/default/assets/") and n.endswith(".png")
+                                    for n in z.namelist()))
                 self.assertFalse(any("/compiled/" in n or n.startswith("ui-data/") for n in z.namelist()))
+                self.assertLessEqual(len(z.namelist()), 4096)
+                self.assertLessEqual(sum(i.file_size for i in z.infolist()), 64 * 1024 * 1024)
+                self.assertTrue(all(i.file_size <= 4 * 1024 * 1024 for i in z.infolist()
+                                    if i.filename.endswith(".lua")))
+                for name in z.namelist():
+                    if name.endswith(".png"):
+                        self.assertTrue(z.read(name).startswith(b"\x89PNG\r\n\x1a\n"), name)
+                        self.assertEqual(hashlib.sha256(z.read(name)).hexdigest(),
+                                         inventory["assets"][Path(name).name]["sha256"], name)
                 self.assertIn(b"base=default\n", z.read("ui/DuxaUI-stock/ui.ini"))
                 self.assertIn(b"base=builtin:modern\n", z.read("ui/default/ui.ini"))
                 for name in z.namelist():

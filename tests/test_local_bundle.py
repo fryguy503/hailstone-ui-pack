@@ -97,6 +97,27 @@ class LocalBundleTests(unittest.TestCase):
                     self.assertIn("py -3", command)
                     self.assertIn('--bundle "%~dp0."', command)
 
+    def test_portable_companion_artwork_and_exact_notices_roundtrip(self):
+        image = "ui-addons/ui-pack/ui/default/assets/" + "a" * 64 + ".png"
+        notices = {"ui-addons/ui-pack/ui/default/THIRD_PARTY_NOTICES.md": b"Synthetic notice\n",
+                   "ui-addons/ui-pack/ui/default/licenses/Nemesis-GPL-2.0.txt": b"Synthetic license\n"}
+        plan = {**self.plan, image: self.plan[self.repair], **notices}
+        restored, _ = bundle.read_bundle(self.write(plan=plan))
+        self.assertEqual(restored, plan)
+        self.assertEqual(bundle._scope(image), "code", "portable art belongs to the verified companion")
+
+    def test_portable_resource_scope_rejects_other_paths_and_disguised_images(self):
+        base = "ui-addons/ui-pack/ui/"
+        for tail in ("default/assets/not-a-digest.png", "default/assets/" + "a" * 64 + ".jpg",
+                     "default/assets/nested/" + "a" * 64 + ".png",
+                     "DuxaUI-stock/assets/" + "a" * 64 + ".png",
+                     "default/OTHER_NOTICES.md", "default/licenses/other.txt"):
+            with self.subTest(tail=tail), self.assertRaisesRegex(ValueError, "outside"):
+                self.write(plan={**self.plan, base + tail: b"unapproved resource"})
+        image = base + "default/assets/" + "a" * 64 + ".png"
+        with self.assertRaisesRegex(ValueError, "supported image"):
+            self.write(plan={**self.plan, image: b"MZ disguised executable"})
+
     def test_profile_remapping_changes_only_repair_destinations(self):
         path = self.write()
         plan, report = bundle.read_bundle(path, "other-profile")

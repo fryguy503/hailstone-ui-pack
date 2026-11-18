@@ -38,7 +38,7 @@ def generated_files(root=ROOT):
     catalog = json.loads((root / "skins.json").read_text(encoding="utf-8"))
     for skin in catalog["skins"]:
         identity = {"schema": 1, "id": skin["id"], "label": skin["label"], "source": skin["source"],
-                    "index": "lib/compiled/index.lua"}
+                    "index": "lib/layouts/index.lua"}
         fields = ", ".join(f"{key}={json.dumps(value)}" for key, value in identity.items())
         result[f"ui/{skin['id']}/lib/pack_profile.lua"] = "return {" + fields + "}\n"
     return result

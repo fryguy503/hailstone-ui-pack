@@ -1,7 +1,7 @@
 -- The interface loader runs this entry; no ScriptHost startup or window interception.
 local context = dofile("lib/pack_context.lua")
 assert(next(context.instance.index.windows or {}),
-  "Source layouts are not compiled. Run the UI pack's local installer for this client.")
+  "The UI pack installation is incomplete. Reinstall ui-pack in Add-ons.")
 do
   local widgets = rawget(_G,"hailstone_skin_widgets")
   if type(widgets)~="table" then

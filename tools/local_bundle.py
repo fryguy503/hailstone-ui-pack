@@ -69,6 +69,11 @@ def _scope(name: str) -> str:
         tail = parts[2:]
         if tail == ["LICENSE"]:
             return "code"
+        if (tail in (["ui", "default", "THIRD_PARTY_NOTICES.md"],
+                     ["ui", "default", "licenses", "Nemesis-GPL-2.0.txt"])
+                or len(tail) == 4 and tail[:3] == ["ui", "default", "assets"]
+                and re.fullmatch(r"[0-9a-f]{64}\.png", tail[3])):
+            return "code"
         if (len(tail) >= 3 and tail[0] == "ui" and tail[1].casefold() in CATALOG
                 and "compiled" not in {part.casefold() for part in tail[2:]}):
             if tail[2:] == ["ui.ini"] or Path(tail[-1]).suffix.casefold() == ".lua":
@@ -138,7 +143,7 @@ def _plan(plan: dict[str, bytes]) -> None:
         raise ValueError("bundle exceeds payload byte limit")
     for name, data in plan.items():
         kind = _scope(name)
-        if kind == "image":
+        if kind == "image" or kind == "code" and Path(name).suffix == ".png":
             _image(data, Path(name).suffix.casefold())
         else:
             _text(data)

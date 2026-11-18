@@ -1,11 +1,42 @@
 # Lua conversion validation
 
-All twenty selected skins compile offline to Lua data consumed through
-`hs.UI.interfaces.LoadData`. No XML renderer is shipped or used.
+The normal addon ships all twenty Lua layout sets. Startup uses its installed
+`lib/layouts/` modules and approved Default inheritance, without a local compiler
+or private `ui-data/` setup. No XML renderer is shipped or used.
 
-## Revised source-layout preview
+## Clean addon installation
 
-The current revision adds source presenters for primary gameplay windows:
+Release checks build and extract the actual archive into an otherwise empty
+installation, then run every real `zz_pack.lua` entry and resolve its bundled
+window graphs. The test also places poisoned old local-conversion files in
+`ui-data/` and verifies that startup never reads them. Indexes and referenced
+buckets are mandatory package inputs. These tests establish startup/package
+completeness; their inactive UI/base stubs do not establish native rendering or
+live gameplay acceptance.
+
+The portable dataset contains 491 Lua modules and 3,281 effective window graphs
+across twenty skins, including Default inheritance. An independent comparison
+with the verified preceding conversion preserved the public presentation fields:
+geometry, anchors, control order, text, fonts, colors, semantic IDs, slots,
+artwork references and type defaults. Provenance and private diagnostics are
+excluded from the portable tables.
+
+Artwork packaging preserves decoded RGBA pixels, including alpha, in 457 shared
+PNG files totaling 15,129,355 bytes. Of 559 logical resource references, 547 resolve
+to bundled artwork; twelve absent originals retain the selected styling
+fallback. The [resource inventory](../assets/manifest.json) records those cases
+and six compatible shared-art aliases. These are package and data checks,
+not a new twenty-skin native visual pass.
+
+The final Windows suite ran 126 tests: 124 passed and two skipped because the
+host could not create test symlinks. This includes the actual extracted-addon
+clean/poisoned-data startup tests for all twenty skins, release determinism,
+required artwork/inventory checks and the client API contracts. The renderer
+fixture passed 90 cases and 2,690 assertions against the UI API 1.7 client.
+
+## Preceding source-layout preview validation
+
+The preceding source-layout revision added presenters for primary gameplay windows:
 inventory, player, target, group, chat, hotbars, item displays, buffs, spell gems
 and extended targets. Source frames now preserve independent corner and side-cap
 sizes. Readable caption metrics are separate from ornamental title-strip height.
@@ -119,7 +150,7 @@ bodies. Capture reports and hashes accompany local artifacts.
 ## Missing original artwork
 
 Delta's `DX_Target.png` was recovered from a matching downloaded variant and is
-hash-verified before installing a server-local overlay. AYA's `border.dds` and
+included in the portable PNG resources. AYA's `border.dds` and
 Duxa's `default_book01.tga` through `default_book04.tga` remain missing. They use
 coherent selected-skin fallback styling with explicit diagnostics. Unrelated
 same-name files are not counted as original art.
@@ -129,8 +160,14 @@ QQUI's missing `Buff_Background.tga` uses Duxa's compatible 64-by-128 sheet.
 Their referenced animation definitions and crop pixels were compared. These
 are shared-art fallbacks, not recovered same-skin originals. Existing originals
 always take precedence and mismatched fallback dimensions are rejected.
+QQ Custom's missing `classic_pieces01.tga` uses QQUI's sheet after matching all
+21 named animation/crop contracts. AYA and SARS use Default's drag-item sheet
+for the matching platinum frame; QQUI uses Default's sheet for both matching
+crystal frames. These recoveries are restricted to the verified source contracts.
 Graphite's missing `window_pieces21.tga` remains diagnosed: candidate atlases
 have different or transparent role-icon cells and are not substituted.
+The resource inventory also lists other absent legacy sheets rather than
+treating an unrelated same-name file as the original.
 
 ## Validation boundaries
 
@@ -142,6 +179,7 @@ actual rendered pixels, but do not prove live combat, server workflows or every
 gesture. Those remain in the [acceptance matrix](acceptance.md). The inventory
 character preview remains an explicit host-API gap.
 
-Git contains original Lua/tooling only. Private compiled setup bundles and
-screenshots are separate local artifacts. No player layouts, account records
-or client API patch are included.
+Git contains the Lua runtime, portable presentation tables and the resources
+required by the addon. Private development snapshots and screenshots remain
+separate local artifacts. No player layouts, account records or client API patch
+are included.

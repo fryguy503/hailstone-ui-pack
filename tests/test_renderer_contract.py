@@ -11,7 +11,7 @@ import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-CLIENT = Path(os.environ.get("HAILSTONE_CLIENT_ROOT", ROOT.parent / "hailstone-branches" / "modular-ui-api"))
+CLIENT = Path(os.environ.get("HAILSTONE_CLIENT_ROOT", ROOT.parent / "hailstone-client"))
 LUA = os.environ.get("HAILSTONE_LUA") or shutil.which("lua5.4") or shutil.which("lua54") or shutil.which("lua")
 
 

@@ -11,6 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("package_preview", ROOT / "tools" / "package_preview.py")
 preview = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preview)
+fixture_spec = importlib.util.spec_from_file_location("preview_portable_fixture", ROOT / "tests/portable_fixture.py")
+portable_fixture = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(portable_fixture)
 REVISION = "a" * 40
 
 
@@ -59,6 +62,23 @@ class PreviewPackageTests(unittest.TestCase):
         for name in preview.tool_module("package_addon").RUNTIME.values():
             write(self.addon / name, (ROOT / name).read_bytes())
         write(self.addon / "LICENSE", b"Companion MIT license")
+        portable_fixture.layouts(self.addon)
+        literals = preview.tool_module("portable_layouts")
+        art_name, logical = "a" * 64 + ".png", "uifiles/test.png"
+        art_path = "assets/" + art_name
+        index_path = self.addon / "layouts/default/index.lua"
+        index = literals.read_lua(index_path)
+        index["images"] = {"TestArt": {"path": logical, "interface_path": art_path}}
+        write(index_path, ("return " + literals.literal(index)).encode())
+        art = portable_fixture.rgba_png()
+        write(self.addon / art_path, art)
+        manifest = {"schema": 1, "kind": "portable-ui-raster-art", "unresolved": [],
+                    "assets": {art_name: {"width": 1, "height": 1, "bytes": len(art),
+                                           "sha256": hashlib.sha256(art).hexdigest()}},
+                    "resources": {logical: {"interface_path": art_path}}}
+        write(self.addon / "assets/manifest.json", json.dumps(manifest).encode())
+        write(self.addon / "THIRD_PARTY_NOTICES.md", b"Synthetic artwork notice.\n")
+        write(self.addon / "licenses/Nemesis-GPL-2.0.txt", b"Synthetic license fixture.\n")
         write(self.game / "uifiles/default/EQUI.xml", b"unshipped synthetic game layout")
         plan = {name: path.read_bytes() for name, path in preview.companion_files(self.addon).items()}
         for skin in catalog["skins"]:
@@ -107,9 +127,12 @@ class PreviewPackageTests(unittest.TestCase):
             self.assertEqual({name.split("/")[1] for name in names if name.startswith("ui/")}, {"modern", "gamepad"})
             self.assertTrue(set(preview.CRT_DLLS) <= names)
             self.assertIn("ui-addons/ui-pack/ui/default/ui.ini", names)
+            self.assertIn("ui-addons/ui-pack/ui/default/assets/" + "a" * 64 + ".png", names)
+            self.assertIn("ui-addons/ui-pack/ui/default/THIRD_PARTY_NOTICES.md", names)
+            self.assertIn("ui-addons/ui-pack/ui/default/licenses/Nemesis-GPL-2.0.txt", names)
             self.assertFalse(any(name.startswith("scripts/") for name in names))
             self.assertEqual(len([name for name in names if name.startswith("ui-addons/") and name.endswith("/ui.ini")]), 20)
-            expected_code = 1 + 20 * (2 + len(preview.tool_module("package_addon").RUNTIME))
+            expected_code = len(preview.companion_files(self.addon))
             self.assertEqual(len([name for name in names if name.startswith("ui-addons/ui-pack/")]), expected_code)
             self.assertEqual(len([name for name in names if name.startswith("ui-data/")]), 40)
             self.assertIn(self.repair, names)
