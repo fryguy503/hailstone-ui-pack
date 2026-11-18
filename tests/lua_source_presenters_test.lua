@@ -364,10 +364,205 @@ local inTabs={type="Screen",rect={w=100,h=100},children={}}
 for n=0,32 do inTabs.children[#inTabs.children+1]={type="InvSlot",name="InvSlot"..n,slot=n,rect={w=40,h=40},inactive=n==0}end
 fw,fh=P.Size("InventoryWindow",inTabs,context.instance,reach)
 eq(fh,100) -- allPages exposes the still-selectable inactive page, so no duplicate
+-- Use all twenty actual portable plans, with populated model contracts rather
+-- than empty startup windows. Text metrics here are deterministic fixtures;
+-- native ImGui/font/pixel acceptance is a separate CPU capture pass.
+local skins={"default","default_old","aya-stock","delta-stock","drakah-pers-adeptus-stock","DuxaUI-stock",
+  "Graphite-stock","ib-stock","lodidodi-stock","Lords-stock","Nemesis-stock","po2-stock","po2alt-stock",
+  "qqcustom-stock","qqui-stock","sars-stock","Sparxx-stock","Takus-stock","vert-stock","wow-stock"}
+local currentSkin,model,metricScale,fontFace="default",nil,1,"face-a"
+local fonts,currentFont={},3
+local originalMeasure,originalPop=ui.CalcTextSize,ui.PopFont
+ui.PushFont=function(font)fonts[#fonts+1]=currentFont;currentFont=font end
+ui.PopFont=function()currentFont=table.remove(fonts)or 3 end
+ui.CalcTextSize=function(value)
+  local longest,rows=0,0
+  for line in (tostring(value).."\n"):gmatch("(.-)\n")do
+    local characters=0;for _ in line:gmatch(".[\128-\191]*")do characters=characters+1 end
+    longest=math.max(longest,characters);rows=rows+1
+  end
+  local pixels=({10,12,14,16,19,22})[currentFont]or 14
+  local faceFactor=fontFace=="face-b"and value~="Wg"and 1.2 or 1
+  return longest*pixels*.55*metricScale*faceFactor,math.max(1,rows)*pixels*metricScale
+end
+local fixtureDofile=dofile
+dofile=function(path)
+  if path=="lib/pack_bindings.lua"then return B end
+  if path:sub(1,12)=="lib/layouts/"then
+    return originalDofile(root.."/layouts/"..currentSkin.."/"..path:sub(13))
+  end
+  return fixtureDofile(path)
+end
+hs.UI.interfaces={LoadBase=function(path)return originalDofile(root.."/layouts/default/"..path:sub(13))end}
+hs.UI.settings={Option=function(name)if name=="font_face"then return fontFace end end}
+local realR=originalDofile(root.."/shared/renderer.lua")
+hs.UI.windows.Text=function(_,name)
+  local value=model and model.text[name]
+  return value or"",value~=nil
+end
+hs.UI.windows.ChildShown=function(_,name)
+  if not model then return false end
+  if model.shown[name]~=nil then return model.shown[name]end
+  return name=="IconButton"or name=="ItemDescription"or name=="ItemDescriptionTabBox"
+    or name=="ItemDescriptionTab"or name=="ItemLoreTab"or name=="ItemLore"
+end
+hs.UI.windows.ChildRect=function(_,name)
+  local row,col=name:match("^IDW_Row(%d+)Col(%d+)Stat$")
+  if row then return 10+(tonumber(col)-1)*130,100+(tonumber(row)-1)*16,100,20 end
+  local heroic=tonumber(name:match("^IDW_Heroic(%d+)$"))
+  if heroic and model.heroic[heroic]then
+    local at=model.heroic[heroic];return 110+(at.col-1)*130,100+(at.row-1)*16,40,20
+  end
+end
+local function populated(dense)
+  local value={text={},shown={},heroic={}}
+  local function text(name,caption)value.text[name]=caption;value.shown[name]=true end
+  text("IDW_ItemInfo1",dense and"Ancient Mantle of the Celestial Dragon Protector of the Eternal Multiverse with an UnbreakableÜberlangenGegenstandsbezeichnung"
+    or"Belt of the Four Winds")
+  text("IDW_ItemInfo2","Magic, Lore, No Trade, Heirloom, Quest, Augmentation")
+  text("IDW_ItemInfo3","Class: WAR CLR PAL RNG SHD DRU MNK BRD ROG SHM NEC WIZ MAG ENC BST BER")
+  text("IDW_ItemInfo4","Race: HUM BAR ERU ELF HIE DEF DWF TRL OGR HFL GNM IKS VAH FRG DRK")
+  text("IDW_ItemInfo5","Slots: Charm Ear Head Face Neck Shoulder Arms Back Wrist Range Hands Primary Secondary Finger Chest Legs Feet Waist Power Source Ammo")
+  if dense then text("IDW_ItemInfo6","Deity: Rodcet Nife, The Tribunal, Brell Serilis, Tunare, Veeshan")end
+  for row=1,dense and 26 or 5 do for col=1,3 do
+    if dense or col<3 then
+      local prefix="IDW_Row"..row.."Col"..col
+      text(prefix.."Stat",dense and("Recommended effectiveness statistic "..row..":"..col)or({"Size:","Weight:","Strength:","Stamina:","Dexterity:"})[row])
+      text(prefix.."Value",dense and("-123456789."..row..col)or(row==1 and"MEDIUM"or"25"))
+      if dense and #value.heroic<13 then
+        local n=#value.heroic+1;value.heroic[n]={row=row,col=col};text("IDW_Heroic"..n,"+123")
+      end
+    end
+  end end
+  text("IDW_ModButtonLabel","Unmodified");value.shown.IDW_ModButton=true
+  text("ItemDescription","ilvl: 151<BR><c '#ffff00'>Long effect text.</c><BR>Additional details and comparison text.")
+  for n=1,7 do
+    local prefix=n==7 and"IDW_Appearance_Socket"or"IDW_Socket_Slot_"..n
+    local shown=dense or n==1
+    value.shown[prefix.."_Screen"]=shown
+    -- A hidden parent can retain a true child default in the native model.
+    value.shown[prefix.."_Item"]=true
+    if shown then
+      text(prefix.."_Description","Slot "..n..", type 7 (General: Group): <a WndNotify=\"0,0^0\">An extraordinarily long augment description with all of its original linked text retained</a>")
+    end
+  end
+  if dense then
+    value.shown.IDW_Appearance_Socket_Buy_Button=true
+    text("IDW_Appearance_Socket_Buy_Button","Jetzt diese Erscheinungsfassung freischalten")
+    text("Hailstone_EvolvingFinalResult","Vollständiges Entwicklungsergebnis dieses Gegenstands anzeigen")
+  end
+  return value
+end
+local function inspectItem(plan,instance,width,height,s)
+  local prepared,extent=P.ItemLayout("ItemDisplayWindow",plan,instance,realR,width,height,s)
+  eq(prepared.sourceItemLayout,true);eq(plan.sourceItemLayout,nil);eq(#fonts,0)
+  eq(P.OwnsScroll("ItemDisplayWindow",plan),true);eq(P.OwnsScroll("InventoryWindow",plan),false)
+  local seen,rects={},{}
+  realR.VisitChildren("ItemDisplayWindow",prepared,instance,{x=0,y=0,w=width*s,h=extent*s,s=s},function(node,at,visible)
+    local name=node.name or node.item
+    local semantic=node.sourceItemText~=nil or node.sourceItemCaption~=nil or name=="IconButton"or name=="IDW_ModButton"
+      or name=="ItemDescription"or name:match("^IDW_.*Socket.*_Item$")or name:match("^IDW_.*Socket.*_Description$")
+    if semantic then
+      eq(seen[name],nil);seen[name]=node
+      eq(math.abs(visible.w-at.w)<.00001,true);eq(math.abs(visible.h-at.h)<.00001,true)
+      eq(at.x>=-.00001 and at.y>=-.00001 and at.x+at.w<=width*s+.00001 and at.y+at.h<=extent*s+.00001,true)
+      if node.sourceItemText or node.sourceItemCaption then
+        local tw,th=realR.MeasureText(instance,node,node.sourceItemText or node.sourceItemCaption)
+        eq(tw<=at.w+.00001,true);eq(th<=at.h+.00001,true)
+      end
+      for _,other in ipairs(rects)do
+        local overlap=math.max(0,math.min(at.x+at.w,other.x+other.w)-math.max(at.x,other.x))
+          *math.max(0,math.min(at.y+at.h,other.y+other.h)-math.max(at.y,other.y))
+        eq(overlap<.00001,true)
+      end
+      rects[#rects+1]=at
+    end
+  end,{allPages=true})
+  for name,caption in pairs(model.text)do
+    if caption~=""and name~="IDW_Appearance_Socket_Buy_Button"then eq(seen[name]~=nil,true)end
+  end
+  eq(seen.IDW_Socket_Slot_1_Item~=nil,true)
+  eq(seen.IDW_Socket_Slot_2_Item~=nil,model.shown.IDW_Socket_Slot_2_Screen)
+  local originalInfo
+  local function original(node)
+    if node.name=="IDW_ItemInfo1"then originalInfo=node end
+    for _,child in ipairs(node.children or{})do original(child)end
+  end
+  original(plan);eq(seen.IDW_ItemInfo1.font,originalInfo.font)
+  local inherited=getmetatable(originalInfo.fields)
+  if inherited then eq(getmetatable(seen.IDW_ItemInfo1.fields),inherited)end
+  return prepared,extent,seen
+end
+local matrix=0
+local cachePlan,cacheInstance
+for _,skin in ipairs(skins)do
+  currentSkin=skin
+  local profile=originalDofile(root.."/ui/"..skin.."/lib/pack_profile.lua")
+  local instance=realR.New(profile);local source=realR.Resolve("ItemDisplayWindow",instance)
+  eq(source~=nil,true)
+  for _,dense in ipairs({false,true})do
+    model=populated(dense)
+    for _,width in ipairs({220,400,640})do for _,scale in ipairs({.75,1.5})do
+      metricScale=scale
+      local prepared,extent,seen=inspectItem(source,instance,width,240,scale)
+      eq(extent>240,true);matrix=matrix+1
+      if dense then
+        if width==220 then eq(seen.Hailstone_EvolvingFinalResult.sourceItemCaption:find("\n",1,true)~=nil,true)end
+        eq(seen.IDW_Appearance_Socket_Buy_Button~=nil,true)
+      end
+    end end
+  end
+  if skin=="default"then cachePlan,cacheInstance=source,instance end
+end
+eq(matrix,240)
+currentSkin="default";model=populated(true);metricScale=1
+local authored=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)
+local resized=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,500,350,1)
+local scrollbar=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,486,350,1)
+eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1),authored)
+eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,500,350,1),resized)
+eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,486,350,1),scrollbar)
+for n=1,5 do P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,500+n,350,1)end
+eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)~=authored,true)
+local other=P.ItemLayout("ItemDisplayWindow#2",cachePlan,cacheInstance,realR,400,200,1)
+eq(other~=authored,true)
+local oldText=other.children[1].children[1].children[#other.children[1].children[1].children].name
+eq(oldText,"ItemDescription")
+model.text.IDW_ItemInfo1="A different inspected item"
+local changed=P.ItemLayout("ItemDisplayWindow#2",cachePlan,cacheInstance,realR,400,200,1)
+eq(changed~=other,true)
+fontFace="face-b"
+eq(P.ItemLayout("ItemDisplayWindow#2",cachePlan,cacheInstance,realR,400,200,1)~=changed,true)
+fontFace="face-a"
+local recent=P.ItemLayout("ItemDisplayWindow#200",cachePlan,cacheInstance,realR,400,200,1)
+for n=201,212 do P.ItemLayout("ItemDisplayWindow#"..n,cachePlan,cacheInstance,realR,400,200,1)end
+eq(P.ItemLayout("ItemDisplayWindow#200",cachePlan,cacheInstance,realR,400,200,1)~=recent,true)
+local beforeSelect=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)
+state=1;frame=frame+1;P.Frame();state=3;frame=frame+1;P.Frame()
+eq(P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)~=beforeSelect,true)
+local paint,buttons=0,0
+local captionNode={type="Button",name="Hailstone_EvolvingFinalResult",sourceItemCaption="Wrapped\ncaption"}
+eq(P.DrawControl("ItemDisplayWindow",captionNode,{x=0,y=0,w=100,h=40,s=1},cacheInstance,
+  {DrawButton=function(_,node,_,_,caption)eq(node,captionNode);eq(caption,"Wrapped\ncaption");buttons=buttons+1 end}),true)
+eq(buttons,1)
+local labelNode={type="Label",name="IDW_ItemInfo1",sourceItemText="Wrapped\nname"}
+eq(P.DrawControl("ItemDisplayWindow",labelNode,{x=0,y=0,w=100,h=40,s=1},cacheInstance,
+  {PaintText=function(_,node,_,_,caption)eq(node,labelNode);eq(caption,"Wrapped\nname");paint=paint+1 end}),true)
+eq(paint,1)
+local drawnItem,childBefore=0,count("endchild")
+local probeR={};for name,fn in pairs(realR)do probeR[name]=fn end
+probeR.Draw=function(_,prepared)eq(prepared.sourceItemLayout,true);drawnItem=drawnItem+1;return true end
+P.Draw("ItemDisplayWindow",cachePlan,cacheInstance,{x=0,y=0,w=220,h=180,s=1},probeR)
+eq(drawnItem,1);eq(count("endchild"),childBefore+1)
+probeR.Draw=function()error("populated item draw failure")end
+eq(pcall(P.Draw,"ItemDisplayWindow",cachePlan,cacheInstance,{x=0,y=0,w=220,h=180,s=1},probeR),false)
+eq(count("endchild"),childBefore+2)
+eq(#fonts,0)
+dofile=fixtureDofile;ui.CalcTextSize=originalMeasure;ui.PopFont=originalPop
 local private={instance={},renderer=R}
 modules["lib/pack_context.lua"]=private
 local privateP=originalDofile(root.."/shared/source_presenters.lua")
 eq(privateP~=P,true);eq(privateP.context,private)
 eq(originalDofile(root.."/shared/source_presenters.lua"),privateP)
 dofile=originalDofile
-print("Source presenters: "..checks.." assertions passed")
+print("Source presenters: "..checks.." assertions passed; "..matrix.." populated item layouts across 20 skins")

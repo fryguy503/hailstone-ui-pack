@@ -6,6 +6,7 @@ if cached and cached.context==context then return cached end
 local API=hs.UI
 local M={context=context}
 rawset(_G,"hailstone_skin_model_presenters",M)
+local activeDraws={}
 local contracts={}
 local function words(text)
   local out={};for name in (text or ""):gmatch("%S+") do out[name]=true end;return out
@@ -113,6 +114,23 @@ local function family(screen)
   if screen:match("^Bag%d+$") or screen=="WorldContainer" then return "ContainerWindow" end
   if screen=="SpellDisplayWindow" or screen:match("^SpellDisplayWindow#%d+$") then return "SpellDisplayWindow" end
 end
+local function containerIdentity(screen)
+  local name,count,combine,where,slot=call("inventory","BagInfo",screen)
+  if not name or type(count)~="number" or count<1 then return nil end
+  return {name=name,count=count,combine=combine,where=where,slot=slot}
+end
+local function sameContainer(a,b)
+  return a and b and a.name==b.name and a.count==b.count and a.combine==b.combine
+    and a.where==b.where and a.slot==b.slot
+end
+local function stillCurrent(screen,scope)
+  if scope.retired then return false end
+  if scope.shown==true and call("windows","Shown",screen)==false
+    or scope.container and not sameContainer(scope.container,containerIdentity(screen)) then
+    scope.retired=true
+  end
+  return not scope.retired
+end
 model("ContainerWindow","StandardDoneButton CombineDoneButton Container_Combine")
 model("SpellDisplayWindow")
 -- These source pages change presentation only; their native models do not
@@ -204,6 +222,19 @@ function M.Input(screen,node)
   end
 end
 function M.Click(screen,node,phase)
+  local scope=activeDraws[screen]
+  if scope and not stillCurrent(screen,scope) then return false end
+  if family(screen)=="ContainerWindow" and phase=="left" then
+    local name=id(node)
+    if name=="StandardDoneButton" or name=="CombineDoneButton" or name=="Container_Combine" then
+      local result=call("windows","ClickChild",screen,name,phase)
+      -- Bag indices compact immediately on close. The same screen may already
+      -- refer to another open bag, so visibility alone cannot retire this draw.
+      if scope and result and name~="Container_Combine" then scope.retired=true end
+      if scope then stillCurrent(screen,scope) end
+      return result
+    end
+  end
   if screen=="TradeskillWnd" and id(node)=="SearchTextEdit" and phase=="left" then
     return call("windows","ClickChild",screen,"SearchButton","left")
   end
@@ -302,9 +333,11 @@ local function prepare(screen,plan,instance)
     end
     return s.plan
   end
-  local _,count,combine=call("inventory","BagInfo",screen)
+  local identity=containerIdentity(screen)
+  local count,combine=identity and identity.count,identity and identity.combine
   count=math.max(0,math.min(256,tonumber(count) or 0))
   local s=state(instance,screen)
+  s.container=identity
   local key=tostring(count)..":"..tostring(combine)
   if s.source==plan and s.key==key then return s.plan end
   s.source,s.key,s.count,s.combine=plan,key,count,combine
@@ -328,6 +361,7 @@ local function prepare(screen,plan,instance)
   return s.plan
 end
 function M.Shown(screen,node)
+  if activeDraws[screen] and activeDraws[screen].retired then return false end
   -- The guild model uses this source combo only as the template for per-row
   -- rank controls (GT_Member_List:<row>); it is not another actionable combo.
   if screen=="GuildManagementWnd" and id(node)=="GT_Ranks_Combobox" then return false end
@@ -343,16 +377,24 @@ function M.Shown(screen,node)
 end
 function M.Item(screen,node)
   if family(screen)~="ContainerWindow" then return false end
+  if activeDraws[screen] and activeDraws[screen].retired then return true,nil end
   local n=suffix(id(node),"Container_Slot:",256)
   if n then return true,call("inventory","BagSlotItem",screen,n) end
   return false
 end
 function M.ItemClick(screen,node,phase,outside)
   if family(screen)~="ContainerWindow" then return end
+  local scope=activeDraws[screen]
+  if scope and not stillCurrent(screen,scope) then return false end
   local n=suffix(id(node),"Container_Slot:",256)
-  if n then return call("inventory","BagSlotClick",screen,n,phase,outside==true) end
+  if n then
+    local result=call("inventory","BagSlotClick",screen,n,phase,outside==true)
+    if scope then stillCurrent(screen,scope) end
+    return result
+  end
 end
 function M.AfterControl(screen,node,box,instance)
+  if activeDraws[screen] and activeDraws[screen].retired then return end
   if node.type~="InvSlot" or not ui.IsItemHovered() then return end
   local own,item=M.Item(screen,node)
   if not own then item=call("inventory","SlotItem",screen,id(node)) end
@@ -396,10 +438,24 @@ function M.DrawControl(screen,node,box)
   return true
 end
 function M.Draw(screen,plan,instance,box,R)
+  local scope={shown=call("windows","Shown",screen)}
+  if family(screen)=="ContainerWindow" then
+    scope.container=containerIdentity(screen)
+    local previous=instance.modelPresenters and instance.modelPresenters[screen]
+    if not scope.container or previous and previous.source==plan and not sameContainer(previous.container,scope.container) then
+      return true,nil,true
+    end
+  end
+  if not stillCurrent(screen,scope) then return true,nil,true end
   local prepared=prepare(screen,plan,instance)
   local extra=extensionHeight(screen)*(box.s or 1)
   local area={x=box.x,y=box.y,w=box.w,h=math.max(1,box.h-extra),s=box.s}
-  local ok,why=R.Draw(screen,prepared,instance,area,M)
+  local previous=activeDraws[screen]
+  activeDraws[screen]=scope
+  local success,ok,why=pcall(R.Draw,screen,prepared,instance,area,M)
+  activeDraws[screen]=previous
+  if not success then error(ok,0) end
+  if not stillCurrent(screen,scope) then return true,nil,true end
   if not ok then return false,why end
   if extra>0 then
     local extensions=lib("extensions")

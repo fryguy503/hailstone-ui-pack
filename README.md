@@ -37,6 +37,14 @@ independent corners and edge artwork; captions reserve readable space for the
 selected font. Source controls call the host's item, chat, spell and window
 services rather than imitating game state.
 
+Item displays arrange the source's runtime-positioned templates after reading
+the item: headers wrap beside the icon, stat labels and values occupy separate
+columns, and augment rows follow the stats. Fonts, colors, tabs and icon sizes
+come from the selected skin. Narrow or scaled windows scroll the complete body.
+Currency decals use their authored size and offset inside the full clickable
+button. Closing a bag retires its current draw before its model can be removed
+or reassigned.
+
 Additional client features remain reachable through **Client tools...** in a
 source window's context menu. Windows without a compatible source presenter keep
 their working built-in body with selected frames, fonts and control artwork.

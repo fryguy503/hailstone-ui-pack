@@ -83,7 +83,7 @@ apiModule("hotbars",{Button=function()return "spell","Hot"end,Click=function(...
  Info=function()return S.hotInfo or {tex={},enabled=true}end})
 hs={UI=api}
 ui={Col={Text=1,TextDisabled=2,FrameBg=3,Button=4,ButtonHovered=5,ButtonActive=6,Header=7,HeaderHovered=8,HeaderActive=9,Border=10},
-  StyleVar={FrameRounding=1,WindowRounding=2,ChildRounding=3,PopupRounding=4,TabRounding=5,GrabRounding=6,ScrollbarRounding=7},Mouse={Left=0,Right=1},HoveredFlags={AllowWhenDisabled=1},
+  StyleVar={FrameRounding=1,WindowRounding=2,ChildRounding=3,PopupRounding=4,TabRounding=5,GrabRounding=6,ScrollbarRounding=7,WindowPadding=8},Mouse={Left=0,Right=1},HoveredFlags={AllowWhenDisabled=1},
   Cond={Always=1,FirstUseEver=2},InputTextFlags={ReadOnly=1,Password=2,EnterReturnsTrue=4},
   SelectableFlags={SpanAllColumns=1,AllowDoubleClick=2},TableFlags={ScrollY=1,RowBg=2,Resizable=4},TableColumnFlags={WidthFixed=1}}
 ui.window=function() error("The renderer must not register/intercept UI windows") end
@@ -94,14 +94,15 @@ ui.CalcTextSize=function(value)check(type(value)=="string","text must be a strin
 ui.PushFont=function()S.fonts=S.fonts+1 end;ui.PopFont=function()S.fonts=S.fonts-1;check(S.fonts>=0)end
 ui.PushClipRect=function(...)S.clips=S.clips+1;record("clip",...)end;ui.PopClipRect=function()S.clips=S.clips-1;check(S.clips>=0)end
 ui.PushStyleColor=function()S.colors=S.colors+1 end;ui.PopStyleColor=function(n)S.colors=S.colors-n;check(S.colors>=0)end
-ui.PushStyleVar=function()S.vars=S.vars+1 end;ui.PopStyleVar=function(n)S.vars=S.vars-n;check(S.vars>=0)end
+ui.PushStyleVar=function(key,x,y)S.vars=S.vars+1;if key==ui.StyleVar.WindowPadding then S.zeroChildPadding=x==0 and y==0 end end
+ui.PopStyleVar=function(n)S.vars=S.vars-n;check(S.vars>=0)end
 ui.BeginDisabled=function(value)S.disabled[#S.disabled+1]=value end;ui.EndDisabled=function()check(#S.disabled>0);table.remove(S.disabled)end
 ui.DrawImage=function(...)S.draws[#S.draws+1]=table.pack(...)end
 ui.DrawRect=function(...)record("border",...)end;ui.DrawRectFilled=function(...)record("fill",...)end
 ui.DrawText=function(...)local a=table.pack(...);S.texts[#S.texts+1]=a end
 ui.SetCursorScreenPos=function(x,y)S.x,S.y=x,y end;ui.GetCursorScreenPos=function()return S.x,S.y end
 ui.GetWindowPos=function()return 0,0 end;ui.GetWindowSize=function()return 200,100 end
-ui.GetContentRegionAvail=function()return 200,100 end
+ui.GetContentRegionAvail=function()if S.children>0 and S.childAvail then return table.unpack(S.childAvail)end;return 200,100 end
 ui.SetNextWindowPos=function(...)record("windowpos",...)end;ui.SetNextWindowSize=function(...)record("windowsize",...)end
 ui.Begin=function()S.windows=S.windows+1;return true,true end;ui.End=function()S.windows=S.windows-1;check(S.windows>=0)end
 ui.InvisibleButton=function(id,w,h)S.last=id;record("hit",id,S.x,S.y,w,h);return not disabled() and S.click[id] or false end
@@ -132,11 +133,11 @@ ui.TableHeadersRow=function()S.headers=S.headers+1 end;ui.TableHeadersRowClicked
 ui.TableGetHoveredColumn=function()return 1 end
 ui.GetScrollY=function()return S.scroll end;ui.SetScrollY=function(y)S.scroll=y;record("scroll",y)end
 ui.Dummy=function(...)record("dummy",...)end;ui.Image=function(...)record("inlineimage",...)end;ui.SameLine=function()end;ui.TextColored=function(...)record("cell",...)end
-ui.BeginChild=function()S.children=S.children+1;return true end;ui.EndChild=function()S.children=S.children-1;check(S.children>=0)end
+ui.BeginChild=function()S.children=S.children+1;S.beginChildZeroPadding=S.zeroChildPadding;return true end;ui.EndChild=function()S.children=S.children-1;check(S.children>=0)end
 setmetatable(ui,{__index=function(_,key)error("Unregistered UI function "..key)end})
 
-local stml={Lines=function(raw)return {{raw}}end,DrawLines=function(view,_,_,key,callback)
-  check(type(key)=="number");S.stmlView=view
+local stml={Lines=function(raw)return {{raw}}end,DrawLines=function(view,width,height,key,callback)
+  check(type(key)=="number");S.stmlView=view;S.stmlArgs={width,height,key}
   if S.stmlError then error("synthetic STML draw failure")end
   if S.stmlLink then callback({27,"item:123"})end
 end}
@@ -568,6 +569,96 @@ run("button base and decal layers remain independent with model overrides",funct
   S.draws={};S.art["Setting:decal"]=nil;S.art["Setting:background"]=table.pack("G")
   R.Draw("Test",plan(n),I,box);equal(#S.draws,2);equal(S.draws[1][6],48/64);equal(S.draws[2][6],32/64)
 end)
+run("nonsquare button decals retain source offset size scale and state",function()
+  local I,index=artFixture()
+  index.templates.Coin={fields={Normal="A",Pressed="B",Disabled="C",Flyby="D",NormalDecal="E",PressedDecal="F",DisabledDecal="G"}}
+  local n=node("Button","Money",5,6,70,24,{DecalOffset={X=1,Y=3},DecalSize={CX=18,CY=18}})
+  n.art.drawTemplate="Coin"
+  for _,case in ipairs({{base=0,decal=32},{checked=true,base=8,decal=40},{enabled=false,base=16,decal=48},{hover=true,base=24,decal=32}})do
+    S.draws={};S.events={};S.hover=case.hover==true;S.states.Money={enabled=case.enabled,checked=case.checked}
+    R.Draw("Test",plan(n),I,{x=10,y=20,w=400,h=200,s=2})
+    equal(#S.draws,2);local base,decal=S.draws[1],S.draws[2]
+    equal(base[2],20);equal(base[3],32);equal(base[4]-base[2],140);equal(base[5]-base[3],48)
+    equal(decal[2],22);equal(decal[3],38);equal(decal[4]-decal[2],36);equal(decal[5]-decal[3],36)
+    equal(base[6],case.base/64);equal(decal[6],case.decal/64)
+    local target;for _,e in ipairs(S.events)do if e.kind=="hit"then target=e.args end end
+    equal(target[4],140);equal(target[5],48,"decal bounds must not shrink the input target")
+  end
+end)
+run("live button atlas cells use decal bounds and retain model hide semantics",function()
+  local I,index=artFixture();index.templates.Coin={fields={Normal="A",NormalDecal="E"}}
+  local n=node("Button","Money",5,6,70,24,{DecalOffset={X=1,Y=3},DecalSize={CX=18,CY=18}})
+  n.art.drawTemplate="Coin";local texture={};S.hover=false
+  S.art["Money:decal"]=table.pack(texture,0.2,0.3,0.4,0.5)
+  R.Draw("Test",plan(n),I,box);equal(#S.draws,2)
+  local decal=S.draws[2];equal(decal[1],texture);equal(decal[2],16);equal(decal[3],29)
+  equal(decal[4],34);equal(decal[5],47);equal(decal[6],0.2);equal(decal[9],0.5)
+  S.draws={};S.art["Money:decal"]=table.pack(false);R.Draw("Test",plan(n),I,box)
+  equal(#S.draws,1,"explicitly hidden live decal must not resurrect the source default")
+  S.draws={};S.art["Money:decal"]=table.pack("F");R.Draw("Test",plan(n),I,box)
+  equal(S.draws[2][2],16);equal(S.draws[2][4],34);equal(S.draws[2][6],40/64)
+  n.fields.DecalSize={CX=0,CY=0};S.draws={};R.Draw("Test",plan(n),I,box)
+  equal(#S.draws,1,"explicit zero-sized prototype decals remain hidden")
+end)
+run("live item icons replace grid prototype backdrops and preserve state layers",function()
+  local I,index=artFixture()
+  index.animations.RedIconBackground=index.animations.A;index.animations.A_InvSlot=index.animations.B
+  index.animations.BuffIcons={grid=true,frames={}}
+  index.templates.Item={fields={Normal="RedIconBackground",NormalDecal="BuffIcons",Flyby="C",Pressed="D"}}
+  local n=node("Button","IconButton",0,0,44,44,{DecalOffset={X=2,Y=2},DecalSize={CX=40,CY=40}})
+  n.art.drawTemplate="Item";local texture={};S.art["IconButton:decal"]=table.pack(texture,0.1,0.2,0.3,0.4);S.hover=false
+  R.Draw("Test",plan(n),I,box);equal(#S.draws,2);equal(S.draws[1][6],8/64,"selected neutral item well replaces prototype red")
+  equal(S.draws[2][1],texture);equal(S.draws[2][2],12);equal(S.draws[2][3],22);equal(S.draws[2][4],52);equal(S.draws[2][5],62)
+  S.draws={};S.hover=true;R.Draw("Test",plan(n),I,box);equal(S.draws[1][6],16/64,"authored hover overlay stays independent")
+  S.draws={};S.hover=false;S.states.IconButton={checked=true};R.Draw("Test",plan(n),I,box)
+  equal(S.draws[1][6],24/64,"authored checked overlay stays independent")
+  S.draws={};S.states={};S.art["IconButton:background"]=table.pack("RedIconBackground");R.Draw("Test",plan(n),I,box)
+  equal(#S.draws,2);equal(S.draws[1][6],0,"explicit host red background is real state, not a placeholder")
+  S.draws={};S.art["IconButton:background"]=nil;S.art["IconButton:decal"]=nil;R.Draw("Test",plan(n),I,box)
+  equal(S.draws[1][6],0,"source artwork remains authoritative without a live replacement")
+end)
+run("button captions retain source alignment and offsets separately from decals",function()
+  local I=artFixture();S.text.Money={"123",true};S.hover=false
+  local n=node("Button","Money",0,0,70,24,{TextAlignCenter=true,TextAlignVCenter=true,TextOffsetX=2,TextOffsetY=-1})
+  R.Draw("Test",plan(n),I,box);equal(S.texts[1][1],10+(70-21)/2+2);equal(S.texts[1][2],24)
+  S.texts={};n.fields.TextAlignRight=true;R.Draw("Test",plan(n),I,box)
+  equal(S.texts[1][1],61,"right alignment overrides the schema's centered default")
+end)
+run("prepared wrapped button captions reuse the exact input and action path once",function()
+  local I,index=artFixture();index.templates.Buy={fields={Normal="A",Pressed="B"}}
+  local id="IDW_Appearance_Socket_Buy_Button"
+  local n=node("Button",id,0,0,100,40);n.art.drawTemplate="Buy";n.sourceItemCaption="Buy\nAppearance Slot"
+  S.text[id]={"Unwrapped live caption",true};S.click["##pack:"..id]=true;S.hover=false
+  local original=R.Bindings.DrawControl
+  R.Bindings.DrawControl=function(screen,child,at,instance,renderer)
+    if child.sourceItemCaption~=nil then renderer.DrawButton(screen,child,at,instance,child.sourceItemCaption);return true end
+    return original(screen,child,at,instance,renderer)
+  end
+  R.Draw("ItemDisplayWindow#3",plan(n),I,box)
+  R.Bindings.DrawControl=original
+  equal(#S.texts,1);equal(S.texts[1][7],n.sourceItemCaption,"explicit line breaks must reach native text painting")
+  local clicked=actions("windows","ClickChild");equal(#clicked,1);equal(clicked[1][3],"ItemDisplayWindow#3");equal(clicked[1][4],id);equal(clicked[1][5],"left")
+  local hits=0;for _,event in ipairs(S.events)do if event.kind=="hit"then hits=hits+1 end end
+  equal(hits,1,"the presenter wrapper must not recursively register another button")
+  equal(S.draws[1][6],0,"the prepared caption retains source button artwork")
+  S.texts={};S.click={};R.DrawButton("ItemDisplayWindow#3",n,box,I,"");equal(#S.texts,0,"empty override hides the host caption")
+  R.DrawButton("ItemDisplayWindow#3",n,box,I);equal(S.texts[1][7],"Unwrapped live caption","nil keeps the normal live caption")
+end)
+run("dynamic presenters measure and paint the selected source font without input changes",function()
+  local I=artFixture();local n=node("Label","Detail",0,0,80,20,{AlignRight=true});n.font=5;n.colors.TextColor={0.2,0.3,0.4,1}
+  local original=ui.PushFont;local selected
+  ui.PushFont=function(value)selected=value;original(value)end
+  local w,h=R.MeasureText(I,n,"Detail");equal(w,42);equal(h,14);equal(selected,5)
+  S.mx=15;S.my=25;R.PaintText("Test",n,{x=10,y=20,w=80,h=20,s=1},I,"Value")
+  equal(selected,5);equal(S.texts[1][1],55);equal(S.texts[1][3],0.2);equal(S.texts[1][7],"Value")
+  for _,e in ipairs(S.events)do check(e.kind~="hit","paint-only text must not steal input")end
+  S.texts={};S.states.Detail={enabled=false};R.PaintText("Test",n,box,I,"Disabled")
+  equal(S.texts[1][3],I.palette.disabled[1])
+  ui.PushFont=original
+  local previous=ui.CalcTextSize;ui.CalcTextSize=function()error("synthetic measurement failure")end
+  check(not pcall(R.MeasureText,I,n,"Failure"));equal(S.fonts,0,"measurement errors must restore the font stack")
+  ui.CalcTextSize=previous
+end)
 run("dialog frame-only chrome cannot paint a background middle or titlebar",function()
   local I,index=artFixture()
   index.templates.Border={fields={TopLeft="A",Top="A",TopRight="A",Left="A",Middle="C",Right="A",BottomLeft="A",Bottom="A",BottomRight="A"}}
@@ -758,6 +849,27 @@ run("STML draw failures restore child font and clipping before propagating",func
   local I=fixture();S.stmlError=true
   local ok,why=pcall(R.Draw,"Test",plan(node("STMLbox","Description")),I,box)
   equal(ok,false);check(why:find("synthetic STML draw failure",1,true));equal(S.children,0);equal(S.fonts,0);equal(S.clips,0)
+end)
+run("narrow STML source rows remove implicit padding and wrap to the real child viewport",function()
+  local I=fixture();local p=plan(node("STMLbox","SocketDescription",0,0,90,18))
+  S.childAvail={74,18};S.text.SocketDescription={"General: empty",true}
+  R.Draw("Test",p,I,box)
+  check(S.beginChildZeroPadding,"a source text row must not lose16 pixels to inherited child padding")
+  equal(S.stmlArgs[1],74,"wrapping uses content width after actual scrollbars, not the90-pixel source box")
+  equal(S.stmlArgs[2],18,"the full source row remains available for a native14-pixel font")
+  check(S.stmlArgs[2]>=select(2,ui.CalcTextSize("Wg il")),"one native text line must fit without tiny scrollbars")
+  local key=S.stmlArgs[3];S.scroll=37;S.childAvail={58,18};R.Draw("Test",p,I,box)
+  equal(S.scroll,37,"resizing preserves the reader's scroll position");check(S.stmlArgs[3]~=key,"width changes invalidate cached line heights")
+  key=S.stmlArgs[3];R.Draw("Test",p,I,box);equal(S.stmlArgs[3],key,"stable viewport and font reuse wrapped heights")
+  local previous=ui.CalcTextSize;ui.CalcTextSize=function(value)return #value*8,16 end
+  R.Draw("Test",p,I,box);check(S.stmlArgs[3]~=key,"actual font metrics invalidate wrapped heights")
+  ui.CalcTextSize=previous
+end)
+run("STML retains a bounded viewport when WindowPadding is unavailable",function()
+  local padding=ui.StyleVar.WindowPadding;ui.StyleVar.WindowPadding=nil
+  local I=fixture();S.childAvail={46,14};R.Draw("Test",plan(node("STMLbox","Description",0,0,80,30)),I,box)
+  equal(S.stmlArgs[1],46);equal(S.stmlArgs[2],14)
+  ui.StyleVar.WindowPadding=padding
 end)
 run("named vertical strategy retains anchor-sized zero-Size gem containers",function()
   local I=fixture({version=2,windows={},images={},animations={},templates={Vertical={type="LayoutVertical",fields={Padding=2,ResizeHorizontal=true,ResizeVertical=true}}}})

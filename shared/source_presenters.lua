@@ -7,6 +7,7 @@ local API=hs.UI
 local P={context=context}
 rawset(_G,"hailstone_skin_presenters",P)
 local chats,toolsOpen,hotbars={},{},{}
+local itemLayouts,itemLayoutScreens,itemSources={},{},setmetatable({},{__mode="k"})
 local listed,lastFrame,lastName,lastAtSelect={},-1,nil,false
 local libraries={}
 local measured=setmetatable({},{__mode="k"})
@@ -40,7 +41,7 @@ function P.Frame()
   local state=call("session","GameState")
   local selecting=state==1 or state==2
   local name=call("character","Name");if name=="" then name=nil end
-  if selecting and not lastAtSelect or name and lastName and name~=lastName then chats={} end
+  if selecting and not lastAtSelect or name and lastName and name~=lastName then chats={};itemLayouts={};itemLayoutScreens={} end
   lastAtSelect=selecting
   if selecting then lastName=nil elseif name then lastName=name end
   listed={}
@@ -70,7 +71,7 @@ local function nativeAction(screen,node)
   if key=="PlayerWindow" then return playerActions[name]==true end
   if key=="HotButtonWnd" then return hotActions[name] or name:match("^HB_Button%d+$")~=nil end
   if key=="ItemDisplayWindow" then
-    return name=="IconButton" or name=="IDW_ModButton" or name=="Hailstone_EvolvingFinalResult"
+    return name=="IconButton" or name=="IDW_ModButton" or name=="Hailstone_EvolvingFinalResult" or name=="IDW_Appearance_Socket_Buy_Button"
       or name:match("^IDW_Socket_Slot_[1-6]_Item$")~=nil or name=="IDW_Appearance_Socket_Item"
   end
   return false
@@ -228,7 +229,305 @@ local function transferHeight(screen)
 end
 local function copy(value)
   if type(value)~="table" then return value end
-  local out={};for k,v in pairs(value) do out[k]=copy(v) end;return out
+  local out={};for k,v in pairs(value) do out[k]=copy(v) end
+  local meta=getmetatable(value);if type(meta)=="table"then setmetatable(out,meta)end
+  return out
+end
+local function itemSource(plan)
+  if type(plan)~="table"then return end
+  local saved=itemSources[plan];if saved then return saved end
+  local nodes,descriptionPage,tab={}
+  local function index(node,page,owner)
+    if node.type=="Page"then page=node end
+    if node.type=="TabBox"then owner=node end
+    nodes[id(node)]=node
+    if id(node)=="ItemDescription"then descriptionPage,tab=page,owner end
+    for _,child in ipairs(node.children or{})do index(child,page,owner)end
+  end
+  index(plan)
+  if not nodes.IconButton or not nodes.IDW_ItemInfo1 or not nodes.ItemDescription or not descriptionPage then return end
+  saved={nodes=nodes,page=descriptionPage,tab=tab};itemSources[plan]=saved;return saved
+end
+local function itemPlain(value)
+  return tostring(value or""):gsub("\r",""):gsub("<[Bb][Rr]%s*/?>","\n"):gsub("</?[Pp]>","\n"):gsub("<[^>]*>","")
+    :gsub("&nbsp;"," "):gsub("&lt;","<"):gsub("&gt;",">"):gsub("&quot;",'"'):gsub("&apos;","'"):gsub("&amp;","&")
+end
+local function itemMeasure(R,instance,node,value,s)
+  local w,h
+  if R and R.MeasureText then w,h=R.MeasureText(instance,node,value)
+  else w,h=ui.CalcTextSize(value)end
+  return math.max(0,tonumber(w)or 0)/s,math.max(1,tonumber(h)or 12)/s
+end
+local function itemWrap(R,instance,node,value,width,s)
+  value=tostring(value or"");width=math.max(1,width)
+  local lines={}
+  local function append(word,line)
+    local candidate=line==""and word or line.." "..word
+    if itemMeasure(R,instance,node,candidate,s)<=width then return candidate end
+    if line~=""then lines[#lines+1]=line end
+    local part=""
+    for character in word:gmatch(".[\128-\191]*")do
+      if part~=""and itemMeasure(R,instance,node,part..character,s)>width then lines[#lines+1]=part;part=""end
+      part=part..character
+    end
+    return part
+  end
+  for paragraph in (value.."\n"):gmatch("(.-)\n")do
+    local line=""
+    for word in paragraph:gmatch("%S+")do line=append(word,line)end
+    lines[#lines+1]=line
+  end
+  local _,lineHeight=itemMeasure(R,instance,node,"Ag",s)
+  return table.concat(lines,"\n"),math.max(1,#lines)*lineHeight,math.max(1,#lines)
+end
+local function itemAbsolute(node,x,y,w,h)
+  node.rect={x=x,y=y,w=math.max(1,w),h=math.max(1,h)}
+  node.anchors={explicit={left=false,right=false,top=false,bottom=false}}
+  node.fields=copy(node.fields or{})
+  for _,name in ipairs({"LeftAnchorOffset","RightAnchorOffset","TopAnchorOffset","BottomAnchorOffset",
+    "LeftAnchorToLeft","RightAnchorToLeft","TopAnchorToTop","BottomAnchorToTop","Layout"})do node.fields[name]=nil end
+  return node
+end
+local function managedItemNode(name)
+  return name=="IconButton"or name=="ItemDescription"or name=="IDW_ModButton"or name=="IDW_ModButtonLabel"
+    or name=="Hailstone_EvolvingFinalResult"or name:match("^IDW_ItemInfo%d+$")or name:match("^IDW_Row%d+Col%d+[A-Za-z]+$")
+    or name:match("^IDW_Heroic%d+$")or name:match("^IDW_Socket_Slot_[1-6]_Screen$")or name=="IDW_Appearance_Socket_Screen"
+    or name:match("^IDW_ClassTitle%d*$")or name:match("^IDW_RaceTitle%d*$")or name=="IDW_DeityTitle"
+    or name=="IDW_CollectedLabel"or name=="IDW_ConvertButton"or name=="IDW_ConvertButtonLabel"
+end
+-- These source nodes are runtime-positioned prototypes: the original item
+-- builder placed info lines, shared stat/value boxes and socket rows after it
+-- knew the item. Reconstruct that responsibility using the selected skin's
+-- fonts, icon size, margins, column proportions and control artwork.
+function P.ItemLayout(screen,plan,instance,R,width,height,s)
+  if type(screen)~="string"or family(screen)~="ItemDisplayWindow"or not API.windows or type(API.windows.Text)~="function"then return plan end
+  local source=itemSource(plan);if not source then return plan end
+  s=math.max(.01,tonumber(s)or 1);width=math.max(1,tonumber(width)or 400);height=math.max(1,tonumber(height)or 200)
+  local live,signature={}, {tostring(width),tostring(height),tostring(s),tostring(call("settings","Option","font_face"))}
+  local function read(name)
+    if live[name]then return live[name]end
+    local shown=call("windows","ChildShown",screen,name)
+    local value,supplied=call("windows","Text",screen,name)
+    local record={shown=shown~=false,text=tostring(value or""),supplied=supplied}
+    live[name]=record;signature[#signature+1]=name..":"..tostring(shown)..":"..#record.text..":"..record.text
+    return record
+  end
+  local infos,cells,heroics,sockets={},{},{},{}
+  for n=1,13 do local name="IDW_ItemInfo"..n;local value=read(name)
+    if value.shown and value.text~=""then infos[#infos+1]={name=name,text=value.text}end
+  end
+  for row=1,26 do cells[row]={}
+    for col=1,3 do
+      local prefix="IDW_Row"..row.."Col"..col
+      local label,value=read(prefix.."Stat"),read(prefix.."Value")
+      if label.shown and label.text~=""then
+        local x,y,w=call("windows","ChildRect",screen,prefix.."Stat")
+        cells[row][col]={label=prefix.."Stat",value=prefix.."Value",text=label.text,valueText=value.shown and value.text or"",x=x,y=y,w=w}
+      end
+    end
+  end
+  for n=1,13 do local name="IDW_Heroic"..n;local value=read(name)
+    if value.shown and value.text~=""then
+      local x,y=call("windows","ChildRect",screen,name)
+      signature[#signature+1]=tostring(x)..":"..tostring(y)
+      local owner,distance
+      if x and y then for row=1,26 do for col=1,3 do local cell=cells[row][col]
+        if cell and cell.x and cell.y and math.abs(y-cell.y)<1 then
+          local delta=math.abs(x-cell.x-(cell.w or 0))
+          if not distance or delta<distance then owner,distance=cell,delta end
+        end
+      end end end
+      local entry={name=name,text=value.text};heroics[#heroics+1]=entry
+      if owner then owner.heroic=entry;entry.assigned=true end
+    end
+  end
+  for n=1,7 do
+    local prefix=n==7 and"IDW_Appearance_Socket"or"IDW_Socket_Slot_"..n
+    local screenShown=call("windows","ChildShown",screen,prefix.."_Screen")
+    signature[#signature+1]=prefix..":"..tostring(screenShown)
+    -- The screen is authoritative. An item child may retain its default shown
+    -- state while its parent socket screen is hidden by the live model.
+    if screenShown==true or screenShown==nil and call("windows","ChildShown",screen,prefix.."_Item")==true then
+      local description=read(prefix.."_Description")
+      local buy=n==7 and call("windows","ChildShown",screen,prefix.."_Buy_Button")==true
+      local buyText=buy and read(prefix.."_Buy_Button").text or""
+      signature[#signature+1]=tostring(buy)
+      sockets[#sockets+1]={prefix=prefix,text=description.text,appearance=n==7,buy=buy,buyText=buyText}
+    end
+  end
+  local modifier,description,final=read("IDW_ModButtonLabel"),read("ItemDescription"),read("Hailstone_EvolvingFinalResult")
+  local fonts={}
+  for _,node in pairs(source.nodes)do if not fonts[node.font or 3]then
+    fonts[node.font or 3]=true;local fw,fh=itemMeasure(R,instance,node,"Wg",s)
+    signature[#signature+1]=tostring(node.font or 3)..":"..tostring(fw)..":"..tostring(fh)
+  end end
+  local key=table.concat(signature,"\31");local cache=itemLayouts[screen]
+  for index,name in ipairs(itemLayoutScreens)do if name==screen then table.remove(itemLayoutScreens,index);break end end
+  table.insert(itemLayoutScreens,1,screen)
+  -- Retain current and recent display instances without keeping every closed
+  -- inspect window alive when a host allocates monotonically increasing ids.
+  if #itemLayoutScreens>12 then itemLayouts[table.remove(itemLayoutScreens)]=nil end
+  if not cache or cache.source~=plan or cache.instance~=instance then
+    cache={source=plan,instance=instance,entries={}};itemLayouts[screen]=cache
+  end
+  for index,entry in ipairs(cache.entries)do if entry.key==key then
+    table.remove(cache.entries,index);table.insert(cache.entries,1,entry)
+    return entry.plan,entry.height
+  end end
+  local prepared=copy(plan);local nodes={};walk(prepared,function(node)nodes[id(node)]=node end)
+  local page=nodes[id(source.page)];local tab=source.tab and nodes[id(source.tab)]
+  local function prune(node)
+    local children={}
+    for _,child in ipairs(node.children or{})do
+      if not managedItemNode(id(child))then prune(child);children[#children+1]=child end
+    end
+    node.children=children
+  end
+  prune(page)
+  local function take(name,fallback,kind)
+    local node=nodes[name]or copy(fallback or source.nodes.IDW_ItemInfo1)
+    node.name=name;node.item=name;node.children={};node.sourceReplaced=nil
+    if kind then node.type=kind end
+    return node
+  end
+  local tabBox=tab and R and R.Geometry and R.Geometry(source.tab,{x=0,y=0,w=width,h=height,s=1})or{x=0,y=0}
+  local left,top=math.max(0,tabBox.x or 0),math.max(0,tabBox.y or 0)
+  left=math.min(left,math.max(0,(width-1)/2))
+  local pageWidth=math.max(1,width-2*left)
+  local tabHeight=tab and tonumber((tab.fields or{}).TabHeight)or 22
+  local sourceIcon=source.nodes.IconButton
+  local icon=R and R.Geometry and R.Geometry(sourceIcon,{x=0,y=0,w=pageWidth,h=height,s=1})or sourceIcon.rect or{}
+  local first=source.nodes.IDW_ItemInfo1
+  local margin=math.max(0,math.min(10,tonumber((source.nodes.IDW_Row1Col1Stat or first).rect.x)or 10,pageWidth/8))
+  local gap=math.max(2,math.min(4,(tonumber((first.rect or{}).h)or 20)/5))
+  local iconX=math.min(math.max(margin,icon.x or margin),math.max(0,pageWidth-1))
+  local iconSize=math.max(1,math.min(math.max(20,math.min(icon.w or 44,icon.h or 44)),pageWidth-iconX-margin))
+  local headerY=math.max(0,(first.rect or{}).y or 0)
+  local iconY=math.max(headerY,icon.y or headerY)
+  local textX=math.max(iconX+iconSize+gap,(first.rect or{}).x or 60)
+  if pageWidth-margin-textX<40 then textX=margin;headerY=iconY+iconSize+gap end
+  local textWidth=math.max(1,pageWidth-margin-textX)
+  local iconNode=take("IconButton",sourceIcon,"Button")
+  page.children[#page.children+1]=itemAbsolute(iconNode,iconX,iconY,iconSize,iconSize)
+  local y=headerY
+  local function label(name,value,x,atY,w,fallback)
+    local node=take(name,fallback,"Label")
+    local wrapped,h=itemWrap(R,instance,node,value,w,s)
+    node.sourceItemText=wrapped;itemAbsolute(node,x,atY,w,h)
+    page.children[#page.children+1]=node;return h,node
+  end
+  for _,entry in ipairs(infos)do
+    local h=label(entry.name,entry.text,textX,y,textWidth,first);y=y+h+gap
+  end
+  y=math.max(y,iconY+iconSize)+gap
+  local available=math.max(1,pageWidth-2*margin)
+  local per=math.max(1,math.min(3,math.floor(available/100)))
+  for band=1,3,per do
+    local last=math.min(3,band+per-1);local columns,total={},0
+    for col=band,last do
+      local sourceStat=source.nodes["IDW_Row1Col"..col.."Stat"]or first
+      local weight=math.max(1,tonumber((sourceStat.rect or{}).w)or 100)
+      columns[col]={weight=weight};total=total+weight
+    end
+    local hasBand=false;for row=1,26 do for col=band,last do if cells[row][col]then hasBand=true end end end
+    if hasBand then
+      local lastRow
+      for row=1,26 do
+        local any=false;for col=band,last do if cells[row][col]then any=true end end
+        if any then
+          if lastRow and row>lastRow+1 then y=y+gap*2 end
+          local rowHeight,x=0,margin
+          for col=band,last do
+            local columnWidth=(available-gap*(last-band))*columns[col].weight/total
+            local cell=cells[row][col]
+            if cell then
+              local stat=source.nodes[cell.label]or first
+              local valueNode=source.nodes[cell.value]or stat
+              local heroic=cell.heroic
+              local heroicWidth=heroic and math.min(columnWidth*.3,math.max(14,itemMeasure(R,instance,source.nodes[heroic.name]or stat,heroic.text,s)))or 0
+              local valueWidth=math.min(columnWidth*.45,math.max(22,itemMeasure(R,instance,valueNode,cell.valueText,s)))
+              if columnWidth<85 then
+                local h=label(cell.label,cell.text,x,y,columnWidth,stat)
+                local vh=label(cell.value,cell.valueText,x,y+h+gap,math.max(1,columnWidth-heroicWidth-gap),valueNode)
+                local hh=heroic and label(heroic.name,heroic.text,x+columnWidth-heroicWidth,y+h+gap,heroicWidth,stat)or 0
+                rowHeight=math.max(rowHeight,h+gap+math.max(vh,hh))
+              else
+                local labelWidth=math.max(1,columnWidth-valueWidth-heroicWidth-gap*(heroic and 2 or 1))
+                local h=label(cell.label,cell.text,x,y,labelWidth,stat)
+                local vh=label(cell.value,cell.valueText,x+labelWidth+gap,y,valueWidth,valueNode)
+                local hh=heroic and label(heroic.name,heroic.text,x+columnWidth-heroicWidth,y,heroicWidth,stat)or 0
+                rowHeight=math.max(rowHeight,h,vh,hh)
+              end
+            end
+            x=x+columnWidth+gap
+          end
+          y=y+rowHeight+gap;lastRow=row
+        end
+      end
+      y=y+gap
+    end
+  end
+  for _,entry in ipairs(heroics)do if not entry.assigned then y=y+label(entry.name,entry.text,margin,y,available,first)+gap end end
+  if modifier.shown and modifier.text~=""then
+    local button=take("IDW_ModButton",{type="Button",font=first.font,fields={}},"Button")
+    local size=math.max(12,math.min(20,(button.rect or{}).h or 15))
+    page.children[#page.children+1]=itemAbsolute(button,margin,y,size,size)
+    local h=label("IDW_ModButtonLabel",modifier.text,margin+size+gap,y,math.max(1,available-size-gap),first)
+    y=y+math.max(size,h)+gap*2
+  end
+  for _,entry in ipairs(sockets)do
+    local prefix=entry.prefix
+    local group=take(prefix.."_Screen",{type="Screen",font=first.font,fields={}},"Screen")
+    local button=take(prefix.."_Item",source.nodes.IDW_Socket_Slot_1_Item or sourceIcon,"Button")
+    local details=take(prefix.."_Description",source.nodes.IDW_Socket_Slot_1_Description or source.nodes.ItemDescription,"STMLbox")
+    local size=math.max(20,math.min(48,(button.rect or{}).h or(entry.appearance and 40 or 20),available))
+    if not source.nodes[prefix.."_Item"]and not source.nodes.IDW_Socket_Slot_1_Item then
+      -- Older skins have no socket prototype. Their item-icon placeholder is
+      -- not an empty augment slot; use selected button chrome and live art.
+      button.art={};button.fields=copy(button.fields or{})
+      button.fields.ButtonDrawTemplate=nil
+      button.fields.DecalSize={CX=size,CY=size};button.fields.DecalOffset={X=0,Y=0}
+    end
+    local descriptionX=size+gap*2
+    local buyWidth=entry.buy and math.min(100,math.max(64,itemMeasure(R,instance,first,entry.buyText~=""and entry.buyText or"Buy Now",s)+12))or 0
+    local buyBelow=entry.buy and available-descriptionX-buyWidth-gap<70
+    local descriptionWidth=math.max(1,available-descriptionX-(entry.buy and not buyBelow and buyWidth+gap or 0))
+    local _,descriptionHeight,descriptionLines=itemWrap(R,instance,details,itemPlain(entry.text),descriptionWidth,s)
+    local lineSpacing=4*(tonumber(ui.GetIO().uiScale)or 1)/s
+    local rowHeight=math.max(size,tonumber((group.rect or{}).h)or 0,descriptionHeight+descriptionLines*lineSpacing+gap*2)
+    group.children={itemAbsolute(button,0,0,size,size),itemAbsolute(details,descriptionX,0,descriptionWidth,rowHeight)}
+    if entry.buy then
+      local buy=take(prefix.."_Buy_Button",{type="Button",font=first.font,fields={Style_HCenter=true,Style_VCenter=true}},"Button")
+      local caption=entry.buyText~=""and entry.buyText or buy.text~=""and buy.text or"Buy Now"
+      local buyHeight
+      buy.sourceItemCaption,buyHeight=itemWrap(R,instance,buy,caption,buyBelow and available or buyWidth,s)
+      buyHeight=math.max(22,buyHeight+8)
+      local buyY=buyBelow and rowHeight+gap or 0
+      group.children[#group.children+1]=itemAbsolute(buy,buyBelow and 0 or available-buyWidth,buyY,buyBelow and available or buyWidth,buyHeight)
+      rowHeight=math.max(rowHeight,buyY+buyHeight)
+    end
+    page.children[#page.children+1]=itemAbsolute(group,margin,y,available,rowHeight)
+    y=y+rowHeight+gap*2
+  end
+  if final.shown and final.text~=""then
+    local button=take("Hailstone_EvolvingFinalResult",{type="Button",font=first.font,fields={Style_HCenter=true,Style_VCenter=true}},"Button")
+    local h;button.sourceItemCaption,h=itemWrap(R,instance,button,final.text,available,s);h=math.max(24,h+8)
+    page.children[#page.children+1]=itemAbsolute(button,margin,y,available,h);y=y+h+gap
+  end
+  local descriptionHeight=math.max(80,height-top-tabHeight-y-gap)
+  local body=take("ItemDescription",source.nodes.ItemDescription,"STMLbox")
+  page.children[#page.children+1]=itemAbsolute(body,margin,y,available,descriptionHeight)
+  local fullHeight=top+tabHeight+y+descriptionHeight+gap
+  itemAbsolute(page,0,0,pageWidth,fullHeight-top-tabHeight)
+  if tab then itemAbsolute(tab,left,top,pageWidth,fullHeight-top)end
+  prepared.rect={x=0,y=0,w=width,h=fullHeight};prepared.sourceItemLayout=true
+  table.insert(cache.entries,1,{key=key,plan=prepared,height=fullHeight})
+  if #cache.entries>4 then table.remove(cache.entries)end
+  return prepared,fullHeight
+end
+function P.OwnsScroll(screen,plan)
+  return type(screen)=="string"and family(screen)=="ItemDisplayWindow"and itemSource(plan)~=nil
+    and API.windows and type(API.windows.Text)=="function"or false
 end
 local function hotPlan(screen,plan,instance,R)
   if family(screen)~="HotButtonWnd" then return plan end
@@ -339,6 +638,23 @@ function P.Size(screen,plan,instance,R)
   P.Frame()
   plan=hotPlan(screen,plan,instance,R)
   local w,h=(plan.rect or {}).w or 320,(plan.rect or {}).h or 200
+  if family(screen)=="ItemDisplayWindow"and itemSource(plan)and API.windows and API.windows.Text then
+    if w<=0 then
+      w=320
+      for col=1,3 do local node=itemSource(plan).nodes["IDW_Row1Col"..col.."Stat"]
+        if node then w=math.max(w,(node.rect.x or 0)+(node.rect.w or 0)+20)end
+      end
+    end
+    h=math.max(230,h)
+    local inset=R and R.ChromeInsets and R.ChromeInsets(plan,instance,1)or{left=0,right=0,top=0,bottom=0}
+    local io=ui.GetIO();local scale=math.max(.01,tonumber(io.uiScale)or 1)
+    local _,natural=P.ItemLayout(screen,plan,instance,R,math.max(1,w-inset.left-inset.right),
+      math.max(1,h-inset.top-inset.bottom),scale)
+    if natural then
+      local limit=math.max(120,(tonumber(io.height)or 1080)/scale*.8)
+      return w,math.min(limit,math.max(h,natural+inset.top+inset.bottom+transferHeight(screen)))
+    end
+  end
   if R and R.MeasureChildren and R.ChromeInsets then
     local inset=R.ChromeInsets(plan,instance,1)
     local key=table.concat({inset.left,inset.right,inset.top,inset.bottom},":")
@@ -421,7 +737,11 @@ local function chatInput(screen,node,box)
 end
 function P.DrawControl(screen,node,box,instance,R)
   local key,name=family(screen),id(node)
-  if key=="ChatWindow" then
+  if key=="ItemDisplayWindow"and node.sourceItemCaption~=nil and R.DrawButton then
+    R.DrawButton(screen,node,box,instance,node.sourceItemCaption);return true
+  elseif key=="ItemDisplayWindow"and node.sourceItemText~=nil and R.PaintText then
+    R.PaintText(screen,node,box,instance,node.sourceItemText);return true
+  elseif key=="ChatWindow" then
     if name=="CWChatInput" or node.type=="Editbox" then chatInput(screen,node,box);return true end
     if name=="CWChatOutput" or node.type=="STMLbox" then chatOutput(screen,node,box);return true end
   elseif key=="InventoryWindow" then
@@ -486,6 +806,38 @@ end
 function P.Draw(screen,plan,instance,box,R)
   P.Frame()
   plan=hotPlan(screen,plan,instance,R)
+  if family(screen)=="ItemDisplayWindow"then
+    local s=box.s or 1;local transfer=transferHeight(screen)*s
+    local availableHeight=math.max(1,box.h-transfer)
+    local prepared,extent=P.ItemLayout(screen,plan,instance,R,box.w/s,availableHeight/s,s)
+    if prepared.sourceItemLayout then
+      local child=extent*s>availableHeight+.01
+      local content={x=box.x,y=box.y,w=box.w,h=math.max(availableHeight,extent*s),s=s}
+      local visible=true
+      if child then
+        ui.SetCursorScreenPos(box.x,box.y)
+        visible=ui.BeginChild("##source-item-layout",box.w,availableHeight,false,0)
+        local x,y=ui.GetCursorScreenPos();local w,h=ui.GetContentRegionAvail()
+        prepared,extent=P.ItemLayout(screen,plan,instance,R,w/s,h/s,s)
+        content={x=x,y=y,w=w,h=math.max(h,extent*s),s=s}
+      end
+      local ok,drawn,why=true,true,nil
+      if visible then ok,drawn,why=pcall(R.Draw,screen,prepared,instance,content,P)end
+      if child then
+        if visible then ui.SetCursorScreenPos(content.x,content.y);ui.Dummy(content.w,content.h)end
+        ui.EndChild()
+      end
+      if not ok then error(drawn,0)end
+      if drawn==false then return false,why end
+      if transfer>0 then
+        ui.SetCursorScreenPos(box.x,box.y+box.h-transfer)
+        if ui.Button("Transfer evolving experience##source-transfer",box.w,math.max(1,transfer-4*s))then
+          call("evolving","OpenFromDisplay",screen)
+        end
+      end
+      return true
+    end
+  end
   local absent,template,templates=missing(screen,plan,instance,R)
   local extra=extrasHeight(screen,plan,instance,R)*(box.s or 1)
   local tabs=tabsHeight(screen)*(box.s or 1)

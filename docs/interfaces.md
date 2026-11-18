@@ -31,6 +31,13 @@ anchors and flow strategies place the controls; live host state supplies values,
 visibility and actions. Missing capabilities or unsupported graphs retain a
 working inherited presentation and a diagnostic.
 
+Item-display files contain templates that the original window code positioned
+at runtime. The shared item presenter performs that placement from the live
+`hs.UI.windows` values, retaining each source's typography, tabs, icon dimensions
+and column proportions. It measures and wraps headers, stat values, socket
+descriptions and action captions; one responsive viewport owns scrolling.
+Prepared layouts use bounded caches keyed by content, width, font and scale.
+
 The source window's context menu exposes **Client tools...** for additional
 client functionality through its inherited body. New or unmatched windows also
 keep their built-in body with the selected source frame, palette, typography and

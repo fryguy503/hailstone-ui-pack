@@ -4,6 +4,43 @@ The normal addon ships all twenty Lua layout sets. Startup uses its installed
 `lib/layouts/` modules and approved Default inheritance, without a local compiler
 or private `ui-data/` setup. No XML renderer is shipped or used.
 
+## Preview 4 drawing and lifecycle regressions
+
+Currency controls exercise authored `DecalOffset`/`DecalSize` at multiple scales,
+including live host UV cells and explicit zero sizes. Button caption alignment
+and offsets are checked independently of the full action rectangle. A live item
+icon replaces the source's red/blue grid-placeholder background with the selected
+neutral item well while retaining explicit host and other state artwork.
+
+The item-display matrix uses every real source plan: 240 populated layouts cover
+220/400/640-pixel widths, 0.75/1.5 scales, sparse and dense 26-row stat grids,
+heroic values, seven sockets, long translated captions and multiple font faces.
+Assertions check full text fit, containment, nonoverlap, retained source fonts
+and defaults, bounded caches, and scroll cleanup after errors. Rich text uses
+its actual content viewport and invalidates wrapped heights on resize.
+
+Bag tests close during chrome, Done actions and held/release phases; compacted
+bag indices, destruction, reopen, empty contents and world containers are covered.
+Retired frames cannot continue reading or acting on a replacement bag. Genuine
+draw errors retain the screen and original diagnostic. The HUD uses a presenter's
+scroll-ownership hook to avoid nested item-display scroll viewports.
+
+The final preview 4 Windows suite ran 126 tests: 124 passed with two expected
+symlink-permission skips. Renderer fixtures passed 98 cases / 3,065 assertions;
+source presenters passed 2,511,473 assertions across the populated matrix, and
+model/HUD lifecycle fixtures passed 287 assertions. Native addon installation
+accepted the final archive; upgrading preview 3 preserved an unrelated addon,
+user files, profile settings and activation/update flags.
+
+Private populated captures exercise the real client Lua host, window models,
+Dear ImGui glyph/layout generation and source renderer. Their textures are
+decoded with the client codecs and the draw triangles are rasterized on the CPU;
+they use synthetic items and an explicit Arial font set without running Vulkan
+or a game session. All twenty skins render inventory and two item displays;
+Default, Duxa and Graphite also exercise narrow and scaled item views. These
+captures validate the reported presentation cases, not live gameplay or GPU
+driver behavior. Capture files and fixtures remain outside the published addon.
+
 ## Clean addon installation
 
 Release checks build and extract the actual archive into an otherwise empty
@@ -28,7 +65,7 @@ fallback. The [resource inventory](../assets/manifest.json) records those cases
 and six compatible shared-art aliases. These are package and data checks,
 not a new twenty-skin native visual pass.
 
-The final Windows suite ran 126 tests: 124 passed and two skipped because the
+The preview 3 Windows suite ran 126 tests: 124 passed and two skipped because the
 host could not create test symlinks. This includes the actual extracted-addon
 clean/poisoned-data startup tests for all twenty skins, release determinism,
 required artwork/inventory checks and the client API contracts. The renderer

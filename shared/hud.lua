@@ -65,7 +65,8 @@ local function bridge(original, kind)
   return function(screen, title, options, body)
     options = options or {}
     local plan, appearance, why
-    local shown=screen and (options.shown==true or API.windows.Shown(screen))
+    local hostShown=screen and API.windows.Shown(screen)
+    local shown=screen and (options.shown==true or hostShown)
     if kind=="dialog" and options.shown~=nil then shown=options.shown end
     if screen then R.TrackWindow(screen,shown,instance) end
     -- Keep lazy plans lazy: the base also claims its hidden windows, as before.
@@ -135,7 +136,14 @@ local function bridge(original, kind)
         if body and ui.MenuItem("Client tools...") then source.OpenTools(screen) end
       end
       presentationPath(screen,"source")
+      local retired=false
+      local function current()
+        if hostShown==true and API.windows.Shown(screen)==false then retired=true end
+        if retired and screen then R.TrackWindow(screen,false,instance) end
+        return not retired
+      end
       local function authored(x,y,w,h,s)
+        if not current() then return end
         context.sourceManagedPanel=false -- the inherited outer panel has already been skipped
         options.rolled=opts.rolled
         local sourceScale=s*sourceFit
@@ -157,13 +165,18 @@ local function bridge(original, kind)
         if not chromeOk then error(chromeError,0) end
         if clicked then
           if options.onClose then options.onClose() else API.windows.Show(screen,false) end
+          retired=true
+          current()
+          return -- close may destroy or reassign the model before its body runs
         end
+        if not current() then return end
         if not opts.rolled then
           local client={x=x+insets.left,y=y+insets.top,w=math.max(1,w-insets.left-insets.right),
             h=math.max(1,h-insets.top-insets.bottom),s=sourceScale}
           local scrollX,scrollY=fields.Style_HScroll==true,fields.Style_VScroll==true
           local child=false
-          if scrollX or scrollY then
+          local ownsScroll=presenter.OwnsScroll and presenter.OwnsScroll(screen,appearance,instance)==true
+          if (scrollX or scrollY) and not ownsScroll then
             local virtualW=math.max(client.w,designW*sourceScale-insets.left-insets.right)
             local virtualH=math.max(client.h,designH*sourceScale-insets.top-insets.bottom)
             if presenter.ContentSize then
@@ -179,20 +192,32 @@ local function bridge(original, kind)
             client={x=cx,y=cy,w=scrollX and virtualW or client.w,h=scrollY and virtualH or client.h,s=sourceScale}
             if not visible then ui.EndChild();return end
           end
-          local ok,reason=pcall(presenter.Draw,screen,appearance,instance,client,R)
+          local ok,drawn,reason,closed=pcall(presenter.Draw,screen,appearance,instance,client,R)
           if child then
             ui.SetCursorScreenPos(client.x,client.y);ui.Dummy(client.w,client.h)
             ui.EndChild()
           end
-          if not ok then error(reason,0) end
-          if reason==false then error("Source presenter failed",0) end
+          if not ok then
+            instance.messages=instance.messages or {}
+            instance.messages["presenter:"..screen]=tostring(drawn)
+            error(drawn,0)
+          end
+          if closed==true then retired=true end
+          if not current() then return end
+          if drawn==false then
+            local message="Source presenter failed for "..tostring(screen)..": "..tostring(reason or "no reason returned")
+            instance.messages=instance.messages or {}
+            instance.messages["presenter:"..screen]=message
+            error(message,0)
+          end
+          if instance.messages then instance.messages["presenter:"..screen]=nil end
         end
         end)
         -- Chrome, glyphs and source hit rectangles share one effective scale.
         -- The separate Client tools body keeps its inherited font/geometry scale.
         ui.SetWindowFontScale(s/(io.uiScale or 1))
         if not success then error(failure,0) end
-        source.Tools(screen,title,body,originalSize,s)
+        if current() then source.Tools(screen,title,body,originalSize,s) end
       end
       local previous=context.sourceManagedPanel
       context.sourceManagedPanel=true

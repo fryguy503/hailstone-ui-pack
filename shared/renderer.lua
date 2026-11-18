@@ -533,12 +533,41 @@ local function text(instance, node, box, value, tint, fitHeight)
     size=box.h;tw=tw*box.h/th;th=box.h
   end
   local f=node.fields or {}; local x,y=box.x,box.y
-  if truth(f.Style_HCenter) or truth(f.AlignCenter) or f.Align=="Center" then x=x+(box.w-tw)/2
+  local button=node.type=="Button"
+  if button and truth(f.TextAlignRight) then x=x+box.w-tw
+  elseif truth(f.Style_HCenter) or truth(f.AlignCenter) or f.Align=="Center" or button and truth(f.TextAlignCenter) then x=x+(box.w-tw)/2
   elseif truth(f.Style_RightJustify) or truth(f.AlignRight) or f.Align=="Right" then x=x+box.w-tw end
-  if truth(f.Style_VCenter) then y=y+(box.h-th)/2 end
+  if truth(f.Style_VCenter) or button and truth(f.TextAlignVCenter) then y=y+(box.h-th)/2 end
+  if button then x=x+number(f.TextOffsetX)*(box.s or 1);y=y+number(f.TextOffsetY)*(box.s or 1) end
   local c=color(tint,instance.palette.text)
   ui.DrawText(x,y,c[1],c[2],c[3],c[4],value,size)
   ui.PopFont()
+end
+function R.MeasureText(instance,node,value)
+  ui.PushFont(font(instance,node))
+  local ok,w,h=pcall(ui.CalcTextSize,tostring(value or ""))
+  ui.PopFont()
+  if not ok then error(w,0) end
+  return w,h -- physical pixels, including the host's current window font scale
+end
+function R.PaintText(screen,node,box,instance,value)
+  local caption,tint=B.Text(screen,node)
+  local enabled=B.State(screen,node)
+  text(instance,node,box,value~=nil and value or caption,enabled==false and instance.palette.disabled
+    or B.Color(screen,node) or tint or color((node.colors or {}).TextColor,instance.palette.text))
+  local mx,my=ui.GetMousePos()
+  if mx>=box.x and mx<box.x+box.w and my>=box.y and my<box.y+box.h then
+    local tip=B.Tooltip(screen,node);if tip~="" then ui.SetTooltip(tip) end
+  end
+end
+local function decalRect(node,box)
+  local f=node.fields or {};local offset,size=f.DecalOffset,f.DecalSize
+  local s=box.s or 1
+  local x=type(offset)=="table" and number(offset.X or offset.x or offset[1])*s or 0
+  local y=type(offset)=="table" and number(offset.Y or offset.y or offset[2])*s or 0
+  local w=type(size)=="table" and number(size.CX or size.cx or size[1])*s or box.w
+  local h=type(size)=="table" and number(size.CY or size.cy or size[2])*s or box.h
+  return {x=box.x+x,y=box.y+y,w=math.max(0,w),h=math.max(0,h),s=s}
 end
 local function point(box) ui.SetCursorScreenPos(box.x,box.y) end
 local function hit(id,box,enabled)
@@ -594,10 +623,19 @@ local function buttonArt(instance,node,box,hover,pressed,checked,enabled,tint,ov
       or hover and art("Flyby") or art("Normal")
   end
   overrides=overrides or {}
-  if not overrides.background and not R.Animation(instance,selected(""),box,tint) then
+  local base=selected("")
+  local placeholder=f and find(instance,"animations",f.NormalDecal)
+  local baseName=type(base)=="string" and base:lower()
+  local replacePlaceholder=overrides.liveIcon and placeholder and truth(placeholder.grid)
+    and (baseName=="rediconbackground" or baseName=="blueiconbackground")
+  -- BuffIcons is a source prototype, not an item's backdrop. An actual live
+  -- item cell uses the selected skin's neutral item well; explicit host buff
+  -- backgrounds and independent pressed/hover artwork retain their meaning.
+  if replacePlaceholder then base="A_InvSlot" end
+  if not overrides.background and not R.Animation(instance,base,box,tint) then
     filled(box,pressed and instance.palette.border or instance.palette.background);border(box,instance.palette.border)
   end
-  if not overrides.decal then R.Animation(instance,selected("Decal"),box,tint) end
+  if not overrides.decal then R.Animation(instance,selected("Decal"),decalRect(node,box),tint) end
 end
 
 local function sliderArt(instance,node,box,fraction,hover,pressed,enabled)
@@ -627,16 +665,19 @@ local function sliderArt(instance,node,box,fraction,hover,pressed,enabled)
   if not R.Animation(instance,art,handle) then filled(handle,instance.palette.border) end
 end
 local dynamicArt,phases
-local function drawButton(instance,screen,node,box)
+local function drawButton(instance,screen,node,box,captionOverride)
   local enabled,checked,_,_,action=B.State(screen,node)
   local clicked,hover,pressed=hit("##pack:"..B.Id(node),box,enabled or action)
   local background=dynamicArt(instance,screen,node,box,"background")
-  local hasDecal=B.Call("windows","ChildArt",screen,B.Id(node),"decal")~=nil
-  buttonArt(instance,node,box,hover,pressed,checked,enabled,nil,{background=background,decal=hasDecal})
-  dynamicArt(instance,screen,node,box,"decal")
+  local decal=table.pack(B.Call("windows","ChildArt",screen,B.Id(node),"decal"))
+  local hasDecal=decal[1]~=nil
+  local liveIcon=hasDecal and decal[1]~=false and type(decal[1])~="string"
+  buttonArt(instance,node,box,hover,pressed,checked,enabled,nil,{background=background,decal=hasDecal,liveIcon=liveIcon})
+  dynamicArt(instance,screen,node,box,"decal",decal)
   local top,r,g,b,a=B.Call("spells","ButtonCoolDown",screen,B.Id(node),box.y,box.y+box.h)
   if top then filled(rect(box.x,math.max(top,box.y),box.w,math.max(0,box.y+box.h-math.max(top,box.y))),{r or 0,g or 0,b or 0,a or 0.6}) end
-  local caption=B.Text(screen,node)
+  local caption=captionOverride
+  if caption==nil then caption=B.Text(screen,node) end
   text(instance,node,box,caption,enabled and B.Color(screen,node) or instance.palette.disabled)
   local rec=state(instance,screen,node)
   if ui.IsItemClicked(ui.Mouse.Left) then rec.dragged=false end
@@ -655,6 +696,9 @@ local function drawButton(instance,screen,node,box)
     if (enabled or action) and ui.IsItemClicked(ui.Mouse.Right) then B.Click(screen,node,"right");consumeRight(instance) end
   end
   tooltip(screen,node)
+end
+function R.DrawButton(screen,node,box,instance,caption)
+  return drawButton(instance,screen,node,box,caption)
 end
 
 local function gaugeArt(instance,node,box,fraction,tint,alpha)
@@ -979,17 +1023,28 @@ local function drawStml(instance,screen,node,box)
   if record.raw~=raw then record.raw=raw;record.lines=instance.stml.Lines(raw,instance.palette.text);record.cum=nil;record.cumKey=nil end
   point(box)
   ui.PushFont(font(instance,node))
+  local padding=ui.StyleVar and ui.StyleVar.WindowPadding
+  if padding then ui.PushStyleVar(padding,0,0) end -- source rectangles already reserve their own text padding
   local visible=ui.BeginChild("##stml:"..B.Id(node),box.w,box.h,false,0)
   local ok,why=pcall(function()
     if visible then
       if changed then ui.SetScrollY(0) end
+      local width,height=ui.GetContentRegionAvail()
+      width,height=math.max(0,number(width)),math.max(0,number(height))
       local fw,fh=ui.CalcTextSize("Wg il")
-      instance.stml.DrawLines(record,box.w,box.h,fw*4096+fh,function(link)
-        B.Call("windows","StmlLink",screen,B.Id(node),link[1],link[2])
-    end)
+      if record.stmlWidth~=width or record.stmlFontW~=fw or record.stmlFontH~=fh then
+        record.stmlWidth,record.stmlFontW,record.stmlFontH=width,fw,fh
+        record.stmlKey=(record.stmlKey or 0)+1 -- invalidate wrapped heights on width as well as font changes
+      end
+      if width>0 and height>0 then
+        instance.stml.DrawLines(record,width,height,record.stmlKey,function(link)
+          B.Call("windows","StmlLink",screen,B.Id(node),link[1],link[2])
+        end)
+      end
     end
   end)
   ui.EndChild()
+  if padding then ui.PopStyleVar(1) end
   ui.PopFont()
   if not ok then error(why,0) end
 end
@@ -1209,10 +1264,14 @@ local function children(instance,screen,node,box)
   for _,entry in ipairs(ordered)do drawNode(instance,screen,entry.node,entry.rect) end
   dividers(instance,screen,node,box,flow,vertical,record)
 end
-dynamicArt=function(instance,screen,node,box,part)
-  local value,u0,v0,u1,v1=B.Call("windows","ChildArt",screen,B.Id(node),part)
+dynamicArt=function(instance,screen,node,box,part,supplied)
+  local value,u0,v0,u1,v1
+  if supplied then value,u0,v0,u1,v1=table.unpack(supplied,1,5)
+  else value,u0,v0,u1,v1=B.Call("windows","ChildArt",screen,B.Id(node),part) end
   if value==false then return true end -- the model explicitly draws nothing
   if value==nil then return false end
+  if part=="decal" then box=decalRect(node,box) end
+  if box.w<=0 or box.h<=0 then return true end
   if type(value)=="string" then R.Animation(instance,value,box,B.Color(screen,node,part));return true end
   ui.DrawImage(value,box.x,box.y,box.x+box.w,box.y+box.h,u0 or 0,v0 or 0,u1 or 1,v1 or 1,1,1,1,1)
   return true

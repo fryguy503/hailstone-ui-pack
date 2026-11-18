@@ -189,6 +189,163 @@ local H=original(root.."/shared/hud.lua")
 H.Dialog("SkillsWindow","Skills",{size=function()preparedCount=preparedCount+1;return 500,600 end},function()modernBody=modernBody+1 end)
 eq(preparedCount,1);eq(modernBody,0);eq(currentContext.paths.SkillsWindow,"source")
 eq(currentContext.sourceManagedPanel,nil)
+
+-- Host bag indices compact on close: Bag1 may immediately refer to the next
+-- bag even though its visibility and capacity did not change.
+do
+  local saved={draw=R.Draw,info=hs.UI.inventory.BagInfo,item=hs.UI.inventory.BagSlotItem,
+    slotClick=hs.UI.inventory.BagSlotClick,click=hs.UI.windows.ClickChild,shown=hs.UI.windows.Shown}
+  local open={name="Same bag name",count=8,slot=23,combine=false}
+  local live=true
+  local clickCount,slotClicks,drawCount,itemReads=0,0,0,0
+  hs.UI.windows.Shown=function()return live end
+  hs.UI.inventory.BagInfo=function()
+    if open then return open.name,open.count,open.combine,"inventory",open.slot end
+  end
+  hs.UI.inventory.BagSlotItem=function()itemReads=itemReads+1;return nil end -- an empty bag still has all of its slots
+  hs.UI.inventory.BagSlotClick=function()slotClicks=slotClicks+1;return true end
+  hs.UI.windows.ClickChild=function()
+    clickCount=clickCount+1
+    open={name="Same bag name",count=8,slot=24,combine=false}
+    return true
+  end
+  M.Size("Bag1",container,instance,R)
+  R.Draw=function()
+    drawCount=drawCount+1
+    eq(B.Item("Bag1",node("InvSlot","Container_Slot:0")),nil)
+    check(B.Click("Bag1",node("Button","StandardDoneButton"),"left"))
+    eq(M.Shown("Bag1",node("Button","StandardDoneButton")),false)
+    eq(B.Click("Bag1",node("Button","StandardDoneButton"),"left"),false)
+    eq(B.ItemClick("Bag1",node("InvSlot","Container_Slot:0"),"left"),false)
+    eq(B.Item("Bag1",node("InvSlot","Container_Slot:0")),nil)
+    local before=#calls
+    M.AfterControl("Bag1",node("InvSlot","Container_Slot:0"),{},instance)
+    eq(#calls,before);eq(itemReads,1)
+    return true
+  end
+  local ok,why,closed=M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R)
+  eq(ok,true);eq(why,nil);eq(closed,true);eq(clickCount,1);eq(slotClicks,0);eq(drawCount,1)
+  check(live) -- closure cannot be inferred from Shown alone
+  M.Size("Bag1",container,instance,R)
+  R.Draw=function()
+    drawCount=drawCount+1
+    check(B.ItemClick("Bag1",node("InvSlot","Container_Slot:0"),"left"))
+    return true
+  end
+  check(M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R));eq(slotClicks,1)
+  -- Destruction/zoning between sizing and drawing quietly retires that frame.
+  live=false;open=nil
+  ok,why,closed=M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R)
+  eq(ok,true);eq(closed,true);eq(drawCount,2)
+  live=true;open={name="Reopened",count=4,slot=25,combine=true}
+  M.Size("Bag1",container,instance,R)
+  eq(M.Shown("Bag1",node("TileLayoutBox","ContainerCombine_Items")),true)
+  check(M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R));eq(slotClicks,2)
+  -- Another action may reassign a bag before a later held/release event.
+  R.Draw=function()
+    open={name="Reopened",count=4,slot=26,combine=true}
+    eq(B.ItemClick("Bag1",node("InvSlot","Container_Slot:0"),"leftheld"),false)
+    return false,"Container contents unavailable"
+  end
+  ok,why,closed=M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R)
+  eq(ok,true);eq(closed,true);eq(slotClicks,2)
+  M.Size("Bag1",container,instance,R)
+  R.Draw=function()return false,"A specific adapter failure" end
+  ok,why=M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R)
+  eq(ok,false);eq(why,"A specific adapter failure")
+  R.Draw=function()live=false;error("original renderer failure",0)end
+  ok,why=pcall(M.Draw,"Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R)
+  eq(ok,false);eq(why,"original renderer failure") -- real errors are never hidden by a simultaneous close
+  live=true
+  R.Draw=function()return true end
+  check(M.Draw("Bag1",container,instance,{x=0,y=0,w=300,h=220,s=1},R)) -- scope recovered after the error
+  for _,screen in ipairs({"Bag36","WorldContainer"})do
+    live=true;open={name="Last container",count=10,slot=-1,combine=true}
+    M.Size(screen,container,instance,R)
+    hs.UI.windows.ClickChild=function()clickCount=clickCount+1;open=nil;live=false;return true end
+    R.Draw=function()
+      check(B.Click(screen,node("Button","CombineDoneButton"),"left"))
+      eq(B.ItemClick(screen,node("InvSlot","Container_Slot:0"),"rightup"),false)
+      return true
+    end
+    ok,why,closed=M.Draw(screen,container,instance,{x=0,y=0,w=300,h=220,s=1},R)
+    eq(ok,true);eq(closed,true);eq(slotClicks,2)
+  end
+  R.Draw,hs.UI.inventory.BagInfo,hs.UI.inventory.BagSlotItem=saved.draw,saved.info,saved.item
+  hs.UI.inventory.BagSlotClick,hs.UI.windows.ClickChild,hs.UI.windows.Shown=saved.slotClick,saved.click,saved.shown
+end
+
+-- The actual shared HUD closes before its source body, keeps scopes balanced,
+-- skips tools after retirement, and retains actionable renderer diagnostics.
+do
+  local saved={draw=R.Draw,insets=R.ChromeInsets,track=R.TrackWindow,shown=hs.UI.windows.Shown,
+    hit=base.T.Hit,tools=modules["lib/pack_source_presenters.lua"].Tools,resolve=R.Resolve,ownsScroll=M.OwnsScroll}
+  local shown,closeHit,ownsScroll=true,false,false
+  local scroll=container.fields.Style_VScroll
+  container.fields.Style_VScroll=true
+  local closes,draws,tools,clips,children,fontScale,childBegins=0,0,0,0,0,1,0
+  hs.UI.windows.Shown=function()return shown end
+  hs.UI.windows.Show=function(_,value)shown=value;closes=closes+1 end
+  base.T.Hit=function()return closeHit end
+  R.Resolve=function()return container end
+  R.ChromeInsets=function()return {left=3,right=3,top=20,bottom=4,titleHeight=20,
+    close={right=3,top=2,width=12,height=12}}end
+  R.TrackWindow=function()end
+  M.OwnsScroll=function(screen)return ownsScroll and screen=="Bag1"end
+  modules["lib/pack_source_presenters.lua"].Tools=function()tools=tools+1 end
+  ui.PushClipRect=function()clips=clips+1 end;ui.PopClipRect=function()clips=clips-1 end
+  ui.SetWindowFontScale=function(value)fontScale=value end
+  ui.BeginChild=function()children=children+1;childBegins=childBegins+1;return true end
+  ui.EndChild=function()children=children-1 end
+  ui.GetCursorScreenPos=function()return 0,0 end
+  ui.Dummy=function()end
+  R.Draw=function()draws=draws+1;return true end
+  local function window(opts)
+    return H.Dialog("Bag1","A real bag",opts or {size=function()return 300,220 end},function()modernBody=modernBody+1 end)
+  end
+  local function balanced()
+    eq(clips,0);eq(children,0);eq(fontScale,1)
+    eq(currentContext.managedChrome,nil);eq(currentContext.sourceManagedPanel,nil)
+  end
+  bagCount=4;closeHit=true
+  window({size=function()return 300,220 end,onClose=function()closes=closes+1;shown=false;bagCount=0 end})
+  eq(closes,1);eq(draws,0);eq(tools,0);balanced()
+  -- Closing Bag1 can leave Bag1 shown because another open bag replaced it.
+  shown=true;bagCount=4
+  window({size=function()return 300,220 end,onClose=function()closes=closes+1 end})
+  eq(closes,2);eq(draws,0);eq(tools,0);balanced()
+  window() -- no custom close callback uses windows.Show, once
+  eq(closes,3);eq(shown,false);eq(draws,0);balanced()
+  shown=true;bagCount=4;closeHit=false
+  window();eq(draws,1);eq(tools,1);check(childBegins>0);balanced() -- reopen, including an empty bag, is still drawable
+  local before=childBegins
+  ownsScroll=true;window();eq(childBegins,before);eq(draws,2);eq(tools,2);balanced()
+  ownsScroll=false;window();check(childBegins>before);eq(draws,3);eq(tools,3);balanced()
+  window({size=function()shown=false;bagCount=0;return 300,220 end})
+  eq(draws,3);eq(tools,3);balanced() -- close/destruction during inherited initialization
+  shown=true;bagCount=4
+  R.Draw=function()return false,"Container model detailed reason" end
+  local ok,why=pcall(window)
+  eq(ok,false);check(why:find("Container model detailed reason",1,true));check(why:find("Bag1",1,true))
+  check(instance.messages["presenter:Bag1"]:find("Container model detailed reason",1,true));balanced()
+  R.Draw=function()error("original source file.lua:42: draw failed",0)end
+  ok,why=pcall(window)
+  eq(ok,false);eq(why,"original source file.lua:42: draw failed")
+  eq(instance.messages["presenter:Bag1"],why);balanced()
+  R.Draw=function()shown=false;return false,"Model retired during draw" end
+  check(pcall(window));eq(tools,3);balanced()
+  shown=true;R.Draw=function()return true end
+  window();eq(instance.messages["presenter:Bag1"],nil);eq(tools,4);balanced()
+  -- Explicit custom-dialog visibility is not a transition to a closed model.
+  shown=false;R.Resolve=function()return sourcePlan end
+  H.Dialog("SkillsWindow","Custom dialog",{shown=true,size=function()return 300,220 end},function()end)
+  eq(tools,5);balanced()
+  container.fields.Style_VScroll=scroll
+  R.Draw,R.ChromeInsets,R.TrackWindow=saved.draw,saved.insets,saved.track
+  hs.UI.windows.Shown,base.T.Hit=saved.shown,saved.hit
+  modules["lib/pack_source_presenters.lua"].Tools,R.Resolve=saved.tools,saved.resolve
+  M.OwnsScroll=saved.ownsScroll
+end
 currentContext={instance={messages={}}}
 local private=original(root.."/shared/model_presenters.lua")
 check(private~=M);eq(private.context,currentContext)
