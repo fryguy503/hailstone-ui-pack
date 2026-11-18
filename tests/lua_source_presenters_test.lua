@@ -558,6 +558,60 @@ probeR.Draw=function()error("populated item draw failure")end
 eq(pcall(P.Draw,"ItemDisplayWindow",cachePlan,cacheInstance,{x=0,y=0,w=220,h=180,s=1},probeR),false)
 eq(count("endchild"),childBefore+2)
 eq(#fonts,0)
+
+-- Legacy self panels keep their source body while putting the clipped name
+-- and parked vital gauges inside the frame at different HUD scales.
+do
+  local oldGauge,oldShown=hs.UI.character.Gauge,hs.UI.windows.ChildShown
+  hs.UI.character.Gauge=function(kind)eq(kind,1);return .76,"Tester\nSurname",760 end
+  hs.UI.windows.ChildShown=function(_,name)if name=="PetHP" then return false end end
+  for _,skin in ipairs({"drakah-pers-adeptus-stock","Nemesis-stock"}) do
+    currentSkin=skin
+    local profile=originalDofile(root.."/ui/"..skin.."/lib/pack_profile.lua")
+    local instance=realR.New(profile)
+    local source=assert(realR.Resolve("PlayerWindow",instance))
+    local sourceHP
+    for _,node in ipairs(source.children) do if node.name=="PlayerHP" then sourceHP=node end end
+    local originalY=assert(sourceHP).rect.y
+    local sizeW,sizeH=P.Size("PlayerWindow",source,instance,realR)
+    local panelHeight=skin=="Nemesis-stock" and 48 or 22
+    eq(sizeH>=source.rect.h+panelHeight,true)
+    for _,scale in ipairs({0.75,1.5}) do
+      local card,caption,drawn,rows
+      local probe={
+        PaintHealthBox=function(owner,at,fraction,tint)
+          eq(owner,instance);eq(fraction,.76);eq(tint,nil);card=at
+        end,
+        PaintControl=function(_,_,at,_,options)
+          caption=options.caption;eq(at.y,card.y);eq(at.w<=card.w,true)
+        end,
+        Draw=function(_,body,_,client)
+          eq(client.y,card.y+panelHeight*scale)
+          for _,node in ipairs(body.children) do
+            if node.name=="PlayerHP" then
+              eq(skin,"drakah-pers-adeptus-stock");eq(node.rect.y,21)
+              eq(node.rect.h,8);eq(node.sourceGaugeCaption,"")
+              drawn=true
+            end
+          end
+          return true
+        end,
+        DrawChildren=function(_,container,_,parent)
+          rows=container.children
+          eq(#rows,2);eq(rows[1].name,"PlayerHP");eq(rows[2].name,"PlayerMana")
+          local first=realR.Geometry(rows[1],parent)
+          local second=realR.Geometry(rows[2],parent)
+          eq(first.y+first.h<=second.y,true);eq(second.y+second.h<=parent.y+parent.h,true)
+        end,
+      }
+      eq(P.Draw("PlayerWindow",source,instance,{x=10,y=30,w=sizeW*scale,h=sizeH*scale,s=scale},probe),true)
+      eq(caption,"Tester");eq(card.h,panelHeight*scale);eq(clipDepth,0)
+      eq(drawn==true,skin=="drakah-pers-adeptus-stock")
+      eq(rows~=nil,skin=="Nemesis-stock");eq(sourceHP.rect.y,originalY)
+    end
+  end
+  hs.UI.character.Gauge,hs.UI.windows.ChildShown=oldGauge,oldShown
+end
 dofile=fixtureDofile;ui.CalcTextSize=originalMeasure;ui.PopFont=originalPop
 local private={instance={},renderer=R}
 modules["lib/pack_context.lua"]=private

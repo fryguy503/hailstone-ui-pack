@@ -99,6 +99,7 @@ ui.PopStyleVar=function(n)S.vars=S.vars-n;check(S.vars>=0)end
 ui.BeginDisabled=function(value)S.disabled[#S.disabled+1]=value end;ui.EndDisabled=function()check(#S.disabled>0);table.remove(S.disabled)end
 ui.DrawImage=function(...)S.draws[#S.draws+1]=table.pack(...)end
 ui.DrawRect=function(...)record("border",...)end;ui.DrawRectFilled=function(...)record("fill",...)end
+ui.DrawRectGradient=function(...)record("gradient",...)end
 ui.DrawText=function(...)local a=table.pack(...);S.texts[#S.texts+1]=a end
 ui.SetCursorScreenPos=function(x,y)S.x,S.y=x,y end;ui.GetCursorScreenPos=function()return S.x,S.y end
 ui.GetWindowPos=function()return 0,0 end;ui.GetWindowSize=function()return 200,100 end
@@ -451,6 +452,46 @@ run("gauge offsets caps fill lines and caption use source geometry",function()
   gauge.art.drawTemplate="G";R.Draw("Test",plan(gauge),I,box)
   equal(S.draws[1][2],13);equal(S.draws[1][3],36);equal(S.draws[1][5]-S.draws[1][3],8)
   equal(#S.draws,6);equal(S.texts[1][1],17);equal(S.texts[1][2],22)
+end)
+run("partial gauge templates preserve transparent draw layers",function()
+  local I,index=artFixture()
+  index.templates.TrackOnly={fields={Background="A"}}
+  index.templates.FillOnly={fields={Fill="B"}}
+  index.templates.FrameOnly={fields={Lines="C"}}
+  for _, template in ipairs({"TrackOnly", "FillOnly", "FrameOnly"}) do
+    local gauge=node("Gauge",template,0,0,80,16)
+    gauge.art.drawTemplate=template
+    S.events,S.draws={},{}
+    R.PaintControl("Test",gauge,box,I,{fraction=0.6,caption=""})
+    equal(#S.draws,1,"only the authored gauge layer is drawn")
+    for _, event in ipairs(S.events) do check(event.kind~="fill","omitted layers remain transparent") end
+  end
+  local gauge=node("Gauge","Name",0,0,80,16)
+  S.events,S.draws={},{}
+  R.PaintControl("Test",gauge,box,I,{caption="Group member",textOnly=true})
+  equal(#S.draws,0)
+  equal(#S.events,0)
+  equal(S.texts[#S.texts][7],"Group member")
+end)
+run("health boxes shade downward and keep unavailable status distinct",function()
+  local I=fixture()
+  local function shade(fraction, tint)
+    S.events={}
+    R.PaintHealthBox(I,box,fraction,tint)
+    local paint=S.events[1]
+    equal(paint.kind,"gradient")
+    equal(paint.args[1],box.x);equal(paint.args[4],box.y+box.h)
+    equal(S.events[2].kind,"border")
+    return paint.args
+  end
+  local healthy=shade(1)
+  local wounded=shade(0)
+  local neutral=shade(nil)
+  local remote=shade(nil,{0.5,0,0.5,1})
+  check(healthy[6]>healthy[5] and healthy[6]>healthy[10],"healthy green darkens down the box")
+  check(wounded[5]>wounded[6] and wounded[5]>wounded[9],"low HP red darkens down the box")
+  equal(neutral[5],neutral[9]);equal(neutral[6],neutral[10])
+  check(remote[7]>remote[6] and remote[7]>remote[11],"explicit status tint takes precedence")
 end)
 run("linear layout skips hidden children and fills remaining client extent",function()
   local I=fixture();local flow=node("HorizontalLayoutBox","Flow",0,0,200,50,{Spacing=5,PaddingLeft=4,PaddingRight=6,PaddingTop=2,PaddingBottom=3,Style_Dividers=false})

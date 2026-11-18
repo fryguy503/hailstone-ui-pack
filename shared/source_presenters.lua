@@ -288,6 +288,88 @@ local function itemAbsolute(node,x,y,w,h)
     "LeftAnchorToLeft","RightAnchorToLeft","TopAnchorToTop","BottomAnchorToTop","Layout"})do node.fields[name]=nil end
   return node
 end
+
+local playerPanels = {
+  ["drakah-pers-adeptus-stock"] = {height = 22},
+  ["nemesis-stock"] = {height = 48, move = {PlayerHP = true, PlayerMana = true, PetHP = true}},
+}
+local preparedPlayers = setmetatable({}, {__mode = "k"})
+
+local function playerPanel(screen, instance)
+  local profile = instance and instance.profile
+  if screen == "PlayerWindow" and profile then return playerPanels[tostring(profile.id):lower()] end
+end
+
+local function playerBody(plan, panel)
+  local saved = preparedPlayers[plan]
+  if saved then return saved.body, saved.gauges end
+
+  local body, gauges = copy(plan), {}
+  local function prepare(parent)
+    local children = {}
+    for _, node in ipairs(parent.children or {}) do
+      local name = id(node)
+      if node.type == "Gauge" and panel.move and panel.move[name] then
+        gauges[name] = node
+      else
+        if node.type == "Gauge" and name == "PlayerHP" then
+          -- The legacy name rectangle extends above the window. Keep the bar
+          -- and its hit target at the authored track inside the body.
+          local rect, fields = node.rect, node.fields or {}
+          local offset = tonumber(fields.GaugeOffsetY) or 0
+          itemAbsolute(node, rect.x, rect.y + offset, rect.w, rect.h - offset)
+          node.fields.GaugeOffsetY = 0
+          node.sourceGaugeCaption = ""
+        end
+        prepare(node)
+        children[#children + 1] = node
+      end
+    end
+    parent.children = children
+  end
+  prepare(body)
+  preparedPlayers[plan] = {body = body, gauges = gauges}
+  return body, gauges
+end
+
+local function drawPlayer(screen, plan, instance, box, R, panel)
+  local body, gauges = playerBody(plan, panel)
+  local scale = box.s or 1
+  local header = math.min(panel.height * scale, math.max(0, box.h - scale))
+  local inset = math.min(4 * scale, box.w / 8)
+  local card = {x = box.x + inset, y = box.y, w = box.w - inset * 2, h = header, s = scale}
+  local fraction, gaugeName, raw, r, g, b = call("character", "Gauge", 1)
+  local name = call("character", "Name")
+  if not name or name == "" then name = gaugeName or "" end
+  local tint = r and {r, g, b, 1}
+  if header > 0 then
+    R.PaintHealthBox(instance, card, (raw == nil or raw >= 0) and fraction or nil, tint)
+    local caption = {type = "Label", name = "Hailstone_SelfName", font = gauges.PlayerHP and gauges.PlayerHP.font or 3,
+      fields = {Style_HCenter = true, Style_VCenter = true}}
+    local title = {x = card.x + inset, y = card.y, w = card.w - inset * 2, h = math.min(20 * scale, header), s = scale}
+    ui.PushClipRect(title.x, title.y, title.x + title.w, title.y + title.h, true)
+    local ok, errorText = pcall(R.PaintControl, screen, caption, title, instance,
+      {caption = name:match("^[^\r\n]*"), tint = instance.palette.text})
+    ui.PopClipRect()
+    if not ok then error(errorText, 0) end
+    if panel.move then
+      local rows, y = {}, 20 * scale
+      for _, key in ipairs({"PlayerHP", "PlayerMana", "PetHP"}) do
+        local node = gauges[key]
+        if node and call("windows", "ChildShown", screen, key) ~= false and y + 7 * scale <= header then
+          local row = itemAbsolute(copy(node), inset / scale, y / scale, title.w / scale, 7)
+          row.fields.GaugeOffsetX, row.fields.GaugeOffsetY = 0, 0
+          row.sourceGaugeCaption = ""
+          rows[#rows + 1] = row
+          y = y + 9 * scale
+        end
+      end
+      R.DrawChildren(screen, {children = rows}, instance, card)
+    end
+  end
+  return R.Draw(screen, body, instance, {x = box.x, y = box.y + header, w = box.w,
+    h = math.max(1, box.h - header), s = scale}, P)
+end
 local function managedItemNode(name)
   return name=="IconButton"or name=="ItemDescription"or name=="IDW_ModButton"or name=="IDW_ModButtonLabel"
     or name=="Hailstone_EvolvingFinalResult"or name:match("^IDW_ItemInfo%d+$")or name:match("^IDW_Row%d+Col%d+[A-Za-z]+$")
@@ -670,7 +752,8 @@ function P.Size(screen,plan,instance,R)
     end
     w,h=saved.w,saved.h
   end
-  return w,h+extrasHeight(screen,plan,instance,R)+tabsHeight(screen)+transferHeight(screen)
+  local panel = playerPanel(screen, instance)
+  return w,h+extrasHeight(screen,plan,instance,R)+tabsHeight(screen)+transferHeight(screen)+(panel and panel.height or 0)
 end
 local function chat(screen)
   local value=chats[screen]
@@ -806,6 +889,8 @@ end
 function P.Draw(screen,plan,instance,box,R)
   P.Frame()
   plan=hotPlan(screen,plan,instance,R)
+  local panel = playerPanel(screen, instance)
+  if panel and R.PaintHealthBox then return drawPlayer(screen, plan, instance, box, R, panel) end
   if family(screen)=="ItemDisplayWindow"then
     local s=box.s or 1;local transfer=transferHeight(screen)*s
     local availableHeight=math.max(1,box.h-transfer)

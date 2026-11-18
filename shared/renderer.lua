@@ -195,9 +195,11 @@ local function gaugeRole(name)
   name=tostring(name):lower()
   if name:find("target",1,true) then return "target" end
   if name:find("mana",1,true) then return "mana" end
-  if name:find("endur",1,true) or name:find("stamina",1,true) then return "endurance" end
+  if name:find("endur",1,true) or name:find("stamina",1,true) or name:find("fatigue",1,true)
+      or name:find("stagauge",1,true) then return "endurance" end
   if name:find("cast",1,true) then return "casting" end
-  if name:find("experience",1,true) or name:find("xp",1,true) or name=="aa" or name:find(".aa",1,true) then return "experience" end
+  if name:find("experience",1,true) or name:find("xp",1,true) or name:find("altadv",1,true)
+      or name=="aa" or name:find(".aa",1,true) then return "experience" end
   return "hp"
 end
 local function template(instance, reference, depth)
@@ -359,6 +361,43 @@ end
 
 local function filled(box,c) if box.w>0 and box.h>0 then ui.DrawRectFilled(box.x,box.y,box.x+box.w,box.y+box.h,unpack(c)) end end
 local function border(box,c) ui.DrawRect(box.x,box.y,box.x+box.w,box.y+box.h,c[1],c[2],c[3],c[4],0,1) end
+
+local healthLow = {0.82, 0.22, 0.18, 1}
+local healthMid = {0.82, 0.57, 0.16, 1}
+local healthHigh = {0.24, 0.69, 0.35, 1}
+
+local function mixColor(a, b, amount)
+  local result = {}
+  for channel = 1, 4 do result[channel] = a[channel] * (1 - amount) + b[channel] * amount end
+  return result
+end
+
+-- A status box shades from light to dark vertically. The overlaid HP gauge
+-- still owns the exact fraction, so the box can encode severity without moving text.
+function R.PaintHealthBox(instance, box, fraction, statusTint)
+  if box.w <= 0 or box.h <= 0 then return end
+  local background = color(instance.palette.background)
+  local tint = background
+  if statusTint then
+    tint = color(statusTint)
+  elseif fraction ~= nil then
+    local health = clamp(number(fraction), 0, 1)
+    if health < 0.5 then
+      tint = mixColor(healthLow, healthMid, health * 2)
+    else
+      tint = mixColor(healthMid, healthHigh, (health - 0.5) * 2)
+    end
+  end
+  local top = mixColor(background, tint, 0.65)
+  local bottom = mixColor(background, tint, 0.24)
+  if ui.DrawRectGradient then
+    ui.DrawRectGradient(box.x, box.y, box.x + box.w, box.y + box.h,
+      top[1], top[2], top[3], top[4], bottom[1], bottom[2], bottom[3], bottom[4])
+  else
+    filled(box, mixColor(top, bottom, 0.5))
+  end
+  border(box, mixColor(color(instance.palette.border), tint, 0.32))
+end
 
 function R.Chrome(instance, box, opts)
   opts=opts or {}; local scale=opts.s or box.s or 1
@@ -702,20 +741,31 @@ function R.DrawButton(screen,node,box,instance,caption)
 end
 
 local function gaugeArt(instance,node,box,fraction,tint,alpha)
+  if box.w <= 0 or box.h <= 0 then return end
   alpha=number(alpha,1)
   local function faded(value)
     local c=color(value);return {c[1],c[2],c[3],c[4]*alpha}
   end
   local f=nodeTemplate(instance,node,"Gauge")
-  if not f or not R.Animation(instance,f.Background,box,{1,1,1,alpha}) then filled(box,faded(instance.palette.background)) end
-  local fraction=clamp(number(fraction),0,1)
-  local vertical=truth((node.fields or {}).Vertical)
-  local clip=vertical and rect(box.x,box.y+box.h*(1-fraction),box.w,box.h*fraction) or rect(box.x,box.y,box.w*fraction,box.h)
-  ui.PushClipRect(clip.x,clip.y,clip.x+clip.w,clip.y+clip.h,true)
-  local fill=tint or instance.palette[gaugeRole(node.name)] or instance.palette.hp
-  if not f or not R.Animation(instance,f.Fill or f.Gauge,box,faded(fill)) then filled(box,faded(fill)) end
-  if f and truth((node.fields or {}).DrawLinesFill) then R.Animation(instance,f.LinesFill,box,faded(color((node.colors or {}).LinesFillTint,tint))) end
-  ui.PopClipRect()
+  local background = f and f.Background
+  -- A fill-only gauge can overlay a different track. A lines-only template
+  -- may be just a frame. Missing parts in either must remain transparent.
+  if not f or (background and background ~= "" and not R.Animation(instance,background,box,{1,1,1,alpha})) then
+    filled(box,faded(instance.palette.background))
+  end
+  fraction=clamp(number(fraction),0,1)
+  if fraction > 0 then
+    local vertical=truth((node.fields or {}).Vertical)
+    local clip=vertical and rect(box.x,box.y+box.h*(1-fraction),box.w,box.h*fraction) or rect(box.x,box.y,box.w*fraction,box.h)
+    ui.PushClipRect(clip.x,clip.y,clip.x+clip.w,clip.y+clip.h,true)
+    local fill=tint or instance.palette[gaugeRole(node.name)] or instance.palette.hp
+    local fillArt = f and (f.Fill or f.Gauge)
+    if not f or (fillArt and fillArt ~= "" and not R.Animation(instance,fillArt,box,faded(fill))) then
+      filled(box,faded(fill))
+    end
+    if f and truth((node.fields or {}).DrawLinesFill) then R.Animation(instance,f.LinesFill,box,faded(color((node.colors or {}).LinesFillTint,tint))) end
+    ui.PopClipRect()
+  end
   if f then
     R.Animation(instance,f.Lines,box,{1,1,1,alpha}); R.Frame(instance,f.Border,box,{1,1,1,alpha},box.s)
     local lw=natural(instance,f.EndCapLeft);local rw=natural(instance,f.EndCapRight);local s=box.s or 1
@@ -723,12 +773,27 @@ local function gaugeArt(instance,node,box,fraction,tint,alpha)
     R.Animation(instance,f.EndCapRight,rect(box.x+math.max(0,box.w-rw*s),box.y,math.min(box.w,rw*s),box.h),{1,1,1,alpha})
   end
 end
+function R.GaugeTrackRect(node, box, instance)
+  local fields = node.fields or {}
+  local scale = box.s or 1
+  local art = nodeTemplate(instance, node, "Gauge") or {}
+  local _, height = natural(instance, art.Background)
+  if height == 0 then _, height = natural(instance, art.Fill or art.Gauge or art.Lines) end
+  local x = number(fields.GaugeOffsetX) * scale
+  local y = number(fields.GaugeOffsetY) * scale
+  local track = rect(box.x + x, box.y + y, box.w - x, box.h - y)
+  track.s = scale
+  if height > 0 then track.h = math.min(track.h, height * scale) end
+  return track
+end
+
 local function drawGauge(instance,screen,node,box,options)
   local fraction,caption,tint=B.Gauge(screen,node)
   options=options or {}
   if options.fraction~=nil then fraction=options.fraction end
-  if options.caption~=nil then caption=options.caption end
-  if fraction==nil then return end
+  if options.caption~=nil then caption=options.caption
+  elseif node.sourceGaugeCaption~=nil then caption=node.sourceGaugeCaption end
+  if fraction==nil and not options.textOnly then return end
   tint=options.tint or tint
   local alpha=1
   if screen=="BreathWindow" and tonumber(node.gaugeEqType or node.eqType)==8 then
@@ -739,11 +804,11 @@ local function drawGauge(instance,screen,node,box,options)
     caption=string.format("%d%%",math.floor(remaining*100+0.5))
   end
   local f=node.fields or {};local s=box.s or 1
-  local t=nodeTemplate(instance,node,"Gauge") or {};local _,height=natural(instance,t.Background or t.Fill)
-  local offsetX,offsetY=number(f.GaugeOffsetX)*s,number(f.GaugeOffsetY)*s
-  local track={x=box.x+offsetX,y=box.y+offsetY,w=math.max(0,box.w-offsetX),h=math.max(0,box.h-offsetY),s=s}
-  if height>0 then track.h=math.min(track.h,height*s) end
-  gaugeArt(instance,node,track,fraction,tint or color((node.colors or {}).FillTint,instance.palette.hp),alpha)
+  if not options.textOnly then
+    local track=R.GaugeTrackRect(node,box,instance)
+    local palette = instance.palette[gaugeRole(node.name)] or instance.palette.hp
+    gaugeArt(instance,node,track,fraction,tint or color((node.colors or {}).FillTint,palette),alpha)
+  end
   if caption~="" then
     local label=rect(box.x+number(f.TextOffsetX)*s,box.y+number(f.TextOffsetY)*s,box.w,box.h)
     text(instance,node,label,caption,B.Color(screen,node,"text")

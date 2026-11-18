@@ -361,5 +361,207 @@ do
   equal(unused.rect.w,0,"the source's unused placeholder stays untouched")
   R.VisitChildren=nil
 end
+-- Populated group contracts: authored fixtures carry only layout facts and
+-- symbolic resource names. No game bitmap is created or copied by these tests.
+local GR={};for key,value in pairs(R)do GR[key]=value end
+function GR.Geometry(n,parent)
+  local r=n.rect or{};return{x=parent.x+(r.x or 0)*(parent.s or 1),y=parent.y+(r.y or 0)*(parent.s or 1),
+    w=(r.w or 0)*(parent.s or 1),h=(r.h or 0)*(parent.s or 1),s=parent.s or 1}
+end
+function GR.GaugeTrackRect(n,at)
+  local y=(n.fields.GaugeOffsetY or 0)*(at.s or 1)
+  return{x=at.x,y=at.y+y,w=at.w,h=math.max(0,at.h-y),s=at.s or 1}
+end
+function GR.MeasureText(_,n,text)return #tostring(text)*7,12 end
+function GR.PaintText(_,n,at,_,text)
+  S.captions=S.captions or{};S.captions[n.name]={text=text,at=at}
+  S.captionList=S.captionList or{};S.captionList[#S.captionList+1]={node=n,text=text}
+end
+function GR.PaintHealthBox(_,at,fraction,tint)
+  S.health=S.health or{};S.health[#S.health+1]={at=at,fraction=fraction,tint=tint}
+end
+function GR.Draw(screen,p,inst,at)
+  local function visit(parent,box)
+    for _,n in ipairs(parent.children or{})do
+      local visible=M.Shown(screen,n)
+      if visible~=false and(visible~=nil or windows.ChildShown(screen,n.name)~=false)then
+        local child=GR.Geometry(n,box)
+        if not M.DrawControl(screen,n,child,inst,GR)then GR.PaintControl(screen,n,child,inst)end
+        visit(n,child)
+      end
+    end
+  end
+  S.drawn=p;visit(p,at);return true
+end
+local function groups(kind)
+  local p=plan({},kind=="compact"and 180 or 155,kind=="compact"and 168 or 205)
+  p.children={node("StaticAnimation","FixturePanel",0,0,p.rect.w,p.rect.h)}
+  local function add(n)p.children[#p.children+1]=n;return n end
+  if kind=="compact"then
+    add(node("Gauge","Gauge0",37,-4,100,24,1)).fields={GaugeOffsetY=16,GaugeDrawTemplate={Fill="FixtureHP"},TextOffsetX=300}
+    add(node("Label","TargetPercentage",-2,9,34,14,19))
+    for _,x in ipairs{-21,-45,-69}do
+      add(node("Gauge","TK_gauge",x,5,95,21,1)).fields={GaugeDrawTemplate={Fill="FixturePlate"}}
+    end
+  end
+  for row=1,5 do
+    local top=kind=="compact"and 36+(row-1)*24 or 15+(row-1)*30
+    local primary=add(node("Gauge","Gauge"..row,kind=="compact"and 37 or 11,top,kind=="compact"and 100 or 137,kind=="compact"and 21 or 26,10+row))
+    primary.fields=kind=="compact"and{GaugeOffsetY=16,TextOffsetX=3,TextOffsetY=3,GaugeDrawTemplate={Fill="FixtureHP"}}or{TextOffsetX=40}
+    if kind=="compact"then
+      for _,x in ipairs{-21,-45,-69}do add(node("Gauge","TK_gauge",x,top+6,95,21,10+row)).fields={GaugeDrawTemplate={Fill="FixturePlate"}}end
+      add(node("Label","TargetPercentage",-2,top+10,34,14,34+row))
+    else
+      add(node("Gauge","GW_Gauge"..row,38,top+14,108,8,10+row)).fields={GaugeOffsetY=0,TextOffsetY=-100,GaugeDrawTemplate={Fill="FixtureHP"}}
+      add(node("Label","HPLabel"..row,13,top+8,21,12,34+row))
+    end
+    local resourceY=top+(kind=="compact"and 21 or 23)
+    add(node("Gauge",kind=="compact"and"ManaGauge1"or"ManaGauge"..row,37,resourceY,100,kind=="compact"and 3 or 4,30+row)).fields={GaugeOffsetY=kind=="compact"and -2 or 0,GaugeDrawTemplate={Fill="FixtureMana"}}
+    add(node("Gauge","GW_STAGauge"..row,37,resourceY+(kind=="compact"and 3 or 0),100,kind=="compact"and 3 or 4,35+row)).fields={GaugeOffsetY=kind=="compact"and -2 or 0,GaugeDrawTemplate={Fill="FixtureEndurance"}}
+    add(node("Gauge","PetGauge"..row,37,top+(kind=="compact"and 27 or 20),100,kind=="compact"and 2 or 3,kind=="compact"and 39+row or 16+row)).fields={GaugeOffsetY=kind=="compact"and -2 or 0,GaugeDrawTemplate={Fill="FixturePet"}}
+    add(node("Button","GroupRoleTank"..row,114,top,15,15))
+  end
+  add(node("Button","InviteButton",11,168,50,26));add(node("Button","DisbandButton",93,168,50,26))
+  add(node("Button","LFGButton",64,kind=="compact"and 268 or 168,26,26))
+  return p
+end
+local function members()
+  S.gauges={[1]={.75,"Self",75},[11]={1,"FixtureOne",100},[12]={.55,"FixtureTwo",55},
+    [13]={1,"RemoteMember",-2,.3,.1,.1},[14]={0,"",-1},[15]={0,"DeadMember",-3,.4,0,0}}
+  for row=1,5 do
+    S.gauges[30+row]={.5,"Member resource",50};S.gauges[35+row]={.4,"Member resource",40};S.gauges[16+row]={.6,"Companion",60}
+  end
+  S.shown.ManaGauge1=false;S.shown.ManaGauge2=true
+end
+local function collect(p)
+  local out={};local function visit(n)
+    out[n.name]=out[n.name]or{};out[n.name][#out[n.name]+1]=n
+    for _,child in ipairs(n.children or{})do visit(child)end
+  end
+  visit(p);return out
+end
+do
+  reset();members();local p=plan({},147,260);p.children={}
+  for _,spec in ipairs{{"Gauge1",11,2,35},{"ManaGauge1",31,28,8},{"STAGauge1",36,32,4},{"PetGauge1",17,37,6}}do
+    local n=node("Gauge",spec[1],20,spec[3],127,spec[4],spec[2]);n.fields.GaugeDrawTemplate={Fill="FixtureBar"};p.children[#p.children+1]=n
+  end
+  local inst=instance();inst.profile={source="default"}
+  local prepared,w,h=M.GroupLayout(p,inst,GR);equal(w,147);equal(h,260);check(not prepared.statusGroupReflow)
+  for index,n in ipairs(prepared.children)do
+    for _,key in ipairs{"x","y","w","h"}do equal(n.rect[key],p.children[index].rect[key],"stock geometry")end
+  end
+  M.Draw("GroupWindow",p,inst,{x=0,y=0,w=147,h=260,s=1},GR)
+  for _,paint in ipairs(S.paint)do
+    if paint.node.name=="Gauge1"then equal(paint.opts,nil,"stock caption keeps native placement/text")
+    else equal(paint.opts.caption,"","supplemental tracks never repeat member/pet names")end
+  end
+  GR.ChromeInsets=function()return{left=4,right=4,top=20,bottom=4}end
+  local _,outerW,outerH=M.GroupLayout(p,instance(),GR);equal(outerW,147);equal(outerH,260,"chrome counted once")
+  GR.ChromeInsets=nil
+end
+for _,entry in ipairs{{"portrait","drakah-pers-adeptus-stock"},{"compact","Nemesis-stock"}}do
+  reset();members();local p=groups(entry[1]);local inst=instance();inst.profile={source=entry[2]}
+  local prepared,w,h=M.GroupLayout(p,inst,GR);local by=collect(prepared)
+  check(prepared.statusGroupReflow);check(h>=p.rect.h);check(M.OwnsScroll("GroupWindow",p,inst))
+  local lastBottom=0;local boxCount=0
+  for row=1,5 do
+    local primary=by["Gauge"..row][1]
+    check(primary.rect.y>=lastBottom);lastBottom=primary.rect.y+primary.rect.h
+    check(lastBottom<=h);check(primary.statusGroupPaintBox~=nil)
+    equal(primary.statusGroupNameOnly,entry[1]=="portrait")
+    local health=by["Hailstone_GroupHealthBox"..row][1];boxCount=boxCount+1
+    check(health.rect.x>=0 and health.rect.x+health.rect.w<=w)
+  end
+  equal(boxCount,5);check(by.InviteButton[1].rect.y>=lastBottom)
+  check(by.DisbandButton[1].rect.y+by.DisbandButton[1].rect.h<=h)
+  local mana2
+  for _,n in ipairs(by[entry[1]=="compact"and"ManaGauge1"or"ManaGauge2"])do if n.statusGroupRow==2 then mana2=n end end
+  check(mana2~=nil);equal(mana2.statusNativeName,"ManaGauge2");equal(M.Shown("GroupWindow",mana2),true)
+  for _,n in ipairs(by.ManaGauge1)do if n.statusGroupRow==1 then equal(M.Shown("GroupWindow",n),false)end end
+  equal(by.PetGauge2[1].gaugeEqType,18,"legacy pet IDs map to current pet contract")
+  for _,list in pairs(by)do for _,n in ipairs(list)do
+    if n.type=="Gauge"and n.statusGroupPaintOnly then equal(n.sourceGaugeCaption,"")end
+    if n.name=="TK_gauge"then equal(n.statusReplaced,true)end
+  end end
+  local oldPrimary=collect(p).Gauge1[1];equal(oldPrimary.statusGroupName,nil,"source plan remains immutable")
+  M.Draw("GroupWindow",p,inst,{x=0,y=0,w=w,h=h,s=1},GR)
+  equal(#S.health,entry[1]=="compact"and 6 or 5)
+  local neutral,remote=false,false
+  for _,health in ipairs(S.health)do
+    if health.fraction==nil then neutral=true end
+    if health.tint and health.tint[1]==.3 then remote=true end
+  end
+  check(neutral);check(remote)
+  if entry[1]=="compact"then
+    local selfPercent,secondPercent
+    for _,paint in ipairs(S.captionList)do
+      if paint.node.statusHealthPercentGauge==1 then selfPercent=paint.text end
+      if paint.node.statusHealthPercentGauge==12 then secondPercent=paint.text end
+    end
+    equal(selfPercent,"75");equal(secondPercent,"55")
+  end
+  S.click=true;local primary=by.Gauge2[1]
+  M.DrawControl("GroupWindow",primary,{x=primary.rect.x,y=primary.rect.y,w=primary.rect.w,h=primary.rect.h,s=1},inst,GR)
+  equal(events("click")[1][3],"Gauge2");equal(events("click")[1][4],"left")
+  S.click=false;S.right=true
+  M.DrawControl("GroupWindow",primary,{x=primary.rect.x,y=primary.rect.y,w=primary.rect.w,h=primary.rect.h,s=1},inst,GR)
+  equal(events("click")[2][3],"Gauge2");equal(events("click")[2][4],"right")
+  S.right=false
+  equal(M.GroupLayout(p,inst,GR),prepared,"default size key remains cached")
+  local resized=M.GroupLayout(p,inst,GR,w+20,h,1)
+  equal(M.GroupLayout(p,inst,GR),prepared,"size/draw cache keys coexist")
+  equal(M.GroupLayout(p,inst,GR,w+20,h,1),resized)
+  for n=1,5 do M.GroupLayout(p,inst,GR,w+n,h,1)end
+  check(M.GroupLayout(p,inst,GR)~=prepared,"resize history is bounded")
+end
+do
+  reset();members();local p=groups("portrait");local inst=instance();inst.profile={source="drakah-pers-adeptus-stock"}
+  local opened,closed=0,0
+  ui.BeginChild=function()opened=opened+1;return true end
+  ui.EndChild=function()closed=closed+1 end
+  ui.GetCursorScreenPos=function()return 0,0 end
+  ui.GetContentRegionAvail=function()return 143,100 end
+  ui.Dummy=function()end
+  check(M.Draw("GroupWindow",p,inst,{x=0,y=0,w=155,h=100,s=1},GR))
+  equal(opened,1);equal(closed,1)
+  local draw=GR.Draw;GR.Draw=function()error("controlled group drawing failure")end
+  check(not pcall(M.Draw,"GroupWindow",p,inst,{x=0,y=0,w=155,h=100,s=1},GR))
+  equal(opened,2);equal(closed,2,"scroll scope closes before error propagation")
+  GR.Draw=draw
+end
+
+-- Resolve all twenty actual portable group graphs. Caption suppression and
+-- aliases are shared; procedural cells/reflow are limited to selected profiles.
+do
+  local originalDofile=dofile;local selected="default"
+  dofile=function(path)
+    if path=="lib/pack_bindings.lua"then return originalDofile("shared/bindings.lua")end
+    if path:sub(1,12)=="lib/layouts/"then return originalDofile("layouts/"..selected.."/"..path:sub(13))end
+    return originalDofile(path)
+  end
+  hs.UI.interfaces={LoadBase=function(path)return originalDofile("layouts/default/"..path:sub(13))end}
+  local real=originalDofile("shared/renderer.lua")
+  local skins={"default","default_old","aya-stock","delta-stock","drakah-pers-adeptus-stock","DuxaUI-stock",
+    "Graphite-stock","ib-stock","lodidodi-stock","Lords-stock","Nemesis-stock","po2-stock","po2alt-stock",
+    "qqcustom-stock","qqui-stock","sars-stock","Sparxx-stock","Takus-stock","vert-stock","wow-stock"}
+  for _,skin in ipairs(skins)do
+    reset();members();selected=skin
+    local inst=real.New(originalDofile("ui/"..skin.."/lib/pack_profile.lua"));local source=real.Resolve("GroupWindow",inst)
+    check(source~=nil)
+    local prepared,w,h=M.GroupLayout(source,inst,real)
+    local adapted=skin=="drakah-pers-adeptus-stock"or skin=="Nemesis-stock"
+    equal(prepared.statusGroupReflow,adapted,skin)
+    local markers,quiet=0,0
+    for _,list in pairs(collect(prepared))do for _,n in ipairs(list)do
+      if n.statusHealthRow~=nil then markers=markers+1;check(n.rect.w>0 and n.rect.h>0)end
+      if n.statusGroupQuiet then equal(n.sourceGaugeCaption,"");quiet=quiet+1 end
+      if n.statusNativeName=="ManaGauge2"then equal(M.Shown("GroupWindow",n),true)end
+    end end
+    if adapted then equal(markers,skin=="Nemesis-stock"and 6 or 5);check(h>0 and w>0)
+    else equal(markers,0);equal(w,source.rect.w);equal(h,source.rect.h)end
+    check(quiet>=5,skin.." retains quiet resource strips")
+  end
+  dofile=originalDofile
+end
 equal(S.fonts or 0,0,"font stack")
 print("source status presenters: "..total.." assertions passed")

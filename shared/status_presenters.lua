@@ -17,7 +17,7 @@ local function number(n,default) return type(n)=="number" and n==n and n~=math.h
 local function clone(value)
   if type(value)~="table" then return value end
   local out={};for k,v in pairs(value)do out[k]=clone(v)end
-  return setmetatable(out,getmetatable(value))
+  local meta=getmetatable(value);if type(meta)=="table"then setmetatable(out,meta)end;return out
 end
 local function walk(node,visit,depth)
   depth=depth or 0;if depth>64 then return false end
@@ -156,6 +156,7 @@ local function gemIndex(node)
   return n and n<12 and n or nil
 end
 local function rowFor(screen,node)
+  if screen=="GroupWindow"and node.statusGroupRow then return node.statusGroupRow,"Gauge"..node.statusGroupRow,node.statusGroupRole end
   local name=id(node)
   if screen=="GroupWindow"then
     for _,prefix in ipairs{"Gauge","HPLabel","HPPercLabel","ManaGauge","ManaLabel","ManaPercLabel",
@@ -177,8 +178,256 @@ local function rowFor(screen,node)
   end
 end
 
+local function groupRole(node)
+  local name=id(node):gsub("^GW_","")
+  local lower=name:lower();local eq=tonumber(node.gaugeEqType or node.eqType)
+  local n=tonumber(lower:match("petgauge(%d+)$"))
+  if n and n>=1 and n<=5 then return n,"pet","PetGauge"..n,16+n end
+  if node.type=="Gauge"then
+    if eq and eq>=31 and eq<=35 then n=eq-30;return n,"mana","ManaGauge"..n,eq end
+    if eq and eq>=36 and eq<=40 then n=eq-35;return n,"endurance","STAGauge"..n,eq end
+    if eq and eq>=17 and eq<=21 then n=eq-16;return n,"pet","PetGauge"..n,eq end
+    if eq and eq>=11 and eq<=15 then n=eq-10;return n,"hp","Gauge"..n,eq end
+  end
+  for _,entry in ipairs{{"hplabel","percent","HPLabel"},{"hpperclabel","unit","HPPercLabel"},
+    {"manalabel","label","ManaLabel"},{"manaperclabel","label","ManaPercLabel"},
+    {"stalabel","label","STALabel"},{"staperclabel","label","STAPercLabel"},
+    {"grouproletank","role","GroupRoleTank"},{"grouproleassist","role","GroupRoleAssist"},
+    {"grouprolepuller","role","GroupRolePuller"},{"aggropctplayer","label","GW_AggroPctPlayer"}}do
+    n=tonumber(lower:match("^"..entry[1].."(%d+)$"))
+    if n and n>=1 and n<=5 then return n,entry[2],entry[3]..n end
+  end
+  if node.type=="Label"and name=="TargetPercentage"and eq and eq>=35 and eq<=39 then
+    n=eq-34;return n,"percent","HPLabel"..n
+  end
+end
+local function absolute(node,at)
+  node.rect={x=at.x,y=at.y,w=math.max(0,at.w),h=math.max(0,at.h)}
+  node.anchors={explicit={left=false,right=false,top=false,bottom=false}}
+  node.fields=clone(node.fields or{})
+  for _,key in ipairs{"LeftAnchorOffset","RightAnchorOffset","TopAnchorOffset","BottomAnchorOffset","Layout"}do node.fields[key]=nil end
+end
+-- Normalize shared group semantics without changing the skin's resources.
+-- Only boxed layouts that cannot fit their own resource strips need reflow.
+function M.GroupLayout(plan,instance,R,clientWidth,clientHeight,scale)
+  local s=state(instance,"GroupWindow");scale=math.max(.01,number(scale,1))
+  local insets=R and R.ChromeInsets and R.ChromeInsets(plan,instance,1)or{}
+  local designW,designH=math.max(1,number((plan.rect or{}).w,200)),math.max(1,number((plan.rect or{}).h,100))
+  local width=math.max(1,number(clientWidth,designW-number(insets.left)-number(insets.right)))
+  local height=math.max(1,number(clientHeight,designH-number(insets.top)-number(insets.bottom)))
+  local metrics={tostring(width),tostring(height),tostring(call("settings","Option","font_face") or "")}
+  if R and R.MeasureText then
+    for font=1,3 do local w,h=R.MeasureText(instance,{font=font},"Wg");metrics[#metrics+1]=w/scale..":"..h/scale end
+  end
+  local key=table.concat(metrics,"|")
+  s.groupCache=s.groupOriginal==plan and s.groupCache or{};s.groupOriginal=plan
+  for index,record in ipairs(s.groupCache)do if record.key==key then
+    table.remove(s.groupCache,index);table.insert(s.groupCache,1,record);return record.plan,record.width,record.height
+  end end
+  local prepared=clone(plan);local rows,nodes={},{};local nested=false
+  local profile=instance.profile or{}
+  local source=tostring(profile.source or profile.id or""):lower()
+  local boxedProfile=source=="drakah-pers-adeptus-stock"or source=="nemesis-stock"
+  local function geometry(node,parent)
+    if R and R.Geometry then
+      local at=R.Geometry(node,parent);local r=node.rect or{};local f=node.fields or{}
+      if f.AutoStretch~=true then
+        if number(r.w)>0 and at.w<=0 then at.x,at.w=parent.x+number(r.x),r.w end
+        if number(r.h)>0 and at.h<=0 then at.y,at.h=parent.y+number(r.y),r.h end
+      end
+      return at
+    end
+    local r=node.rect or{};return{x=parent.x+number(r.x),y=parent.y+number(r.y),w=number(r.w),h=number(r.h),s=1}
+  end
+  local function index(node,parent,depth)
+    depth=depth or 0;if depth>1 then nested=true end
+    local at=node==prepared and parent or geometry(node,parent)
+    if node~=prepared then nodes[#nodes+1]={node=node,at=at,depth=depth}end
+    local row,role,native,eq=groupRole(node)
+    if row then
+      node.statusGroupRow,node.statusGroupRole,node.statusNativeName=row,role,native
+      if eq then node.gaugeEqType,node.eqType=eq,eq end
+      rows[row]=rows[row]or{nodes={}};local record={node=node,at=at,role=role}
+      rows[row].nodes[#rows[row].nodes+1]=record
+      if role=="percent"then rows[row].percent=record end
+      if role=="hp"then
+        local f=node.fields or{};local score=(id(node)=="Gauge"..row and 4 or 0)+(at.x>=0 and 2 or 0)
+          +(number(f.TextOffsetY)>-20 and 2 or 0)+(number(f.TextOffsetX)>=0 and 2 or 0)
+        if not rows[row].score or score>rows[row].score then rows[row].primary=record;rows[row].score=score end
+      elseif role=="mana"or role=="endurance"or role=="pet"then rows[row][role]=record end
+    end
+    for _,child in ipairs(node.children or{})do index(child,at,depth+1)end
+  end
+  index(prepared,{x=0,y=0,w=designW,h=designH,s=1})
+  local boxes,adapt={},{}
+  for row,record in pairs(rows)do
+    local primary,percent=record.primary,record.percent
+    if primary then
+      local own=(primary.node.fields or{}).GaugeDrawTemplate
+      record.nameOnly=own==nil or own==""or type(own)=="table"and next(own)==nil
+      local negative
+      for _,entry in ipairs(record.nodes)do
+        if entry.role=="hp"and number((entry.node.rect or{}).x)<0 then negative=entry end
+      end
+      if boxedProfile and percent and(record.nameOnly or negative)then
+        local p=percent.at;local cell
+        if record.nameOnly then
+          cell={x=primary.at.x,y=primary.at.y,w=math.min(primary.at.h,primary.at.w),h=primary.at.h}
+        else
+          cell={x=math.max(0,p.x),y=negative.at.y,w=math.min(p.x+p.w,primary.at.x-2)-math.max(0,p.x),h=negative.at.h}
+        end
+        if cell.w>0 and cell.h>0 then boxes[row]=cell;adapt[row]=true end
+      end
+      for _,entry in ipairs(record.nodes)do
+        local n=entry.node
+        if n.type=="Gauge"and entry~=primary then n.sourceGaugeCaption="";n.statusGroupQuiet=true end
+      end
+      primary.node.statusGroupName=true;primary.node.statusGroupNameOnly=record.nameOnly
+    end
+  end
+  -- Some compact group skins include the player's own leading health cell.
+  -- It is not a sixth group member and retains the source's self controls.
+  local selfPercent,selfLayer
+  for _,entry in ipairs(nodes)do
+    local eq=tonumber(entry.node.gaugeEqType or entry.node.eqType)
+    if entry.node.type=="Label"and id(entry.node)=="TargetPercentage"and eq==19 then selfPercent=entry end
+    if boxedProfile and entry.node.type=="Gauge"and eq==1 and number((entry.node.rect or{}).x)<0 then selfLayer=entry;entry.node.statusReplaced=true end
+    if entry.node.type=="Gauge"and(eq==2 or eq==3 or eq==16)then entry.node.sourceGaugeCaption=""end
+  end
+  if selfPercent and selfLayer then
+    boxes[0]={x=math.max(0,selfPercent.at.x),y=selfLayer.at.y,w=math.min(34,selfPercent.at.w),h=selfLayer.at.h}
+    selfPercent.node.statusHealthPercentGauge=1
+  end
+  local reflow=next(adapt)~=nil and not nested
+  local naturalH=height
+  if reflow then
+    local ordered={};for row=1,5 do if rows[row]and rows[row].primary then ordered[#ordered+1]=row end end
+    local extra,bottom=0,0
+    local function track(entry)
+      if R and R.GaugeTrackRect then return R.GaugeTrackRect(entry.node,entry.at,instance)end
+      local f=entry.node.fields or{};return{x=entry.at.x,y=entry.at.y+number(f.GaugeOffsetY),w=entry.at.w,h=math.max(1,entry.at.h-number(f.GaugeOffsetY))}
+    end
+    for index,row in ipairs(ordered)do
+      local record=rows[row];local originalTop=record.primary.at.y
+      for _,entry in ipairs(record.nodes)do if entry~=record.primary then entry.node.statusGroupPaintOnly=true end end
+      if record.percent then record.percent.node.statusHealthPercentGauge=10+row end
+      local top=math.max(originalTop+extra,bottom>0 and bottom+2 or originalTop)
+      local delta=top-originalTop
+      for _,entry in ipairs(record.nodes)do entry.at.y=entry.at.y+delta end
+      local primary=record.primary;local f=primary.node.fields or{}
+      local _,textH=12,12
+      if R and R.MeasureText then _,textH=R.MeasureText(instance,primary.node,"Ag");textH=textH/scale end
+      local nameBottom=primary.at.y+math.max(0,number(f.TextOffsetY))+textH
+      local hp
+      for _,entry in ipairs(record.nodes)do if entry.role=="hp"and entry.at.x>=0 and(not record.nameOnly or entry~=primary)then hp=entry;break end end
+      local endY=nameBottom
+      if hp then local band=track(hp)
+        if band.y<nameBottom+1 then hp.at.y=hp.at.y+nameBottom+1-band.y;band=track(hp)end
+        endY=math.max(endY,band.y+band.h)
+      end
+      local mana,endurance=record.mana,record.endurance
+      if mana and endurance then
+        local left=math.min(mana.at.x,endurance.at.x);local right=math.max(mana.at.x+mana.at.w,endurance.at.x+endurance.at.w)
+        local half=math.max(1,(right-left-2)/2)
+        mana.at.x,mana.at.w=left,half;endurance.at.x,endurance.at.w=left+half+2,half
+        local first,second=track(mana),track(endurance);local y=math.max(endY+1,math.min(first.y,second.y))
+        mana.at.y=mana.at.y+y-first.y;endurance.at.y=endurance.at.y+y-second.y
+        endY=math.max(y+first.h,y+second.h)
+      else
+        local resource=mana or endurance
+        if resource then local band=track(resource);local y=math.max(endY+1,band.y);resource.at.y=resource.at.y+y-band.y;endY=y+band.h end
+      end
+      if record.pet then local band=track(record.pet);local y=math.max(endY+1,band.y);record.pet.at.y=record.pet.at.y+y-band.y;endY=y+band.h end
+      if boxes[row]then boxes[row].y=boxes[row].y+delta;endY=math.max(endY,boxes[row].y+boxes[row].h)end
+      bottom=math.max(endY,primary.at.y+primary.at.h)
+      record.primary.node.statusGroupHit={x=boxes[row]and boxes[row].x or primary.at.x,y=top,
+        w=primary.at.x+primary.at.w-(boxes[row]and boxes[row].x or primary.at.x),h=bottom-top}
+      local nextRow=ordered[index+1]
+      if nextRow then extra=math.max(extra,bottom+2-rows[nextRow].primary.at.y)end
+    end
+    local footerTop=bottom+4
+    for _,entry in ipairs(nodes)do
+      local n=entry.node;local name=id(n)
+      if not n.statusGroupRow and(name=="LFGButton"or(name=="InviteButton"or name=="DisbandButton"or name=="FollowButton"or name=="DeclineButton")and entry.at.y>designH*.6)then
+        entry.at.y=math.max(footerTop,entry.at.y+extra)
+        if entry.at.y>designH*1.5 then entry.at.y=footerTop end
+        naturalH=math.max(naturalH,entry.at.y+entry.at.h+6)
+      end
+    end
+    naturalH=math.max(naturalH,bottom+6)
+    local xScale=width/designW
+    for _,entry in ipairs(nodes)do
+      if entry.node.statusGroupRow then
+        if entry.node.type=="Gauge"and number((entry.node.rect or{}).x)<0 and boxes[entry.node.statusGroupRow]then entry.node.statusReplaced=true end
+      end
+      local at=entry.at
+      at.x,at.w=at.x*xScale,at.w*xScale
+      if entry.node.statusGroupName then
+        entry.node.fields=clone(entry.node.fields or{})
+        entry.node.fields.TextOffsetX=number(entry.node.fields.TextOffsetX)*xScale
+      end
+      if entry.node.type=="StaticAnimation"and at.y==0 and number((entry.node.rect or{}).h)>=designH*.8 then at.w=width;at.h=math.max(height,naturalH)end
+      absolute(entry.node,at)
+      local hit=entry.node.statusGroupHit
+      if hit then hit.x,hit.w=hit.x*xScale,hit.w*xScale end
+    end
+    local overlays={}
+    local maskLeft,maskTop,maskRight,maskBottom=width,height,0,0
+    for row,cell in pairs(boxes)do
+      local marker={type="StaticFrame",name="Hailstone_GroupHealthBox"..row,item="",children={},fields={},font=2,
+        statusHealthRow=row,rect={x=cell.x*xScale,y=cell.y,w=cell.w*xScale,h=cell.h},anchors={explicit={left=false,right=false,top=false,bottom=false}}}
+      overlays[#overlays+1]=marker
+      maskLeft=math.min(maskLeft,cell.x*xScale-1);maskRight=math.max(maskRight,(cell.x+cell.w)*xScale+1)
+      maskTop=math.min(maskTop,cell.y-1);maskBottom=math.max(maskBottom,cell.y+cell.h+1)
+    end
+    if #overlays>0 then
+      table.insert(overlays,1,{type="StaticFrame",name="Hailstone_GroupHealthColumn",item="",children={},fields={},
+        statusHealthColumn=true,rect={x=math.max(0,maskLeft),y=math.max(0,maskTop),w=maskRight-math.max(0,maskLeft),h=maskBottom-math.max(0,maskTop)},
+        anchors={explicit={left=false,right=false,top=false,bottom=false}}})
+    end
+    local after=0;for index,n in ipairs(prepared.children)do if n.type=="StaticAnimation"then after=index end end
+    for index,n in ipairs(overlays)do table.insert(prepared.children,after+index,n)end
+  end
+  if not reflow and not nested then
+    for _,entry in ipairs(nodes)do
+      local at=geometry(entry.node,{x=0,y=0,w=width,h=height,s=1})
+      for k,v in pairs(at)do entry.at[k]=v end
+    end
+  end
+  if not nested then
+    for row,record in pairs(rows)do if record.primary then
+      local primary=record.primary;local left,top,right,bottom=primary.at.x,primary.at.y,primary.at.x+primary.at.w,primary.at.y+primary.at.h
+      for _,entry in ipairs(record.nodes)do
+        if not entry.node.statusReplaced and entry.at.x>=0 then
+          local at=entry.at
+          if entry.node.type=="Gauge"and entry~=primary and R and R.GaugeTrackRect then at=R.GaugeTrackRect(entry.node,entry.at,instance)end
+          left,top=math.min(left,at.x),math.min(top,at.y);right,bottom=math.max(right,at.x+at.w),math.max(bottom,at.y+at.h)
+        end
+      end
+      if boxes[row]then left=math.min(left,boxes[row].x*width/designW)end
+      for _,entry in ipairs(nodes)do if id(entry.node)=="GW_Voice"..row then right=math.min(right,entry.at.x)end end
+      primary.node.statusGroupOrigin={x=primary.at.x,y=primary.at.y}
+      primary.node.statusGroupHit={x=left,y=top,w=math.max(1,right-left),h=math.max(1,bottom-top)}
+      local f=primary.node.fields or{};local textStart=primary.at.x+math.max(0,number(f.TextOffsetX))
+      local textRight=math.min(primary.at.x+primary.at.w,right)
+      for _,entry in ipairs(record.nodes)do if entry.role=="role"then textRight=math.min(textRight,entry.at.x-2)end end
+      primary.node.statusGroupTextWidth=math.max(1,textRight-textStart)
+      primary.node.statusGroupFitName=reflow
+      if reflow then primary.node.statusGroupPaintBox=clone(primary.at);absolute(primary.node,primary.node.statusGroupHit)end
+    end end
+  end
+  prepared.statusGroupLayout=true;prepared.statusGroupReflow=reflow;prepared.rect={x=0,y=0,w=width,h=math.max(height,naturalH)}
+  s.groupOwnsScroll=reflow
+  local record={key=key,plan=prepared,width=width+number(insets.left)+number(insets.right),height=math.max(height,naturalH)+number(insets.top)+number(insets.bottom)}
+  table.insert(s.groupCache,1,record);if #s.groupCache>4 then table.remove(s.groupCache)end
+  return prepared,record.width,record.height
+end
+
 function M.Handles(screen)return families[screen]==true end
-function M.Shown(screen,node)if node.statusReplaced then return false end end
+function M.Shown(screen,node)
+  if node.statusReplaced then return false end
+  if screen=="GroupWindow"and node.statusNativeName then return call("windows","ChildShown",screen,node.statusNativeName)end
+end
 function M.CanDraw(screen,plan,instance)
   if not M.Handles(screen)then return false,"Not a source status presenter"end
   if type(plan)~="table"or plan.type~="Screen"or type(plan.children)~="table"then return false,"Missing source status graph"end
@@ -207,6 +456,7 @@ end
 -- Keep every authored node in place. Extra usable gems/buffs/target rows use a
 -- source control's artwork in an appended area instead of silently disappearing.
 local function prepare(screen,plan,instance,R)
+  if screen=="GroupWindow"then return M.GroupLayout(plan,instance,R)end
   local s=state(instance,screen);local frame=ui.GetFrameCount()
   if s.prepared and s.frame==frame and s.original==plan then return s.prepared,s.width,s.height end
   s.original,s.frame=plan,frame
@@ -404,7 +654,32 @@ local function buffMenu(screen,instance)
   ui.EndPopup()
 end
 local function drawRow(screen,node,box,instance,R,row,canonical)
-  R.PaintControl(screen,node,box,instance)
+  local paintBox=box;local sourceBox=node.statusGroupPaintBox
+  if sourceBox then
+    local s=box.s or 1;local at=node.rect
+    paintBox={x=box.x+(sourceBox.x-at.x)*s,y=box.y+(sourceBox.y-at.y)*s,w=sourceBox.w*s,h=sourceBox.h*s,s=s}
+  end
+  local options
+  if screen=="GroupWindow"and node.statusGroupName and node.statusGroupFitName then
+    local _,name,raw=call("character","Gauge",10+row)
+    name=raw==-1 and""or tostring(name or""):match("^[^\n]*")
+    local available=number(node.statusGroupTextWidth,paintBox.w/(box.s or 1))*(box.s or 1)
+    if R.MeasureText then
+      local width=R.MeasureText(instance,node,name)
+      if width>available then
+        if R.MeasureText(instance,node,"...")>available then name=""
+        else
+          local result="";for letter in name:gmatch(".[\128-\191]*")do
+            if R.MeasureText(instance,node,result..letter.."...")>available then break end;result=result..letter
+          end
+          name=result.."..."
+        end
+      end
+    end
+    options={caption=name,textOnly=node.statusGroupNameOnly==true}
+  elseif screen=="GroupWindow"and node.statusGroupQuiet then options={caption=""}
+  end
+  R.PaintControl(screen,node,paintBox,instance,options)
   local click,hover=hit(screen,id(node),box,enabled(screen,canonical))
   local s=state(instance,screen);local rec=s.controls[canonical]or{};s.controls[canonical]=rec
   if ui.IsItemClicked(ui.Mouse.Left)then rec.dragged=false end
@@ -513,6 +788,30 @@ end
 function M.DrawControl(screen,node,box,instance,R)
   if not M.Handles(screen)then return false end
   if node.statusReplaced then return true end
+  if screen=="GroupWindow"then
+    if node.statusHealthColumn then
+      local c=instance.palette.background or{.08,.08,.09,1}
+      ui.DrawRectFilled(box.x,box.y,box.x+box.w,box.y+box.h,c[1],c[2],c[3],1);return true
+    end
+    if node.statusHealthRow~=nil then
+      local gauge=node.statusHealthRow==0 and 1 or 10+node.statusHealthRow
+      local fraction,_,raw,r,g,b=call("character","Gauge",gauge)
+      if raw==-1 then fraction=nil end
+      if R.PaintHealthBox then R.PaintHealthBox(instance,box,fraction,raw and raw< -1 and r and{r,g,b,1}or nil)end
+      return true
+    end
+    if node.statusHealthPercentGauge then
+      local gauge=node.statusHealthPercentGauge
+      local fraction,_,raw=call("character","Gauge",gauge)
+      if raw~=-1 and fraction then
+        local value=tostring(math.floor(math.max(0,math.min(1,fraction))*100+.5))
+        if R.PaintText then R.PaintText(screen,node,box,instance,value)
+        else caption(node,box,value,instance.palette.text,"center")end
+      end
+      return true
+    end
+    if node.statusGroupPaintOnly then R.PaintControl(screen,node,box,instance,node.type=="Gauge"and{caption=""}or nil);return true end
+  end
   if screen=="GroupWindow"and node.type=="InvSlot"then
     local value=node.slot
     local slot=type(value)=="number"and value or type(value)=="string"and tonumber(value:match("^%d+$"))
@@ -561,13 +860,37 @@ function M.Draw(screen,plan,instance,client,R)
   local s=state(instance,screen);local frame=ui.GetFrameCount()
   if s.drawFrame and frame>s.drawFrame+1 then s.buffMenu=nil;s.controls={}end
   s.drawFrame=frame
-  local prepared=prepare(screen,plan,instance,R)
+  local prepared
+  if screen=="GroupWindow"then
+    local scale=client.s or 1
+    prepared=M.GroupLayout(plan,instance,R,client.w/scale,client.h/scale,scale)
+    if prepared.statusGroupReflow and prepared.rect.h*scale>client.h+.01 then
+      ui.SetCursorScreenPos(client.x,client.y)
+      local visible=ui.BeginChild("##source-group-rows",client.w,client.h,false,0)
+      local x,y=ui.GetCursorScreenPos();local width,height=ui.GetContentRegionAvail()
+      prepared=M.GroupLayout(plan,instance,R,width/scale,height/scale,scale)
+      local virtual={x=x,y=y,w=width,h=math.max(height,prepared.rect.h*scale),s=scale}
+      local success,drawn,reason=true,true,nil
+      if visible then success,drawn,reason=pcall(R.Draw,screen,prepared,instance,virtual,M)end
+      if visible then ui.SetCursorScreenPos(x,y);ui.Dummy(virtual.w,virtual.h)end
+      ui.EndChild()
+      if not success then error(drawn,0)end
+      return drawn,reason
+    end
+  else prepared=prepare(screen,plan,instance,R)end
   buffRectangles(screen,prepared,instance,client,R)
   local drawn,reason=R.Draw(screen,prepared,instance,client,M)
   if not drawn then return false,reason end
   if screen=="BuffWindow"or screen=="ShortDurationBuffWindow"or screen=="TargetWindow"then buffMenu(screen,instance)
   elseif screen=="CastSpellWnd"then spellSets(screen)end
   return true
+end
+function M.OwnsScroll(screen,plan,instance,R)
+  if screen~="GroupWindow"then return false end
+  local s=state(instance,screen)
+  if s.groupOriginal==plan and s.groupOwnsScroll~=nil then return s.groupOwnsScroll end
+  local prepared=M.GroupLayout(plan,instance,R)
+  return prepared.statusGroupReflow==true
 end
 rawset(_G,"hailstone_skin_status_presenters",M)
 return M
