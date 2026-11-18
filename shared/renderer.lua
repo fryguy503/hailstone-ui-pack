@@ -1303,7 +1303,9 @@ function R.VisitChildren(screen,plan,instance,box,visit,opts)
       end
     end
   end
-  walk(plan,box,box,0)
+  -- A scrollable root's content may extend past its viewport. Geometry still
+  -- uses the authored client box; nested containers retain their own clips.
+  walk(plan,box,opts.clip or box,0)
 end
 local function children(instance,screen,node,box)
   local ordered,over={},{}

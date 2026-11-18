@@ -6,6 +6,7 @@ end
 local calls,frame,character,state={},1,"Tester",3
 local windows={{slot=1,tab=1,tabs={{title="Main"},{title="Combat"}}}}
 local input,enter,active,focus,clicked="",false,false,0,false
+local selectedTabLabel
 local left,right=false,false
 local settings,viewport={}, {width=1920,height=1080,uiScale=1,alt=false}
 local context={instance={palette={},profile={}},paths={}}
@@ -45,7 +46,11 @@ ui={InputTextFlags={EnterReturnsTrue=1},HoveredFlags={ChildWindows=1},Mouse={Lef
   GetScrollY=function()return 0 end,GetScrollMaxY=function()return 0 end,
   GetContentRegionAvail=function()return 320,180 end,CalcTextSize=function()return 24,12 end,
   SetScrollHereY=function()record("follow")end,SetScrollY=function()end,
-  SameLine=function()end,Button=function(label)record("button",label);return clicked end,
+  SameLine=function()end,Button=function(label,w,h)record("button",label,w,h);return clicked end,
+  BeginCombo=function(id,preview)record("chatcombo",id,preview);return true end,
+  Selectable=function(label,selected)record("chatoption",label,selected);return label==selectedTabLabel end,
+  SetItemDefaultFocus=function()record("tabfocus")end,EndCombo=function()record("endcombo")end,
+  DrawLine=function(...)record("line",...)end,
   IsWindowHovered=function()return true end,IsMouseClicked=function(which)return which==0 and left or which==1 and right end,
   GetIO=function()return viewport end,
   SetNextWindowSize=function(w,h)record("toolsize",w,h)end,
@@ -61,10 +66,11 @@ modules["lib/stml.lua"]={UpdateLines=function(c,lines)c.lines=lines;record("upda
 modules["lib/hud.lua"]={T={TakeRightClick=function()record("righttaken")end}}
 modules["lib/pack_context.lua"]=context
 local originalDofile=dofile
+modules["lib/pack_bindings.lua"]=originalDofile(root.."/shared/bindings.lua")
 dofile=function(path)if modules[path]then return modules[path]end;return originalDofile(path)end
 rawset(_G,"hailstone_skin_presenters",nil)
 local P=originalDofile(root.."/shared/source_presenters.lua")
-local B=originalDofile(root.."/shared/bindings.lua")
+local B=modules["lib/pack_bindings.lua"]
 for _,screen in ipairs({"InventoryWindow","PlayerWindow","HotButtonWnd","HotButtonWnd10","Chat32","ItemDisplayWindow#6"})do eq(P.Handles(screen),true)end
 eq(P.Handles("OtherWindow"),false)
 local plan={type="Screen",rect={w=300,h=200},children={}}
@@ -125,11 +131,28 @@ eq(count("link"),1);eq(count("pushfont"),count("popfont"));eq(count("beginchild"
 local R={Draw=function(screen,p,instance,content,adapter)
   eq(context.sourceManagedPanel==true,false)
   eq(adapter,P);record("sourcebody",content.x,content.y,content.w,content.h,content.s);return true
-end,DrawChildren=function(screen,p)record("extra",p.children[1].name)end}
+end,DrawChildren=function(screen,p)record("extra",p.children[1].name)end,
+  PushStyle=function()record("chatstyle");return "style"end,PopStyle=function(token)eq(token,"style");record("endchatstyle")end}
 local _,height=P.Size("Chat1",plan);eq(height,224)
 P.Draw("Chat1",plan,context.instance,{x=12,y=30,w=300,h=224,s=1},R)
 local body;for _,call in ipairs(calls)do if call[1]=="sourcebody"then body=call end end
 eq(body[3],54);eq(body[5],200)
+eq(count("button"),2);eq(count("chatcombo"),0)
+windows[1].tab=2
+windows[1].tabs={{title="Main"},{title="Combat"},{title="Loot"},{title="Tradeskills",unread=true}}
+frame=frame+1
+selectedTabLabel="* Tradeskills##source-tab4"
+P.Draw("Chat1",plan,context.instance,{x=12,y=30,w=100,h=224,s=1.5},R)
+eq(count("button"),2);eq(count("chatcombo"),1);eq(count("chatoption"),4)
+eq(count("tabfocus"),1);eq(count("endcombo"),1);eq(count("tab"),1)
+eq(count("chatstyle"),1);eq(count("endchatstyle"),1)
+for _,call in ipairs(calls)do
+  if call[1]=="chatcombo"then eq(call[3],"Combat")end
+  if call[1]=="tab"then eq(call[2],1);eq(call[3],4)end
+end
+selectedTabLabel=nil
+windows[1].tab=1;windows[1].tabs={{title="Main"},{title="Combat"}}
+frame=frame+1
 clicked=true
 P.Draw("ItemDisplayWindow#2",plan,context.instance,{x=0,y=0,w=300,h=228,s=1},R)
 eq(count("transfer"),1);eq(P.Size("ItemDisplayWindow#2",plan),300)
@@ -306,7 +329,7 @@ eq(B.HotTarget("BandolierWnd",{type="HotButton",eqType="hotbutton/Bar 0/12"}),ni
 -- hidden/zero-sized authored controls cannot suppress a live fallback slot.
 local flow={type="Screen",rect={w=100,h=100},children={}}
 for n=1,12 do flow.children[n]={type="HotButton",name="HB_Button"..n,rect={w=40,h=40},unreachable=n>=11}end
-local placedDraws,extraNames={},{}
+local placedDraws,extraNames,extraNodes={},{},{}
 local reach={ChromeInsets=function()return {left=10,right=10,top=10,bottom=10}end,
   VisitChildren=function(screen,p,owner,at,visit,options)
     eq(options.allPages,true)
@@ -319,7 +342,7 @@ local reach={ChromeInsets=function()return {left=10,right=10,top=10,bottom=10}en
     scan(p)
   end,
   Draw=function(screen,p)placedDraws[#placedDraws+1]=p;return true end,
-  DrawChildren=function(screen,p)extraNames[#extraNames+1]=p.children[1].name end}
+  DrawChildren=function(screen,p)extraNames[#extraNames+1]=p.children[1].name;extraNodes[#extraNodes+1]=p.children[1] end}
 hs.UI.hotbars.Setting=function(_,key)if key=="PercentSize"then return 100 end;return true end
 local fw,fh=P.Size("HotButtonWnd4",flow,context.instance,reach)
 eq(fw,100);eq(fh,192) -- client80 fits one44px cell per row, not two from outer100
@@ -328,6 +351,20 @@ eq(#extraNames,2);eq(extraNames[1],"HB_Button11");eq(extraNames[2],"HB_Button12"
 eq(placedDraws[#placedDraws].children[11].sourceReplaced,true)
 eq(P.Shown("HotButtonWnd4",placedDraws[#placedDraws].children[11]),false)
 eq(flow.children[11].sourceReplaced,nil)
+local legacy={type="Screen",rect={w=60,h=520},children={}}
+for n=1,12 do
+  legacy.children[n]={type="HotButton",name="HB1_Button"..n,eqType="hotbutton/Bar 0/"..(n-1),rect={w=40,h=40}}
+end
+local lw,lh=P.Size("HotButtonWnd",legacy,context.instance,reach)
+eq(lw,60);eq(lh,520)
+P.Draw("HotButtonWnd",legacy,context.instance,{x=0,y=0,w=40,h=520,s=1},reach)
+eq(#extraNames,2) -- all 12 authored identities already exist
+eq(placedDraws[#placedDraws].children[12].name,"HB1_Button12")
+local incomplete={type=legacy.type,rect=legacy.rect,children={table.unpack(legacy.children,1,11)}}
+P.Draw("HotButtonWnd",incomplete,context.instance,{x=0,y=0,w=40,h=564,s=1},reach)
+eq(#extraNames,3);eq(extraNames[3],"HB_Button12")
+local nativeBar,nativeButton=B.HotTarget("HotButtonWnd",extraNodes[3])
+eq(nativeBar,"HotButtonWnd");eq(nativeButton,"HB_Button12")
 local socketPlan={type="Screen",rect={w=100,h=100},children={{type="Button",name="IDW_Socket_Slot_1_Item",rect={w=40,h=40},unreachable=true}}}
 hs.UI.windows.ChildShown=function(_,name)return name=="IDW_Socket_Slot_1_Item"or name=="IDW_Appearance_Socket_Item"end
 extraNames={}
@@ -515,7 +552,13 @@ for _,skin in ipairs(skins)do
   if skin=="default"then cachePlan,cacheInstance=source,instance end
 end
 eq(matrix,240)
-currentSkin="default";model=populated(true);metricScale=1
+currentSkin="default";model=populated(false);metricScale=1
+-- Sparse source columns retain the authored gutter: a value such as MEDIUM
+-- must not visually run into the following AC/stat caption.
+local _,_,gutterSeen=inspectItem(cachePlan,cacheInstance,400,240,1)
+local gutterValue,gutterLabel=gutterSeen.IDW_Row1Col1Value.rect,gutterSeen.IDW_Row1Col2Stat.rect
+eq(math.abs(gutterLabel.x-gutterValue.x-gutterValue.w-20)<.00001,true)
+model=populated(true)
 local authored=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,400,200,1)
 local resized=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,500,350,1)
 local scrollbar=P.ItemLayout("ItemDisplayWindow",cachePlan,cacheInstance,realR,486,350,1)

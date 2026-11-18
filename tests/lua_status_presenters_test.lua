@@ -363,7 +363,102 @@ do
 end
 -- Populated group contracts: authored fixtures carry only layout facts and
 -- symbolic resource names. No game bitmap is created or copied by these tests.
+do
+  reset();local n=node("Label","ETW_HPLabel7",4,3,30,12,155)
+  S.labels={[155]="51",[158]="18"}
+  M.DrawControl("ExtendedTargetWnd",n,box,instance(),R)
+  equal(S.paint[1].opts.caption,"18","a legacy wrong label ID cannot show another target's HP")
+  equal(n.eqType,155,"compiled source metadata remains immutable")
+end
+do
+  reset();local container=node("LayoutBox","ETW_Ext0",0,0,127,35)
+  container.children={node("Gauge","ETW_Gauge0",18,0,100,32,42)}
+  equal(M.DrawControl("ExtendedTargetWnd",container,box,instance(),R),false,
+    "a named target container must keep traversing its child gauges")
+  equal(#S.paint,0)
+end
+do
+  reset();local p=plan({},120,80);p.fields.Style_VScroll=true
+  for index=0,19 do
+    local n=node("Gauge","ETW_Gauge"..index,0,0,0,0,42+index)
+    n.anchors={top=index*35,bottom=index*35+30}
+    p.children[#p.children+1]=n
+    S.shown[n.name]=true
+  end
+  local originalVisit,originalMeasure=R.VisitChildren,R.MeasureChildren
+  R.MeasureChildren=function(_,source,_,at)equal(#source.children,20);return at.w,695 end
+  R.VisitChildren=function(_,source,_,at,visit,opts)
+    equal(source,p);equal(at.h,80,"source anchors use the viewport size")
+    equal(opts.clip.h,695,"coverage includes reachable scroll content")
+    for _,n in ipairs(source.children)do
+      visit(n,{x=10,y=n.anchors.top,w=at.w-20,h=30,s=1})
+    end
+  end
+  local inst=instance();local w,h=M.Size("ExtendedTargetWnd",p,inst,R)
+  equal(w,120);equal(h,80,"the source viewport must not grow just to expose scroll content")
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  equal(#S.drawn.children,20,"all20 authored rows remain; no 12px duplicates are appended")
+  equal(S.drawn.children[20],p.children[20]);equal(p.children[20].anchors.top,665)
+  local cw,ch=M.ContentSize("ExtendedTargetWnd",p,inst,R)
+  equal(cw,120);equal(ch,695,"the last live row remains reachable through the scroll child")
+  R.VisitChildren,R.MeasureChildren=originalVisit,originalMeasure
+end
+do
+  local originalVisit,originalMeasure=R.VisitChildren,R.MeasureChildren
+  for _,screen in ipairs{"GroupWindow","ExtendedTargetWnd"}do
+    reset();for index=0,19 do S.shown["ETW_Gauge"..index]=false end
+    local tile=node("TileLayoutBox","AuthoredFlow");tile.fields.SnapToChildren=true
+    local p=plan({},100,50);p.fields.Layout="AuthoredVertical";p.children={tile}
+    R.MeasureChildren=function()return 130,175 end
+    R.VisitChildren=function()end
+    local inst=instance();inst.profile={id="sars-stock"}
+    local w,h=M.Size(screen,p,inst,R)
+    equal(w,130);equal(h,175,screen.." honors authored SnapToChildren instead of clipping wrapped rows")
+    equal(p.rect.h,50,"natural measurement cannot mutate source geometry")
+    tile.fields.SnapToChildren=false
+    S.frame=S.frame+1
+    w,h=M.Size(screen,p,inst,R);equal(w,100);equal(h,50,"fixed source layouts retain their authored size")
+  end
+  R.VisitChildren,R.MeasureChildren=originalVisit,originalMeasure
+end
+do
+  reset();for index=0,19 do S.shown["ETW_Gauge"..index]=index<2 end
+  local anchored=node("Gauge","ETW_Gauge0",0,0,0,0,42)
+  local p=plan({},100,50);p.children={anchored}
+  local originalVisit=R.VisitChildren
+  R.VisitChildren=function(_,_,_,_,visit)visit(anchored,{x=20,y=0,w=80,h=35,s=1})end
+  local inst=instance();local w,h=M.Size("ExtendedTargetWnd",p,inst,R)
+  M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=w,h=h,s=1},R)
+  local extra=S.drawn.children[2]
+  equal(extra.rect.w,80);equal(extra.rect.h,35,"new slots inherit resolved anchor size, not a12px placeholder")
+  equal(extra.gaugeEqType,43);equal(anchored.rect.w,0)
+  R.VisitChildren=originalVisit
+end
 local GR={};for key,value in pairs(R)do GR[key]=value end
+do
+  reset();local n=node("Gauge","GW_Gauge1",7,9,100,23,11)
+  n.anchors={explicit={left=true,right=true,top=true,bottom=true},left=0,right=0,top=0,bottom=0}
+  local p=plan({},150,100);p.children={n};local inst=instance();inst.profile={id="Takus-stock"}
+  local renderer={};for key,value in pairs(R)do renderer[key]=value end
+  renderer.Geometry=function(child,parent)
+    local collapsed=child.anchors and child.anchors.explicit.right
+    return{x=parent.x+child.rect.x,y=parent.y+child.rect.y,w=collapsed and 0 or child.rect.w,h=collapsed and 0 or child.rect.h,s=1}
+  end
+  local prepared=M.GroupLayout(p,inst,renderer)
+  local at=renderer.Geometry(prepared.children[1],{x=0,y=0})
+  equal(at.w,100);equal(at.h,23,"Takus's measured fixed HP cell must also be drawable")
+  equal(at.x,7);equal(at.y,9);equal(n.anchors.explicit.right,true,"source zero-anchor metadata stays unchanged")
+end
+do
+  reset();for index=0,19 do S.shown["ETW_Gauge"..index]=false end
+  local n=node("Label","ETW_HPLabel2",21,58,18,12,153)
+  n.anchors={explicit={left=true,right=true,top=true,bottom=true},top=90,bottom=102,left=32,right=76}
+  local p=plan({},137,305);p.children={n};local inst=instance();inst.profile={id="Sparxx-stock"}
+  S.labels={[153]="73"};M.Draw("ExtendedTargetWnd",p,inst,{x=0,y=0,w=137,h=305,s=1},R)
+  equal(S.paint[1].box.y,58);equal(S.paint[1].box.x,21)
+  equal(S.paint[1].opts.caption,"73");equal(S.paint[1].node.anchors.explicit.top,false)
+  equal(n.anchors.top,90,"misplaced source offsets remain immutable")
+end
 function GR.Geometry(n,parent)
   local r=n.rect or{};return{x=parent.x+(r.x or 0)*(parent.s or 1),y=parent.y+(r.y or 0)*(parent.s or 1),
     w=(r.w or 0)*(parent.s or 1),h=(r.h or 0)*(parent.s or 1),s=parent.s or 1}
@@ -549,6 +644,15 @@ do
     local inst=real.New(originalDofile("ui/"..skin.."/lib/pack_profile.lua"));local source=real.Resolve("GroupWindow",inst)
     check(source~=nil)
     local prepared,w,h=M.GroupLayout(source,inst,real)
+    if skin=="Takus-stock"then
+      local controls=collect(prepared)
+      for row=1,5 do
+        local gauge=(controls["GW_Gauge"..row]or controls["Gauge"..row])[1]
+        local at=real.Geometry(gauge,{x=0,y=0,w=w,h=h,s=1})
+        equal(at.w,120,"Takus repaired cells retain the authored column width")
+        equal(at.h,23);equal(at.x,gauge.rect.x);equal(at.y,gauge.rect.y)
+      end
+    end
     local adapted=skin=="drakah-pers-adeptus-stock"or skin=="Nemesis-stock"
     equal(prepared.statusGroupReflow,adapted,skin)
     local markers,quiet=0,0
@@ -558,7 +662,12 @@ do
       if n.statusNativeName=="ManaGauge2"then equal(M.Shown("GroupWindow",n),true)end
     end end
     if adapted then equal(markers,skin=="Nemesis-stock"and 6 or 5);check(h>0 and w>0)
-    else equal(markers,0);equal(w,source.rect.w);equal(h,source.rect.h)end
+    else
+      equal(markers,0)
+      if skin=="sars-stock"then
+        check(w>=source.rect.w and h>source.rect.h,"Sars honors its named flow's SnapToChildren")
+      else equal(w,source.rect.w);equal(h,source.rect.h)end
+    end
     check(quiet>=5,skin.." retains quiet resource strips")
   end
   dofile=originalDofile

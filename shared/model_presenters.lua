@@ -360,6 +360,26 @@ local function prepare(screen,plan,instance)
   else s.tile=nil end
   return s.plan
 end
+local function fitContainer(screen,plan,instance,R,width,height)
+  if family(screen)~="ContainerWindow"or not R.MeasureChildren then return plan end
+  local s=state(instance,screen);local tile
+  walk(plan,function(node)if id(node)==s.tile then tile=node end end)
+  if not tile or #(tile.children or{})==0 then return plan end
+  local box={x=0,y=0,w=math.max(1,width),h=math.max(1,height),s=1}
+  local at=R.Geometry and R.Geometry(tile,box)or box
+  -- The named vertical strategy otherwise treats a zero-height slot tile as
+  -- flexible and gives the Done button part of its last row. Snap the live
+  -- tile to its contents first; the parent can then reserve its footer/gaps.
+  local _,needed=R.MeasureChildren(screen,tile,instance,{x=0,y=0,w=math.max(1,at.w),h=math.max(1,at.h),s=1})
+  if type(needed)=="number"and needed>0 then
+    tile.rect=copy(tile.rect or{});tile.rect.h=needed
+    tile.fields=copy(tile.fields or{});tile.fields.AutoStretch=false;tile.fields.AutoStretchVertical=false
+    tile.fields.BottomAnchorOffset=nil;tile.fields.BottomAnchorToTop=true
+    tile.anchors=copy(tile.anchors or{});tile.anchors.bottomToTop=true
+    tile.anchors.explicit=copy(tile.anchors.explicit or{});tile.anchors.explicit.bottom=false
+  end
+  return plan
+end
 function M.Shown(screen,node)
   if activeDraws[screen] and activeDraws[screen].retired then return false end
   -- The guild model uses this source combo only as the template for per-row
@@ -413,10 +433,103 @@ local function extensionHeight(screen)
   local actions=call("extensions","ListActions",screen,"member_actions",extensions.RaidContext()) or {}
   return (#actions>0 or #(actions.sections or {})>0) and 112 or 0
 end
+local function tradeFlow(screen,plan)
+  if screen~="TradeWnd"then return nil end
+  for _,node in ipairs(plan.children or{})do
+    local f=node.fields or{}
+    if node.type=="TileLayoutBox"and f.SnapToChildren==true and f.HorizontalFirst==false
+      and f.FirstPieceTemplate~=true and #(node.children or{})>=2 then
+      local fixed=true
+      for _,piece in ipairs(node.children)do
+        local r=piece.rect or{}
+        if (tonumber(r.w)or 0)<=0 or(tonumber(r.h)or 0)<=0 then fixed=false;break end
+      end
+      if fixed then return node end
+    end
+  end
+end
+local function tradeCanvas(screen,plan,instance,R)
+  local flow=tradeFlow(screen,plan)
+  if not flow or not R.Geometry then return nil end
+  local inset=R.ChromeInsets(plan,instance,1)
+  local w=math.max(1,plan.rect.w-inset.left-inset.right)
+  local h=math.max(1,plan.rect.h-inset.top-inset.bottom)
+  local f=flow.fields or{}
+  local naturalW,naturalH,count=0,0,0
+  for _,piece in ipairs(flow.children)do
+    local visible=call("windows","ChildShown",screen,nativeName(screen,piece))
+    if visible~=false and(visible~=nil or(piece.fields or{}).Visible~=false)then
+      naturalW=math.max(naturalW,piece.rect.w);naturalH=naturalH+piece.rect.h;count=count+1
+    end
+  end
+  naturalW=naturalW+(tonumber(f.PaddingLeft)or 0)+(tonumber(f.PaddingRight)or 0)
+  naturalH=naturalH+math.max(0,count-1)*(tonumber(f.Spacing)or 5)
+    +(tonumber(f.PaddingTop)or 0)+(tonumber(f.PaddingBottom)or 0)
+  local at=R.Geometry(flow,{x=0,y=0,w=w,h=h,s=1})
+  return w+math.max(0,naturalW-at.w),h+math.max(0,naturalH-at.h),inset
+end
+function M.OwnsScroll(screen,plan)return family(screen)=="ContainerWindow"or tradeFlow(screen,plan)~=nil end
+local function drawContainer(screen,plan,instance,box,R)
+  if not R.MeasureChildren then return R.Draw(screen,plan,instance,box,M)end
+  local scale=box.s or 1
+  local w,h=R.MeasureChildren(screen,plan,instance,{x=0,y=0,w=box.w/scale,h=box.h/scale,s=1})
+  if w*scale<=box.w+.01 and h*scale<=box.h+.01 then return R.Draw(screen,plan,instance,box,M)end
+  ui.SetCursorScreenPos(box.x,box.y)
+  local padded=ui.StyleVar and ui.StyleVar.WindowPadding
+  if padded then ui.PushStyleVar(padded,0,0)end
+  local visible=ui.BeginChild("##source-container-client",box.w,box.h,false,
+    w*scale>box.w and ui.WindowFlags and ui.WindowFlags.HorizontalScrollbar or 0)
+  local ok,drawn,why=true,true,nil
+  if visible then
+    ok,drawn,why=pcall(function()
+      local x,y=ui.GetCursorScreenPos();local availableW,availableH=ui.GetContentRegionAvail()
+      fitContainer(screen,plan,instance,R,availableW/scale,availableH/scale)
+      w,h=R.MeasureChildren(screen,plan,instance,{x=0,y=0,w=availableW/scale,h=availableH/scale,s=1})
+      local canvas={x=x,y=y,w=math.max(availableW,w*scale),h=math.max(availableH,h*scale),s=scale}
+      local result,reason=R.Draw(screen,plan,instance,canvas,M)
+      ui.SetCursorScreenPos(x,y);ui.Dummy(canvas.w,canvas.h)
+      return result,reason
+    end)
+  end
+  ui.EndChild();if padded then ui.PopStyleVar(1)end
+  if not ok then error(drawn,0)end
+  return drawn,why
+end
+local function drawGraph(screen,plan,instance,box,R)
+  if family(screen)=="ContainerWindow"then return drawContainer(screen,plan,instance,box,R)end
+  local w,h=tradeCanvas(screen,plan,instance,R)
+  if not w then return R.Draw(screen,plan,instance,box,M)end
+  local scale=math.max(.01,tonumber(box.s)or 1)
+  if w*scale<=box.w+.000001*scale and h*scale<=box.h+.000001*scale then
+    return R.Draw(screen,plan,instance,box,M)
+  end
+  -- Fixed source panes retain their scale and vertical flow. A smaller saved
+  -- window scrolls this canvas instead of wrapping its second pane sideways.
+  ui.SetCursorScreenPos(box.x,box.y)
+  local padded=ui.StyleVar and ui.StyleVar.WindowPadding
+  if padded then ui.PushStyleVar(padded,0,0)end
+  local visible=ui.BeginChild("##source-trade-client",box.w,box.h,false,
+    ui.WindowFlags and ui.WindowFlags.HorizontalScrollbar or 0)
+  local ok,drawn,why=true,true,nil
+  if visible then
+    local x,y=ui.GetCursorScreenPos()
+    local availableW,availableH=ui.GetContentRegionAvail()
+    local canvas={x=x,y=y,w=math.max(availableW,w*scale),h=math.max(availableH,h*scale),s=scale}
+    ok,drawn,why=pcall(function()
+      local result,reason=R.Draw(screen,plan,instance,canvas,M)
+      ui.SetCursorScreenPos(canvas.x,canvas.y);ui.Dummy(canvas.w,canvas.h)
+      return result,reason
+    end)
+  end
+  ui.EndChild();if padded then ui.PopStyleVar(1)end
+  if not ok then error(drawn,0)end
+  return drawn,why
+end
 function M.ContentSize(screen,plan,instance,R)
   plan=prepare(screen,plan,instance)
   local insets=R.ChromeInsets(plan,instance,1)
   local w,h=math.max(1,plan.rect.w-insets.left-insets.right),math.max(1,plan.rect.h-insets.top-insets.bottom)
+  plan=fitContainer(screen,plan,instance,R,w,h)
   if R.MeasureChildren then w,h=R.MeasureChildren(screen,plan,instance,{x=0,y=0,w=w,h=h,s=1}) end
   if family(screen)~="ContainerWindow" then
     -- Source-only parked controls do not enlarge a stock dialog. Container
@@ -426,11 +539,51 @@ function M.ContentSize(screen,plan,instance,R)
   return w,h+extensionHeight(screen)
 end
 function M.Size(screen,plan,instance,R)
+  local tw,th,inset=tradeCanvas(screen,plan,instance,R)
+  if tw then return math.max(plan.rect.w,tw+inset.left+inset.right),math.max(plan.rect.h,th+inset.top+inset.bottom)end
   local w,h=M.ContentSize(screen,plan,instance,R)
   local insets=R.ChromeInsets(plan,instance,1)
-  return math.max(plan.rect.w,w+insets.left+insets.right),math.max(plan.rect.h,h+insets.top+insets.bottom)
+  local width,height=math.max(plan.rect.w,w+insets.left+insets.right),math.max(plan.rect.h,h+insets.top+insets.bottom)
+  if family(screen)=="ContainerWindow"and ui.GetIO then
+    local io=ui.GetIO();local viewport=tonumber(io.height)
+    if viewport and viewport>0 then height=math.min(height,math.max(plan.rect.h,viewport/math.max(.01,tonumber(io.uiScale)or 1)*.8))end
+  end
+  return width,height
 end
-function M.DrawControl(screen,node,box)
+local function drawLootPane(screen,node,box,instance,R)
+  local fields=node.fields or{}
+  ui.SetCursorScreenPos(box.x,box.y)
+  local padded=ui.StyleVar and ui.StyleVar.WindowPadding
+  if padded then ui.PushStyleVar(padded,0,0)end
+  local flags=ui.WindowFlags or{}
+  local visible=ui.BeginChild("##source-loot-slots",box.w,box.h,false,
+    (flags.NoBackground or 0)|(fields.Style_HScroll==true and(flags.HorizontalScrollbar or 0)or 0))
+  local ok,why=true,nil
+  if visible then
+    ok,why=pcall(function()
+      local x,y=ui.GetCursorScreenPos();local w,h=ui.GetContentRegionAvail()
+      local extentW,extentH=R.MeasureChildren(screen,node,instance,{x=0,y=0,w=w,h=h,s=box.s or 1})
+      local canvas={x=x,y=y,w=fields.Style_HScroll==true and math.max(w,extentW)or w,
+        h=math.max(h,extentH),s=box.s or 1}
+      R.DrawChildren(screen,node,instance,canvas)
+      ui.SetCursorScreenPos(x,y);ui.Dummy(canvas.w,canvas.h)
+    end)
+  end
+  ui.EndChild();if padded then ui.PopStyleVar(1)end
+  if not ok then error(why,0)end
+end
+function M.DrawControl(screen,node,box,instance,R)
+  local fields=node.fields or{}
+  local scope=activeDraws[screen]
+  if screen=="LootWnd"and node.type=="Screen"and id(node)=="LootInvWnd"
+    and fields.Style_VScroll==true and R and R.MeasureChildren and R.DrawChildren and scope then
+    R.PaintControl(screen,node,box,instance)
+    -- Finish the parent graph and all footer clips before switching draw lists.
+    -- Older hosts account Lua clip pushes only on the most recent draw list.
+    scope.lootPanes=scope.lootPanes or{}
+    scope.lootPanes[#scope.lootPanes+1]={node=node,box=box}
+    return true
+  end
   local message=unavailable[family(screen)] and unavailable[family(screen)][id(node)]
   if not message then return false end
   ui.SetCursorScreenPos(box.x,box.y)
@@ -450,9 +603,19 @@ function M.Draw(screen,plan,instance,box,R)
   local prepared=prepare(screen,plan,instance)
   local extra=extensionHeight(screen)*(box.s or 1)
   local area={x=box.x,y=box.y,w=box.w,h=math.max(1,box.h-extra),s=box.s}
+  prepared=fitContainer(screen,prepared,instance,R,area.w/(area.s or 1),area.h/(area.s or 1))
   local previous=activeDraws[screen]
   activeDraws[screen]=scope
-  local success,ok,why=pcall(R.Draw,screen,prepared,instance,area,M)
+  local success,ok,why=pcall(function()
+    local drawn,reason=drawGraph(screen,prepared,instance,area,R)
+    if drawn then
+      for _,pane in ipairs(scope.lootPanes or{})do
+        if not stillCurrent(screen,scope)then break end
+        drawLootPane(screen,pane.node,pane.box,instance,R)
+      end
+    end
+    return drawn,reason
+  end)
   activeDraws[screen]=previous
   if not success then error(ok,0) end
   if not stillCurrent(screen,scope) then return true,nil,true end

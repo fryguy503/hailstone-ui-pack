@@ -135,10 +135,13 @@ local function walk(node,fn)
   fn(node)
   for _,child in ipairs(node.children or {}) do walk(child,fn) end
 end
-local function slotIdentity(key,node)
+local function slotIdentity(key,node,screen)
   if key=="InventoryWindow" and node.type=="InvSlot" then return slot(node) end
   if key=="HotButtonWnd" and node.type=="HotButton" then
-    local n=tonumber(id(node):match("^HB_Button(%d+)$"));return n and n>=1 and n<=12 and n or nil
+    -- Legacy names such as HB1_Button1 still address the same native slot.
+    -- Use the renderer's mapping so coverage and clicks agree.
+    local bar,button=lib("pack_bindings").HotTarget(screen,node)
+    return bar==screen and tonumber(button:match("%d+$")) or nil
   end
   if key=="ItemDisplayWindow" and (node.type=="Button"or node.type=="InvSlot") then
     local name=id(node)
@@ -162,7 +165,7 @@ local function missing(screen,plan,instance,R)
       if R and R.Geometry then at=R.Geometry(node,parent)
       else local r=node.rect or {};at={x=parent.x+(r.x or 0),y=parent.y+(r.y or 0),w=r.w or 0,h=r.h or 0,s=1}end
     end
-    local n=slotIdentity(key,node)
+    local n=slotIdentity(key,node,screen)
     if n~=nil then
       template=template or node;templates[n]=templates[n]or node
       if key=="ItemDisplayWindow"and not inFlow and at.w>0 and at.h>0 then
@@ -177,13 +180,13 @@ local function missing(screen,plan,instance,R)
   index(plan,nil,base,false)
   if R and R.VisitChildren then
     R.VisitChildren(screen,plan,instance,reference(plan,instance,R),function(node,at,visible)
-      local n=slotIdentity(key,node)
+      local n=slotIdentity(key,node,screen)
       if n~=nil then
         seen[n]=true
         if key=="ItemDisplayWindow"then placed[#placed+1]={key=n,box=visible or at,page=pageOf[node]}end
       end
     end,{allPages=true})
-  else walk(plan,function(node)local n=slotIdentity(key,node);if n~=nil then seen[n]=true end end)end
+  else walk(plan,function(node)local n=slotIdentity(key,node,screen);if n~=nil then seen[n]=true end end)end
   -- Some source files provide socket prototypes at one shared origin; native
   -- code originally positioned them. Separate live sockets must never share
   -- an input target. Keep distinct selectable pages independent.
@@ -504,6 +507,15 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
   y=math.max(y,iconY+iconSize)+gap
   local available=math.max(1,pageWidth-2*margin)
   local per=math.max(1,math.min(3,math.floor(available/100)))
+  local columnGap
+  for col=1,2 do
+    local one,two=source.nodes["IDW_Row1Col"..col.."Stat"],source.nodes["IDW_Row1Col"..(col+1).."Stat"]
+    if one and two then
+      local authored=(two.rect.x or 0)-(one.rect.x or 0)-(one.rect.w or 0)
+      if authored>0 then columnGap=math.min(columnGap or authored,authored)end
+    end
+  end
+  columnGap=math.max(gap,math.min(columnGap or gap,math.max(gap,(available-per*85)/math.max(1,per-1))))
   for band=1,3,per do
     local last=math.min(3,band+per-1);local columns,total={},0
     for col=band,last do
@@ -520,7 +532,7 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
           if lastRow and row>lastRow+1 then y=y+gap*2 end
           local rowHeight,x=0,margin
           for col=band,last do
-            local columnWidth=(available-gap*(last-band))*columns[col].weight/total
+            local columnWidth=(available-columnGap*(last-band))*columns[col].weight/total
             local cell=cells[row][col]
             if cell then
               local stat=source.nodes[cell.label]or first
@@ -541,7 +553,7 @@ function P.ItemLayout(screen,plan,instance,R,width,height,s)
                 rowHeight=math.max(rowHeight,h,vh,hh)
               end
             end
-            x=x+columnWidth+gap
+            x=x+columnWidth+columnGap
           end
           y=y+rowHeight+gap;lastRow=row
         end
@@ -818,6 +830,56 @@ local function chatInput(screen,node,box)
   end
   if c.error then ui.SetTooltip(c.error) end
 end
+
+local function drawChatTabs(window, box, instance, R)
+  local s = box.s or 1
+  local gap, height = 3 * s, 20 * s
+  local labels, widths = {}, {}
+  local total = 0
+  for index, tab in ipairs(window.tabs) do
+    local title = tab.title
+    if not title or title == "" then title = "Chat " .. index end
+    labels[index] = (tab.unread and "* " or "") .. title
+    widths[index] = ui.CalcTextSize(labels[index]) + 10 * s
+    total = total + widths[index] + (index > 1 and gap or 0)
+  end
+
+  if total > box.w then
+    local token = R.PushStyle(instance)
+    ui.SetCursorScreenPos(box.x, box.y)
+    ui.SetNextItemWidth(box.w)
+    if ui.BeginCombo("##source-chat-tabs", labels[window.tab] or labels[1]) then
+      for index, label in ipairs(labels) do
+        local selected = index == window.tab
+        if ui.Selectable(label .. "##source-tab" .. index, selected) and not selected then
+          call("chat", "SelectTab", window.slot, index)
+        end
+        if selected then ui.SetItemDefaultFocus() end
+      end
+      ui.EndCombo()
+    end
+    R.PopStyle(token)
+    return
+  end
+
+  local x = box.x
+  for index, label in ipairs(labels) do
+    local width = widths[index]
+    ui.SetCursorScreenPos(x, box.y)
+    if ui.Button(label .. "##source-tab" .. index, width, height) and index ~= window.tab then
+      call("chat", "SelectTab", window.slot, index)
+    end
+    if index == window.tab then
+      local accent = instance.palette.accent or instance.palette.text
+      if accent then
+        local y = box.y + height - 2 * s
+        ui.DrawLine(x + 3 * s, y, x + width - 3 * s, y, accent[1], accent[2], accent[3], accent[4] or 1, s)
+      end
+    end
+    x = x + width + gap
+  end
+end
+
 function P.DrawControl(screen,node,box,instance,R)
   local key,name=family(screen),id(node)
   if key=="ItemDisplayWindow"and node.sourceItemCaption~=nil and R.DrawButton then
@@ -865,6 +927,7 @@ local function extraSlots(screen,plan,instance,box,R,absent,template,templates)
     local key=family(screen)
     node.name=key=="InventoryWindow" and "InvSlot"..n or key=="HotButtonWnd"and "HB_Button"..n or n
     node.type=key=="InventoryWindow" and "InvSlot" or key=="HotButtonWnd"and "HotButton"or "Button"
+    if key=="HotButtonWnd"then node.eqType=nil end -- the new slot uses its own canonical name
     node.slot=key=="InventoryWindow"and n or nil;node.children={};node.rect={x=0,y=0,w=size,h=size};node.anchors={};node.fields={}
     local at={x=box.x+((index-1)%per)*(size+4)*s,y=box.y+((index-1)//per)*(size+4)*s,w=size*s,h=size*s,s=s}
     if not P.DrawControl(screen,node,at,instance,R) then
@@ -881,7 +944,7 @@ local function replaceUnreachable(screen,plan,absent)
   local function clone(node)
     local out={};for k,v in pairs(node)do out[k]=v end
     out.children={};for _,child in ipairs(node.children or {})do out.children[#out.children+1]=clone(child)end
-    if identities[slotIdentity(family(screen),node)]then out.sourceReplaced=true end
+    if identities[slotIdentity(family(screen),node,screen)]then out.sourceReplaced=true end
     return out
   end
   local result=clone(plan);repaired[plan]={key=key,plan=result};return result
@@ -927,16 +990,7 @@ function P.Draw(screen,plan,instance,box,R)
   local extra=extrasHeight(screen,plan,instance,R)*(box.s or 1)
   local tabs=tabsHeight(screen)*(box.s or 1)
   local transfer=transferHeight(screen)*(box.s or 1)
-  if tabs>0 then
-    ui.SetCursorScreenPos(box.x,box.y)
-    local window=listed[screen]
-    for index,tab in ipairs(window.tabs) do
-      if index>1 then ui.SameLine() end
-      if ui.Button((tab.unread and "* " or "")..tostring(tab.title or index).."##source-tab"..index) then
-        call("chat","SelectTab",window.slot,index)
-      end
-    end
-  end
+  if tabs>0 then drawChatTabs(listed[screen],box,instance,R) end
   local content={x=box.x,y=box.y+tabs,w=box.w,h=math.max(1,box.h-extra-tabs-transfer),s=box.s}
   local drawn,why=R.Draw(screen,replaceUnreachable(screen,plan,absent),instance,content,P)
   if not drawn then return false,why end

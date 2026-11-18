@@ -1078,6 +1078,21 @@ run("presenter coverage may include reachable inactive pages without changing se
   local all={};R.VisitChildren("Test",root,I,box,function(n)all[n.name]=true end,{allPages=true})
   check(all.SlotA and all.SlotB);equal(#actions("windows","SetTabPage"),0);equal(#S.draws,0)
 end)
+run("scroll content coverage preserves authored geometry and nested clipping",function()
+  local I=fixture();local below=node("Gauge","Below",10,140,0,20)
+  below.anchors={leftToLeft=true,rightToLeft=false,topToTop=true,bottomToTop=true,
+    left=10,right=5,top=140,bottom=160,explicit={left=true,right=true,top=true,bottom=true}}
+  local panel=node("Screen","Panel",0,180,100,20)
+  panel.children={node("Gauge","NestedClipped",0,30,80,15)}
+  local root=plan(below,panel);local client={x=0,y=0,w=100,h=80,s=1}
+  local seen={};R.VisitChildren("Test",root,I,client,function(n)seen[n.name]=true end)
+  equal(seen.Below,nil)
+  seen={};R.VisitChildren("Test",root,I,client,function(n,r)seen[n.name]=r end,
+    {clip={x=0,y=0,w=100,h=400,s=1}})
+  equal(seen.Below.w,85,"virtual clipping cannot stretch the source geometry box")
+  equal(seen.Below.y,140);equal(seen.NestedClipped,nil,"fixed nested panels still clip their descendants")
+  equal(#S.draws,0);equal(#S.texts,0)
+end)
 run("noninteger scaled exact-fit tiles keep five pieces per row or column",function()
   local scale=1.5*((720-12*1.5)/(550*1.5))
   for _,horizontal in ipairs{true,false}do

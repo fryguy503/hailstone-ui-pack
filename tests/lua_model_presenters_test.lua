@@ -158,6 +158,92 @@ eq(B.Shown("Bag1",node("TileLayoutBox","ContainerCombine_Items")),true)
 eq(B.Shown("Bag1",node("InvSlot","Container_Slot:4")),false)
 bagCount=0;eq(M.CanDraw("Bag1",container,instance),false);bagCount=4
 
+-- Resolve the shipped source graph and exercise its real vertical/tile flow.
+-- The live slot tile must reserve its complete last row before Done is placed;
+-- large bags scroll at their authored scale instead of shrinking every slot.
+do
+  local skins={"default","default_old","aya-stock","delta-stock","drakah-pers-adeptus-stock","DuxaUI-stock",
+    "Graphite-stock","ib-stock","lodidodi-stock","Lords-stock","Nemesis-stock","po2-stock","po2alt-stock",
+    "qqcustom-stock","qqui-stock","sars-stock","Sparxx-stock","Takus-stock","vert-stock","wow-stock"}
+  local skin="default"
+  local savedDofile,owner,interfaces=dofile,currentContext.instance,hs.UI.interfaces
+  local savedCount,savedCombine=bagCount,combine
+  dofile=function(path)
+    if path=="lib/pack_bindings.lua"then return B end
+    if path:sub(1,12)=="lib/layouts/"then return original(root.."/layouts/"..skin.."/"..path:sub(13))end
+    return savedDofile(path)
+  end
+  hs.UI.interfaces={LoadBase=function(path)return original(root.."/layouts/default/"..path:sub(13))end}
+  local actual=original(root.."/shared/renderer.lua")
+  actual.ChromeInsets=function()return {left=2,right=2,top=18,bottom=2}end
+  local save={io=ui.GetIO,begin=ui.BeginChild,finish=ui.EndChild,pos=ui.SetCursorScreenPos,get=ui.GetCursorScreenPos,
+    avail=ui.GetContentRegionAvail,dummy=ui.Dummy,flags=ui.WindowFlags,style=ui.StyleVar}
+  ui.GetIO=function()return {width=1280,height=720,uiScale=1}end
+  local defaultPlan,defaultInstance
+  for _,name in ipairs(skins)do
+    skin=name
+    local profile=original(root.."/ui/"..skin.."/lib/pack_profile.lua")
+    local live=actual.New(profile);local source=actual.Resolve("ContainerWindow",live);check(source)
+    local slotHeight
+    local function slotPrototype(n)
+      if n.name=="Container_Slot"then slotHeight=n.rect.h end
+      for _,child in ipairs(n.children or{})do slotPrototype(child)end
+    end
+    slotPrototype(source);check(slotHeight and slotHeight>0)
+    currentContext.instance=live
+    for _,count in ipairs({10,80,200})do
+      bagCount=count;combine=false
+      local outerW,outerH=M.Size("Bag1",source,live,actual)
+      local fullW,fullH=M.ContentSize("Bag1",source,live,actual)
+      local prepared=live.modelPresenters.Bag1.plan
+      local slots,footer,bottom=0,nil,0
+      actual.VisitChildren("Bag1",prepared,live,{x=0,y=0,w=fullW,h=fullH,s=1},function(n,at,visible)
+        if (n.name or""):match("^Container_Slot:%d+$")then
+          slots=slots+1;eq(at.h,slotHeight);eq(visible.h,at.h);eq(visible.w,at.w)
+          bottom=math.max(bottom,at.y+at.h)
+        elseif n.name=="StandardDoneButton"then footer=at end
+      end)
+      eq(slots,count)
+      if footer then check(bottom<=footer.y+.00001);check(footer.y+footer.h<=fullH+.00001)end
+      if count>=80 then check(fullH+20>outerH);check(outerH<=576)end
+      check(M.OwnsScroll("Bag1",source))
+    end
+    local function pristine(n)
+      if n.name=="ContainerStandardWithDone_Items"then eq(#n.children,0)end
+      for _,child in ipairs(n.children or{})do pristine(child)end
+    end
+    pristine(source)
+    if name=="default"then defaultPlan,defaultInstance=source,live end
+  end
+  currentContext.instance=defaultInstance;bagCount=200
+  local depth,offset,canvas,extent=0,0,nil,nil
+  ui.StyleVar=nil;ui.WindowFlags={HorizontalScrollbar=2048}
+  ui.SetCursorScreenPos=function()end;ui.GetCursorScreenPos=function()return 10,20-offset end
+  ui.GetContentRegionAvail=function()return 97,540 end
+  ui.BeginChild=function(name,w,h)eq(name,"##source-container-client");eq(w,111);eq(h,540);depth=depth+1;return true end
+  ui.EndChild=function()depth=depth-1 end;ui.Dummy=function(w,h)extent={w,h}end
+  actual.Draw=function(_,_,_,at)canvas=at;return true end
+  local beforeActions=actions
+  M.Draw("Bag1",defaultPlan,defaultInstance,{x=10,y=20,w=111,h=540,s=1},actual)
+  eq(depth,0);check(canvas.h>540);eq(canvas.s,1);eq(extent[2],canvas.h)
+  offset=1000
+  M.Draw("Bag1",defaultPlan,defaultInstance,{x=10,y=20,w=111,h=540,s=1},actual)
+  eq(canvas.y,-980);eq(depth,0);eq(actions,beforeActions)
+  actual.Draw=function()error("controlled bag paint failure")end
+  local ok,why=pcall(M.Draw,"Bag1",defaultPlan,defaultInstance,{x=10,y=20,w=111,h=540,s=1},actual)
+  eq(ok,false);check(tostring(why):find("controlled bag paint failure",1,true));eq(depth,0)
+  eq(B.Shown("Bag1",node("InvSlot","Container_Slot:199")),true)
+  eq(B.Shown("Bag1",node("InvSlot","Container_Slot:200")),false)
+  local slotClick,clicked=hs.UI.inventory.BagSlotClick
+  hs.UI.inventory.BagSlotClick=function(screen,n,phase)clicked={screen,n,phase};return true end
+  check(B.ItemClick("Bag1",node("InvSlot","Container_Slot:199"),"rightheld"))
+  eq(clicked[1],"Bag1");eq(clicked[2],199);eq(clicked[3],"rightheld")
+  hs.UI.inventory.BagSlotClick=slotClick
+  ui.GetIO,ui.BeginChild,ui.EndChild,ui.SetCursorScreenPos,ui.GetCursorScreenPos=save.io,save.begin,save.finish,save.pos,save.get
+  ui.GetContentRegionAvail,ui.Dummy,ui.WindowFlags,ui.StyleVar=save.avail,save.dummy,save.flags,save.style
+  currentContext.instance=owner;hs.UI.interfaces=interfaces;dofile=savedDofile;bagCount,combine=savedCount,savedCombine
+end
+
 -- The source Raid body retains the existing named addon section in a scrolling
 -- footer. Metadata/preflight never invoke its display or action callbacks.
 local before=#calls
@@ -345,6 +431,92 @@ do
   hs.UI.windows.Shown,base.T.Hit=saved.shown,saved.hit
   modules["lib/pack_source_presenters.lua"].Tools,R.Resolve=saved.tools,saved.resolve
   M.OwnsScroll=saved.ownsScroll
+end
+-- A vertical source Trade layout can require more client height than its old
+-- root size after frame insets. Retain one column and scroll narrow saves.
+do
+  local source=plan({});source.rect={x=0,y=0,w=188,h=473}
+  local flow=node("TileLayoutBox","TradePanes",{node("Screen","HisPane"),node("Screen","MyPane")})
+  flow.fields={HorizontalFirst=false,FirstPieceTemplate=false,SnapToChildren=true,Spacing=8}
+  for _,pane in ipairs(flow.children)do pane.rect={x=0,y=0,w=176,h=232}end
+  source.children={flow}
+  local T={ChromeInsets=function()return{left=4,right=4,top=17,bottom=4}end,
+    Geometry=function(_,at)return{x=2,y=2,w=at.w-4,h=at.h-4,s=at.s}end}
+  local drawn,childSize,extent,depth
+  local save={begin=ui.BeginChild,finish=ui.EndChild,pos=ui.SetCursorScreenPos,get=ui.GetCursorScreenPos,
+    dummy=ui.Dummy,flags=ui.WindowFlags,avail=ui.GetContentRegionAvail,style=ui.StyleVar,
+    shown=hs.UI.windows.Shown,childShown=hs.UI.windows.ChildShown}
+  ui.WindowFlags={HorizontalScrollbar=256};depth=0
+  ui.SetCursorScreenPos=function()end;ui.GetCursorScreenPos=function()return 10,20 end
+  ui.StyleVar=nil
+  ui.GetContentRegionAvail=function()return childSize[1]-14,childSize[2]-14 end
+  ui.BeginChild=function(name,w,h,_,flags)eq(name,"##source-trade-client");eq(flags,256);childSize={w,h};depth=depth+1;return true end
+  ui.EndChild=function()depth=depth-1 end;ui.Dummy=function(w,h)extent={w,h}end
+  hs.UI.windows.Shown=function()return true end;hs.UI.windows.ChildShown=function()return nil end
+  T.Draw=function(screen,p,owner,at,adapter)
+    eq(screen,"TradeWnd");eq(p,source);eq(adapter,M);drawn=at;return true
+  end
+  local before=actions
+  local w,h=M.Size("TradeWnd",source,instance,T);eq(w,188);eq(h,497)
+  check(M.OwnsScroll("TradeWnd",source))
+  M.Draw("TradeWnd",source,instance,{x=0,y=0,w=180,h=476,s=1},T)
+  eq(drawn.w,180);eq(drawn.h,476);eq(childSize,nil,"natural-size trades do not acquire a child or scrollbar gutter");eq(depth,0)
+  M.Draw("TradeWnd",source,instance,{x=0,y=0,w=90,h=180},T)
+  eq(drawn.w,180);eq(drawn.h,476);eq(drawn.s,1);eq(childSize[1],90);eq(childSize[2],180)
+  eq(extent[1],180);eq(extent[2],476);eq(depth,0)
+  T.Draw=function()error("controlled trade paint failure")end
+  local ok,why=pcall(M.Draw,"TradeWnd",source,instance,{x=0,y=0,w=90,h=180,s=1},T)
+  eq(ok,false);check(tostring(why):find("controlled trade paint failure",1,true));eq(depth,0)
+  eq(actions,before);eq(source.rect.h,473);eq(flow.children[2].rect.h,232)
+  flow.fields.SnapToChildren=false;eq(M.OwnsScroll("TradeWnd",source),false)
+  ui.BeginChild,ui.EndChild,ui.SetCursorScreenPos,ui.GetCursorScreenPos=save.begin,save.finish,save.pos,save.get
+  ui.Dummy,ui.WindowFlags,ui.GetContentRegionAvail,ui.StyleVar=save.dummy,save.flags,save.avail,save.style
+  hs.UI.windows.Shown,hs.UI.windows.ChildShown=save.shown,save.childShown
+end
+-- Only the authored nested Loot viewport scrolls. Footers stay outside it;
+-- child slot IDs and positions retain the native Loot model's own actions.
+do
+  local pane=node("Screen","LootInvWnd",{node("InvSlot","LW_LootSlot0"),node("InvSlot","LW_LootSlot33")})
+  pane.fields.Style_VScroll=true
+  local save={begin=ui.BeginChild,finish=ui.EndChild,pos=ui.SetCursorScreenPos,get=ui.GetCursorScreenPos,
+    avail=ui.GetContentRegionAvail,dummy=ui.Dummy,flags=ui.WindowFlags,style=ui.StyleVar,shown=hs.UI.windows.Shown}
+  local depth,scroll,painted,childDraws,canvas,footers,parentClip=0,0,0,0,nil,0,false
+  ui.StyleVar=nil;ui.WindowFlags={NoBackground=128,HorizontalScrollbar=2048}
+  ui.SetCursorScreenPos=function()end;ui.GetCursorScreenPos=function()return 10,20-scroll end
+  ui.GetContentRegionAvail=function()return 90,100 end;ui.Dummy=function(w,h)eq(w,90);eq(h,700)end
+  ui.BeginChild=function(name,w,h,_,flags)
+    eq(parentClip,false,"nested child starts only after the parent graph restores its clips")
+    eq(name,"##source-loot-slots");eq(w,110);eq(h,100);eq(flags,128);depth=depth+1;return true
+  end
+  ui.EndChild=function()depth=depth-1 end
+  local T={PaintControl=function(_,n)eq(n,pane);painted=painted+1 end,
+    MeasureChildren=function(screen,n,owner,at)eq(screen,"LootWnd");eq(n,pane);eq(at.s,1);return 85,700 end,
+    DrawChildren=function(screen,n,owner,at)
+      eq(screen,"LootWnd");eq(n.children[2].name,"LW_LootSlot33");eq(footers,childDraws+1)
+      canvas=at;childDraws=childDraws+1
+    end}
+  local before=actions;local at={x=10,y=20,w=110,h=100,s=1}
+  local source=plan({pane})
+  T.Draw=function()
+    parentClip=true
+    check(M.DrawControl("LootWnd",pane,at,instance,T));eq(depth,0)
+    footers=footers+1 -- the original graph draws its Link/Loot/Done siblings
+    parentClip=false
+    return true
+  end
+  hs.UI.windows.Shown=function()return true end
+  check(M.Draw("LootWnd",source,instance,at,T));eq(canvas.y,20);eq(canvas.h,700);eq(canvas.w,90)
+  scroll=600;check(M.Draw("LootWnd",source,instance,at,T));eq(canvas.y,-580);eq(depth,0)
+  eq(painted,2);eq(childDraws,2);eq(actions,before)
+  T.DrawChildren=function()error("controlled loot paint failure")end
+  local ok,why=pcall(M.Draw,"LootWnd",source,instance,at,T)
+  eq(ok,false);check(tostring(why):find("controlled loot paint failure",1,true));eq(depth,0)
+  eq(M.DrawControl("LootWnd",pane,at,instance,T),false,"an error restores the owned model draw scope")
+  pane.fields.Style_VScroll=false;eq(M.DrawControl("LootWnd",pane,at,instance,T),false)
+  pane.fields.Style_VScroll=true;eq(M.DrawControl("BankWnd",pane,at,instance,T),false)
+  ui.BeginChild,ui.EndChild,ui.SetCursorScreenPos,ui.GetCursorScreenPos=save.begin,save.finish,save.pos,save.get
+  ui.GetContentRegionAvail,ui.Dummy,ui.WindowFlags,ui.StyleVar=save.avail,save.dummy,save.flags,save.style
+  hs.UI.windows.Shown=save.shown
 end
 currentContext={instance={messages={}}}
 local private=original(root.."/shared/model_presenters.lua")

@@ -25,6 +25,25 @@ local function walk(node,visit,depth)
   for _,child in ipairs(node.children or {})do if not walk(child,visit,depth+1)then return false end end
   return true
 end
+local function snapSize(screen,plan,instance,R,width,height)
+  if not R or not R.MeasureChildren then return width,height end
+  if screen~="CastSpellWnd"and screen~="GroupWindow"and screen~="ExtendedTargetWnd"then return width,height end
+  if screen=="GroupWindow"or screen=="ExtendedTargetWnd"then
+    -- This source uses a named stretch strategy around wrapping tiles. Other
+    -- skins contain parked pieces which must not determine the outer size.
+    local profile=instance and instance.profile
+    if not profile or tostring(profile.id):lower()~="sars-stock"then return width,height end
+  end
+  local snap=false
+  walk(plan,function(n)
+    if n.type=="TileLayoutBox"and(n.fields or{}).SnapToChildren==true then snap=true end
+  end)
+  if snap then
+    local w,h=R.MeasureChildren(screen,plan,instance,{x=0,y=0,w=width,h=height,s=1})
+    width,height=math.max(width,w),math.max(height,h)
+  end
+  return width,height
+end
 local function state(instance,screen)
   instance.statusPresenters=instance.statusPresenters or {}
   local s=instance.statusPresenters[screen]
@@ -169,6 +188,8 @@ local function rowFor(screen,node)
       for _,base in ipairs{10,16,30,35}do if eq>base and eq<=base+5 then return eq-base,"Gauge"..(eq-base)end end
     end
   elseif screen=="ExtendedTargetWnd"then
+    if node.type=="Screen"or node.type=="LayoutBox"or node.type=="TileLayoutBox"
+      or node.type=="HorizontalLayoutBox"or node.type=="VerticalLayoutBox"or node.type=="TemplateContainer"then return nil end
     local n=tonumber(name:match("^ETW_[%a]+(%d+)$"))
     if n and n>=0 and n<20 then return n,"ETW_Gauge"..n end
     local eq=tonumber(node.gaugeEqType or node.eqType)
@@ -178,6 +199,13 @@ local function rowFor(screen,node)
   end
 end
 
+local function targetHealthRow(node)
+  if node.type~="Gauge"then return nil end
+  local eq=tonumber(node.gaugeEqType or node.eqType)
+  if id(node):match("^ETW_Gauge%d+$")or eq and eq>=42 and eq<62 then
+    return rowFor("ExtendedTargetWnd",node)
+  end
+end
 local function groupRole(node)
   local name=id(node):gsub("^GW_","")
   local lower=name:lower();local eq=tonumber(node.gaugeEqType or node.eqType)
@@ -215,6 +243,7 @@ function M.GroupLayout(plan,instance,R,clientWidth,clientHeight,scale)
   local designW,designH=math.max(1,number((plan.rect or{}).w,200)),math.max(1,number((plan.rect or{}).h,100))
   local width=math.max(1,number(clientWidth,designW-number(insets.left)-number(insets.right)))
   local height=math.max(1,number(clientHeight,designH-number(insets.top)-number(insets.bottom)))
+  width,height=snapSize("GroupWindow",plan,instance,R,width,height)
   local metrics={tostring(width),tostring(height),tostring(call("settings","Option","font_face") or "")}
   if R and R.MeasureText then
     for font=1,3 do local w,h=R.MeasureText(instance,{font=font},"Wg");metrics[#metrics+1]=w/scale..":"..h/scale end
@@ -228,20 +257,30 @@ function M.GroupLayout(plan,instance,R,clientWidth,clientHeight,scale)
   local profile=instance.profile or{}
   local source=tostring(profile.source or profile.id or""):lower()
   local boxedProfile=source=="drakah-pers-adeptus-stock"or source=="nemesis-stock"
+  local repairFixed=source=="takus-stock"
   local function geometry(node,parent)
     if R and R.Geometry then
-      local at=R.Geometry(node,parent);local r=node.rect or{};local f=node.fields or{}
+      local at=R.Geometry(node,parent);local r=node.rect or{};local f=node.fields or{};local repaired=false
       if f.AutoStretch~=true then
-        if number(r.w)>0 and at.w<=0 then at.x,at.w=parent.x+number(r.x),r.w end
-        if number(r.h)>0 and at.h<=0 then at.y,at.h=parent.y+number(r.y),r.h end
+        if number(r.w)>0 and at.w<=0 then at.x,at.w=parent.x+number(r.x),r.w;repaired=true end
+        if number(r.h)>0 and at.h<=0 then at.y,at.h=parent.y+number(r.y),r.h;repaired=true end
       end
-      return at
+      return at,repaired
     end
     local r=node.rect or{};return{x=parent.x+number(r.x),y=parent.y+number(r.y),w=number(r.w),h=number(r.h),s=1}
   end
   local function index(node,parent,depth)
     depth=depth or 0;if depth>1 then nested=true end
-    local at=node==prepared and parent or geometry(node,parent)
+    local at,repaired
+    if node==prepared then at=parent else at,repaired=geometry(node,parent)end
+    if repaired and repairFixed then
+      -- Fixed source cells also declare zero opposing anchors. Persist the
+      -- resolved fallback in the drawing graph, not only its measurement.
+      local sourceRect=node.rect or{}
+      absolute(node,{x=number(sourceRect.x),y=number(sourceRect.y),
+        w=number(sourceRect.w,at.w),h=number(sourceRect.h,at.h)})
+      at=geometry(node,parent)
+    end
     if node~=prepared then nodes[#nodes+1]={node=node,at=at,depth=depth}end
     local row,role,native,eq=groupRole(node)
     if row then
@@ -462,23 +501,23 @@ local function prepare(screen,plan,instance,R)
   s.original,s.frame=plan,frame
   local prepared={};for k,v in pairs(plan)do prepared[k]=v end
   prepared.children={};for _,v in ipairs(plan.children)do prepared.children[#prepared.children+1]=v end
+  local profile=instance.profile or{}
+  if screen=="ExtendedTargetWnd"and tostring(profile.source or profile.id or""):lower()=="sparxx-stock"then
+    prepared=clone(prepared)
+    walk(prepared,function(n)
+      if n.type=="Label"and (id(n):match("^ETW_HPLabel%d+$")or id(n):match("^ETW_HPPercLabel%d+$"))then
+        local at=n.rect or{}
+        if number(at.w)>0 and number(at.h)>0 then absolute(n,at)end
+      end
+    end)
+  end
   local insets=R and R.ChromeInsets and R.ChromeInsets(plan,instance,1)or{}
   local insetW=number(insets.left)+number(insets.right)
   local insetH=number(insets.top)+number(insets.bottom)
   local width=math.max(1,number((plan.rect or {}).w,200)-insetW)
   local height=math.max(1,number((plan.rect or {}).h,100)-insetH)
-  if screen=="CastSpellWnd"and R and R.MeasureChildren then
-    local snap=false
-    walk(plan,function(n)
-      local f=n.fields or {}
-      if n.type=="TileLayoutBox"and f.SnapToChildren==true then snap=true end
-    end)
-    if snap then
-      local w,h=R.MeasureChildren(screen,plan,instance,{x=0,y=0,w=width,h=height,s=1})
-      width,height=math.max(width,w),math.max(height,h)
-    end
-  end
-  local baseHeight=height;local covered,first,sourceKeys,replaced={},{},{},{}
+  width,height=snapSize(screen,plan,instance,R,width,height)
+  local baseHeight=height;local covered,first,sourceKeys,replaced,sourceRects={},{},{},{},{}
   local function sourceKey(n,key)
     sourceKeys[n]=sourceKeys[n]or{};sourceKeys[n][key]=true
   end
@@ -492,23 +531,35 @@ local function prepare(screen,plan,instance,R)
     if screen=="CastSpellWnd"and n.type=="SpellGem"then
       local gi=gemIndex(n);if gi then choose("gem",n);sourceKey(n,"gem:"..gi)end
     end
-    if screen=="ExtendedTargetWnd"and n.type=="Gauge"then
-      local row=rowFor(screen,n);if row then choose("row",n);sourceKey(n,"row:"..row)end
+    if screen=="ExtendedTargetWnd"then
+      local row=targetHealthRow(n);if row then choose("row",n);sourceKey(n,"row:"..row)end
     end
     if n.type=="Gauge"then choose("gauge",n);sourceKey(n,"gauge:"..tostring(n.gaugeEqType or n.eqType))end
     if id(n)=="CSPW_SpellBookV"or id(n)=="CSPW_SpellBookH"then sourceKey(n,"book")end
   end)
-  local function cover(n)
+  local function cover(n,at)
+    if at then sourceRects[n]=at end
     local bi=buffIndex(screen,n);if bi then covered["buff:"..bi]=true end
     local gi=screen=="CastSpellWnd"and n.type=="SpellGem"and gemIndex(n)
     if gi then covered["gem:"..gi]=true end
-    local row=screen=="ExtendedTargetWnd"and n.type=="Gauge"and rowFor(screen,n)
-    if row then covered["row:"..row]=true end
+    local row=screen=="ExtendedTargetWnd"and targetHealthRow(n)
+    if row then
+      covered["row:"..row]=true
+      if at and not first.usableRow then first.row=n;first.usableRow=true end
+    end
     if n.type=="Gauge"then covered["gauge:"..tostring(n.gaugeEqType or n.eqType)]=true end
     if id(n)=="CSPW_SpellBookV"or id(n)=="CSPW_SpellBookH"then covered.book=true end
   end
   if R and R.VisitChildren then
-    R.VisitChildren(screen,plan,instance,{x=0,y=0,w=width,h=height,s=1},cover)
+    local client={x=0,y=0,w=width,h=height,s=1}
+    local opts
+    if screen=="ExtendedTargetWnd"and (plan.fields or{}).Style_VScroll==true and R.MeasureChildren then
+      local cw,ch=R.MeasureChildren(screen,plan,instance,client)
+      -- Existing offscreen rows are reachable by the inherited scroll child.
+      -- Do not replace their anchored rectangles with small duplicate gauges.
+      opts={clip={x=0,y=0,w=math.max(width,cw),h=math.max(height,ch),s=1}}
+    end
+    R.VisitChildren(screen,plan,instance,client,cover,opts)
   else
     -- Isolated presenter fixtures may not provide the renderer traversal.
     -- A real source graph is always checked through resolved placements.
@@ -530,7 +581,9 @@ local function prepare(screen,plan,instance,R)
     local n=clone(template);n.name,n.item,n.type=name,name,kind or template.type;n.children={}
     n.eqType,n.gaugeEqType=eq or "",eq or ""
     n.fields=n.fields or {};n.fields.ScreenID=name;n.fields.Visible=true
-    local w=math.max(12,number((template.rect or {}).w,24));local h=math.max(12,number((template.rect or {}).h,24))
+    local measured=key=="target row"and sourceRects[template]
+    local w=math.max(12,number(measured and measured.w or(template.rect or {}).w,24))
+    local h=math.max(12,number(measured and measured.h or(template.rect or {}).h,24))
     if extraX>0 and extraX+w>width then extraX=0;extraY=extraY+extraHeight+3;extraHeight=0 end
     n.rect={x=extraX,y=extraY,w=w,h=h}
     n.anchors={topToTop=true,bottomToTop=true,leftToLeft=true,rightToLeft=true,top=0,bottom=0,left=0,right=0,
@@ -660,7 +713,9 @@ local function drawRow(screen,node,box,instance,R,row,canonical)
     paintBox={x=box.x+(sourceBox.x-at.x)*s,y=box.y+(sourceBox.y-at.y)*s,w=sourceBox.w*s,h=sourceBox.h*s,s=s}
   end
   local options
-  if screen=="GroupWindow"and node.statusGroupName and node.statusGroupFitName then
+  if screen=="ExtendedTargetWnd"and node.type=="Label"and id(node)=="ETW_HPLabel"..row then
+    options={caption=call("character","Label",151+row)or""}
+  elseif screen=="GroupWindow"and node.statusGroupName and node.statusGroupFitName then
     local _,name,raw=call("character","Gauge",10+row)
     name=raw==-1 and""or tostring(name or""):match("^[^\n]*")
     local available=number(node.statusGroupTextWidth,paintBox.w/(box.s or 1))*(box.s or 1)
