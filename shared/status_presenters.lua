@@ -34,6 +34,7 @@ local gemIds,gemKeys={},{}
 for gem=0,11 do gemIds[gem],gemKeys[gem]="CSPW_Spell"..gem,"gem:"..gem end
 local gemOrientationChildren={CSPW_HorizontalOrientationBook=true,CSPW_HorizontalOrientationTemplate=true,
   CSPW_VerticalOrientationTemplate=true}
+local retainedCallObserver
 local function fn(module,name)
   local t=API[module]
   if API.Supports and not API.Supports(module,name) then return nil end
@@ -43,7 +44,11 @@ local function call(module,name,...)
   local methods=API[module]
   local f=methods and rawget(methods,name)
   if type(f)~="function"then f=fn(module,name)end
-  if type(f)=="function"then return f(...)end
+  if type(f)=="function"then
+    -- Gauge and visibility snapshots record from their scope caches below.
+    if retainedCallObserver and name~="Gauge" and name~="ChildShown" then return retainedCallObserver(module,name,f,...) end
+    return f(...)
+  end
 end
 local function id(node) return tostring(node.name or node.item or "") end
 local extendedSlots=setmetatable({},{__mode="k"})
@@ -169,7 +174,8 @@ local function childShown(screen,child)
   if value==nil then
     value=call("windows","ChildShown",screen,child)
     reads.shown[child]=value==nil and unconstrained or value
-  elseif value==unconstrained then return nil end
+  elseif value==unconstrained then value=nil end
+  if reads.retainWatch then reads.retainWatch.shown[child]=value==nil and unconstrained or value end
   return value
 end
 local function shown(screen,child)
@@ -231,7 +237,10 @@ local function gaugeInfo(screen,kind)
   local reads=drawReads
   if not reads or reads.screen~=screen then return call("character","Gauge",kind)end
   local info=reads.gauges[kind]
-  if info then return table.unpack(info,1,6) end
+  if info then
+    if reads.retainWatch then reads.retainWatch.gauges[kind]=info end
+    return table.unpack(info,1,6)
+  end
   local slot=screen=="GroupWindow" and groupGaugeSlots[kind]
   local groupGauges=slot and API.character and API.character.GroupGauges
   if type(groupGauges)=="function"then
@@ -254,6 +263,7 @@ local function gaugeInfo(screen,kind)
   info=readResult(reads)
   info[1],info[2],info[3],info[4],info[5],info[6]=call("character","Gauge",kind)
   reads.gauges[kind]=info
+  if reads.retainWatch then reads.retainWatch.gauges[kind]=info end
   return table.unpack(info,1,6)
 end
 local function hit(screen,child,box,on,withActive,hitId)
@@ -1758,9 +1768,195 @@ local function passiveExtendedPlan(screen,plan,instance,R)
   s.compoundProjection={plan=plan,absent=absent,rows=rows,visible=visible}
   return visible
 end
+
+-- A quiet Extended Target body is a good candidate for retaining its exact
+-- draw commands. Interactive frames and changing model values still use the
+-- original presenter, which owns layout, order, actions and texture lookup.
+local retainedTypes={Screen=true,Page=true,LayoutBox=true,TemplateContainer=true,
+  Label=true,StaticText=true,StaticHeader=true,StaticFrame=true,
+  StaticAnimation=true,StaticTintedBlendAnimation=true,Gauge=true,TileLayoutBox=true}
+local retainedGraphs=setmetatable({},{__mode="k"})
+local nativeReplay,nextReplayProbe
+
+local function findNativeReplay(frame)
+  if nativeReplay then return nativeReplay end
+  if nextReplayProbe and frame<nextReplayProbe then return end
+  nextReplayProbe=frame+60
+  local plugins=API.plugins
+  local plugin=plugins and plugins.Get and plugins.Get("plugin:ui-pack-native")
+  if not plugin or type(plugin.Version)~="function" or plugin.Version()~=2 then return end
+  local capture,finish,begin,replay=plugin.BeginCapture,plugin.EndCapture,plugin.BeginReplay,plugin.EndReplay
+  if type(capture)~="function" or type(finish)~="function" or type(begin)~="function" or type(replay)~="function" then return end
+  nativeReplay={capture=capture,finish=finish,begin=begin,replay=replay}
+  return nativeReplay
+end
+
+local function retainedGraph(plan)
+  local validated=retainedGraphs[plan]
+  if validated~=nil then return validated end
+  validated=plan._packColorsNormalized==true and walk(plan,function(node)
+    if retainedTypes[node.type] then return true end
+    if node.type=="Button" and rowFor("ExtendedTargetWnd",node) then return true end
+    return (node.type=="VerticalLayoutBox" or node.type=="HorizontalLayoutBox")
+      and (node.fields or EMPTY).Style_Dividers==false
+  end)
+  retainedGraphs[plan]=validated
+  return validated
+end
+
+local observableCalls={windows={Text=true,ChildColor=true,ChildUnder=true,ChildArt=true,
+    ChildGauge=true,ChildShown=true,ChildState=true},character={Label=true,Gauge=true}}
+local function watchCall(record,module,member,fn,...)
+  if module=="assets" and (member=="InterfaceImage" or member=="Image") then return fn(...) end
+  if not (observableCalls[module] and observableCalls[module][member]) or select("#",...)>3 then
+    record.bad=true
+    return fn(...)
+  end
+  local args=table.pack(...)
+  local key=module.."\0"..member.."\0"..args.n
+  for i=1,args.n do
+    local arg,kind=args[i],type(args[i])
+    if (kind=="string" and arg:find("\0",1,true))
+      or (kind~="string" and kind~="number" and kind~="boolean" and kind~="nil") then
+      record.bad=true
+      return fn(...)
+    end
+    key=key.."\0"..kind..":"..tostring(arg)
+  end
+  local result=table.pack(fn(...))
+  if result.n>6 then record.bad=true end
+  for i=1,result.n do
+    local kind=type(result[i])
+    if kind=="userdata" and module=="windows" and member=="ChildArt" and i==1 then
+      record.extraTextures[result[i]]=true
+    elseif kind~="boolean" and kind~="string" and kind~="number" and kind~="nil" then record.bad=true end
+  end
+  local previous=record.seen[key]
+  if previous then
+    for i=1,6 do if previous.result[i]~=result[i] then record.bad=true end end
+  elseif #record.calls<384 then
+    record.methods[module.."\0"..member]={module,member,fn}
+    local entry={fn=fn,args=args,result=result}
+    record.seen[key]=entry
+    record.calls[#record.calls+1]=entry
+  else
+    record.bad=true
+  end
+  return table.unpack(result,1,result.n)
+end
+
+local function sameValues(expected,a,b,c,d,e,f)
+  return expected[1]==a and expected[2]==b and expected[3]==c
+    and expected[4]==d and expected[5]==e and expected[6]==f
+end
+
+local function validRetained(record,plan,client,font)
+  if record.plan~=plan or record.x~=client.x or record.y~=client.y or record.w~=client.w
+    or record.h~=client.h or record.s~=client.s or record.font~=font then return false end
+  for _,method in pairs(record.methods)do
+    local group=API[method[1]]
+    if not group or group[method[2]]~=method[3] then return false end
+  end
+  for name,expected in pairs(record.shown)do
+    local actual=childShown("ExtendedTargetWnd",name)
+    if expected~=(actual==nil and unconstrained or actual) then return false end
+  end
+  for kind,expected in pairs(record.gauges)do
+    if not sameValues(expected,gaugeInfo("ExtendedTargetWnd",kind))then return false end
+  end
+  for _,entry in ipairs(record.calls)do
+    local args=entry.args
+    if not sameValues(entry.result,entry.fn(table.unpack(args,1,args.n))) then return false end
+  end
+  return true
+end
+
+local function probeRetainedArt(record,R,instance)
+  if not R.ProbeArtwork(instance,record.artwork) then return false end
+  for texture in pairs(record.extraTextures)do ui.DrawImage(texture,0,0,0,0) end
+  return true
+end
+
+local function tryRetained(replay,record,R,instance)
+  if not replay.begin(record.token) then return false end
+  -- Normal Lua image submission is the client’s texture validation gate.
+  -- These empty-clip probes never reach the backend as draw calls.
+  ui.PushClipRect(0,0,0,0,true)
+  local ok,ready=pcall(probeRetainedArt,record,R,instance)
+  ui.PopClipRect()
+  if not ok or not ready then replay.replay(0);return false end
+  return replay.replay(record.token)==true
+end
+
+local function drawRetainedExtended(plan,instance,client,R)
+  local reads=drawReads
+  local s=reads.extendedState
+  if reads.extendedInteractive~=false
+    or not R.CaptureArtwork or not R.EndArtworkCapture
+    or not R.ProbeArtwork or not R.Bindings or not R.Bindings.WatchCalls then
+    return R.Draw("ExtendedTargetWnd",plan,instance,client,M)
+  end
+  local native=findNativeReplay(s.drawFrame)
+  if not native or s.retainedRetry and s.drawFrame<s.retainedRetry or not retainedGraph(plan) then
+    return R.Draw("ExtendedTargetWnd",plan,instance,client,M)
+  end
+  local record=s.retainedBody
+  local font=call("settings","Option","font_face")
+  if record and validRetained(record,plan,client,font) then
+    if tryRetained(native,record,R,instance) then
+      s.retainedHits=(s.retainedHits or 0)+1
+      record.hits=record.hits+1
+      if record.hits==4 then s.retainedCooldown=nil end
+      return true
+    end
+    -- Unload, atlas replacement, or a changed clip invalidates the snapshot.
+    s.retainedRejects=(s.retainedRejects or 0)+1
+  elseif record then
+    s.retainedReadChanges=(s.retainedReadChanges or 0)+1
+  end
+  s.retainedBody=nil
+  if record and record.hits<4 then
+    -- Capturing costs more than a normal draw. Avoid repeating it during
+    -- combat if health or occupancy keeps changing before it pays for itself.
+    local cooldown=math.min(64,(s.retainedCooldown or 2)*2)
+    s.retainedCooldown=cooldown
+    s.retainedRetry=s.drawFrame+cooldown
+    return R.Draw("ExtendedTargetWnd",plan,instance,client,M)
+  end
+  if native.capture()~=true then
+    nativeReplay=nil
+    return R.Draw("ExtendedTargetWnd",plan,instance,client,M)
+  end
+  record={plan=plan,x=client.x,y=client.y,w=client.w,h=client.h,s=client.s,font=font,
+    calls={},methods={},seen={},shown={},gauges={},extraTextures={},hits=0}
+  local function observer(...)return watchCall(record,...)end
+  local prior=R.Bindings.WatchCalls(observer)
+  local previous=retainedCallObserver
+  local artwork=R.CaptureArtwork()
+  retainedCallObserver=observer
+  reads.retainWatch=record
+  local ok,drawn,why=pcall(R.Draw,"ExtendedTargetWnd",plan,instance,client,M)
+  reads.retainWatch=nil
+  retainedCallObserver=previous
+  R.Bindings.WatchCalls(prior)
+  R.EndArtworkCapture(artwork)
+  local token=native.finish()
+  if not ok then error(drawn,0) end
+  if drawn and type(token)=="number" and not record.bad and not artwork.bad then
+    for kind,live in pairs(record.gauges)do record.gauges[kind]=table.pack(table.unpack(live,1,6)) end
+    record.token,record.artwork,record.seen=token,artwork,nil
+    s.retainedBody=record
+    s.retainedCaptures=(s.retainedCaptures or 0)+1
+  else
+    s.retainedRetry=s.drawFrame+90
+  end
+  return drawn,why
+end
+
 local function paintPrepared(screen,plan,instance,client,R)
   plan=passiveExtendedPlan(screen,plan,instance,R)
   setBuffGeometry(screen,plan,instance,client,R)
+  if screen=="ExtendedTargetWnd" then return drawRetainedExtended(plan,instance,client,R) end
   if not buffSlots[screen] then return R.Draw(screen,plan,instance,client,M)end
   local s=state(instance,screen)
   local reads=drawReads

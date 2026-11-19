@@ -2,6 +2,13 @@
 -- All actions use the public host contract; no invented commands or window owners.
 local API = hs.UI
 local B = {}
+local callWatch
+
+function B.WatchCalls(watch)
+  local previous=callWatch
+  callWatch=watch
+  return previous
+end
 
 local presenterKeys={"hailstone_skin_status_presenters","hailstone_skin_presenters","hailstone_skin_model_presenters"}
 local activeScreen,activePresenter
@@ -69,7 +76,10 @@ function B.Call(module, member, ...)
   local fn=methods and rawget(methods,member)
   -- Optional methods on older facades still use capability detection.
   if type(fn)~="function" then fn=B.Function(module,member) end
-  if type(fn)=="function" then return fn(...) end
+  if type(fn)=="function" then
+    if callWatch then return callWatch(module,member,fn,...) end
+    return fn(...)
+  end
 end
 
 function B.Id(node) return tostring(node.name or node.item or "") end

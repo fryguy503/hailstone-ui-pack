@@ -17,6 +17,12 @@ Bundled-art rendering requires client UI API 1.7 and
 configured game-art lookup or selected-theme drawing when artwork is unavailable.
 The guarded fallback does not require a separate layout compilation step.
 
+The optional Windows x64 rendering companion uses the client plugin SDK and
+shares its Dear ImGui context. This preview uses Dear ImGui 1.91.9 from the
+tested Hailstone build. The installer's version check is a lower bound. Use a
+client that explicitly supports the modular UI and bundled-art APIs, and
+revalidate the binary if the client's Dear ImGui version or build options change.
+
 Use a client that supports the current modular API, then select an installed
 interface through the normal Interface list. UI addons are full client
 interfaces and can call host interface, account and game actions. No ScriptHost

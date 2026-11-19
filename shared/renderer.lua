@@ -17,7 +17,7 @@ local supported = {Screen=true, Page=true, TabBox=true, Label=true, StaticText=t
 -- Placement entries are private to a traversal. A synchronous presenter may
 -- borrow its draw rectangles. General draws and visitors still own theirs.
 local placementPool,activePlacements={},{}
-local activeFrame,paintFilter,borrowDrawRects
+local activeFrame,paintFilter,borrowDrawRects,artworkCapture
 local drawClipDepth=0
 local function borrowPlacements()
   local depth=#activePlacements+1
@@ -336,14 +336,57 @@ local sharedImages={
   ["uifiles/qqcustom-stock/cs_buttons.bmp"]={path="uifiles/qqui-stock/CS_Buttons.bmp",w=256,h=256},
   ["uifiles/qqui-stock/buff_background.tga"]={path="uifiles/DuxaUI-stock/Buff_Background.tga",w=64,h=128},
 }
-local function image(instance, name, clock)
+function R.CaptureArtwork()
+  local capture={images={},seen={},bad=false,parent=artworkCapture}
+  artworkCapture=capture
+  return capture
+end
+function R.EndArtworkCapture(capture)
+  if type(capture)~="table" or capture.closed then return capture end
+  local current=artworkCapture
+  while current and current~=capture do current=current.parent end
+  if not current then capture.bad=true;return capture end
+  -- An interrupted nested capture must not leave a stale recording scope.
+  while artworkCapture~=capture do
+    local nested=artworkCapture
+    artworkCapture=nested.parent
+    nested.parent,nested.closed,nested.bad=nil,true,true
+    capture.bad=true
+  end
+  artworkCapture=capture.parent
+  capture.parent,capture.closed=nil,true
+  return capture
+end
+local function recordArtwork(instance,name,texture,w,h)
+  local capture=artworkCapture
+  if not capture then return end
+  if not texture or type(w)~="number" or type(h)~="number" or w<=0 or h<=0
+      or w~=w or h~=h or w==math.huge or h==math.huge then capture.bad=true;return end
+  if capture.instance and capture.instance~=instance then capture.bad=true;return end
+  capture.instance=instance
+  local saved=capture.seen[name]
+  if saved then
+    if not rawequal(saved.texture,texture) or saved.w~=w or saved.h~=h then capture.bad=true end
+  elseif #capture.images>=16 then capture.bad=true
+  else
+    saved={name=name,texture=texture,w=w,h=h}
+    capture.seen[name]=saved
+    capture.images[#capture.images+1]=saved
+  end
+end
+local function image(instance, name, clock, fresh)
   local entry = find(instance,"images",name)
   if not entry or not (entry.path or entry.interface_path) then
+    if fresh then instance.spriteFrames=nil end
+    if artworkCapture then artworkCapture.bad=true end
     emit(instance,"image:"..tostring(name),"Missing compiled image reference: "..tostring(name)); return nil
   end
   local cacheKey=entry.interface_path or entry.path
   local cached=instance.textures[cacheKey]
-  if cached and cached.frame==clock then return cached.texture,cached.w,cached.h end
+  if cached and cached.frame==clock and not fresh then
+    if artworkCapture then recordArtwork(instance,name,cached.texture,cached.w,cached.h)end
+    return cached.texture,cached.w,cached.h
+  end
   local texture,w,h
   if entry.interface_path then texture,w,h=B.Call("assets","InterfaceImage",entry.interface_path) end
   if not texture and entry.path then texture,w,h=B.Call("assets","Image",entry.path) end
@@ -356,10 +399,30 @@ local function image(instance, name, clock)
         .."; using compatible shared artwork: "..shared.path)
     end
   end
+  if fresh and cached and (not rawequal(cached.texture,texture) or cached.w~=w or cached.h~=h)then
+    instance.spriteFrames=nil -- a failed replay must not leave same-frame sprites using the retired atlas
+  end
   if not cached then cached={};instance.textures[cacheKey]=cached end
   cached.frame,cached.texture,cached.w,cached.h=clock,texture,w,h
+  if artworkCapture then recordArtwork(instance,name,texture,w,h)end
   if not texture then emit(instance,"image:"..name,"Missing artwork: "..tostring(entry.path or entry.interface_path)); return nil end
   return texture,w,h
+end
+
+function R.ProbeArtwork(instance,capture)
+  if type(capture)~="table" or capture.bad or type(capture.images)~="table"
+      or #capture.images>16 or capture.instance and capture.instance~=instance then return false end
+  local clock=ui.GetFrameCount()
+  for _,saved in ipairs(capture.images)do
+    -- Reacquire even in the capture frame: a host texture may have retired
+    -- since its prior lookup. Tokens stay opaque and are never converted.
+    local texture,w,h=image(instance,saved.name,clock,true)
+    if not texture or not rawequal(texture,saved.texture) or w~=saved.w or h~=saved.h then return false end
+  end
+  for _,saved in ipairs(capture.images)do
+    ui.DrawImage(saved.texture,0,0,0,0,0,0,1,1,1,1,1,1)
+  end
+  return true
 end
 
 local function finite(value)
@@ -368,6 +431,9 @@ local function finite(value)
 end
 local function resolveAnimation(instance,name,at,clock)
   local animation=find(instance,"animations",name)
+  if artworkCapture and animation and truth(animation.cycle) and #(animation.frames or EMPTY)>1 then
+    artworkCapture.bad=true
+  end
   if animation and truth(animation.grid) then
     emit(instance,"grid:"..name,"Grid artwork requires a resolved host cell: "..name)
     return false -- ItemIcon/ChildArt/GemInfo provide actual cells; never paint a whole item atlas.
@@ -399,7 +465,7 @@ local function drawAnimation(instance, name, x, y, w, h, tint, at, fill, vertica
     if not sprites then sprites={};instance.spriteFrames=sprites end
     local sprite=sprites[name]
     if not sprite then sprite={};sprites[name]=sprite end
-    if sprite.clock~=clock then
+    if sprite.clock~=clock or artworkCapture then
       sprite.texture,sprite.u0,sprite.v0,sprite.u1,sprite.v1=resolveAnimation(instance,name,nil,clock)
       sprite.clock=clock
     end
@@ -495,14 +561,17 @@ local function framePieces(instance,f,box,scale,edgesOnly,piece)
   piece(f.RightTop,x+w-rtw,y+trh,rtw,rth)
   piece(f.RightBottom,x+w-rbw,y+h-brh-rbh,rbw,rbh)
 end
-local function frameInstructions(instance,reference,f,box,scale,edgesOnly)
-  -- A named packaged frame's artwork geometry is static at a fixed screen
-  -- rectangle. Keep only those quads. Images, animation and tints are live.
-  if instance.dataRoot~="lib/layouts" or type(reference)~="string" then return nil end
+local function frameInstructions(instance,reference,f,box,scale,edgesOnly,cacheInline)
+  -- Packaged templates, including inline window borders and titlebars, keep
+  -- static geometry. Ad hoc templates retain their live table semantics.
+  if instance.dataRoot~="lib/layouts" then return nil end
+  local key=type(reference)=="string" and reference
+    or cacheInline and instance.index.portable==1 and f
+  if not key then return nil end
   local all=instance.frameInstructions
-  if not all then all={};instance.frameInstructions=all end
-  local variants=all[reference]
-  if not variants then variants={};all[reference]=variants end
+  if not all then all=setmetatable({},{__mode="k"});instance.frameInstructions=all end
+  local variants=all[key]
+  if not variants then variants={};all[key]=variants end
   edgesOnly=not not edgesOnly
   for _,entry in ipairs(variants) do
     if entry.x==box.x and entry.y==box.y and entry.w==box.w and entry.h==box.h
@@ -523,7 +592,30 @@ local function frameInstructions(instance,reference,f,box,scale,edgesOnly)
   return quads
 end
 local compileImageQuads,drawImageQuads=rawget(ui,"CompileImageQuads"),rawget(ui,"DrawImageQuads")
-local function buildFrameBatch(instance,quads,clock)
+local function compileHostFrame(definitions)
+  return compileImageQuads(definitions) or false
+end
+local nativeFrame,nextNativeFrameProbe
+local function nativeFrameMethods(clock)
+  if nativeFrame then return nativeFrame end
+  if nextNativeFrameProbe and clock<nextNativeFrameProbe then return end
+  nextNativeFrameProbe=clock+60
+  local plugins=hs.UI.plugins
+  local plugin=plugins and plugins.Get and plugins.Get("plugin:ui-pack-native")
+  if not plugin or type(plugin.Version)~="function" or plugin.Version()~=2 then return end
+  local compile,begin,finish=plugin.CompileFrameQuads,plugin.BeginFrameQuads,plugin.EndFrameQuads
+  if type(compile)~="function" or type(begin)~="function" or type(finish)~="function" then return end
+  nativeFrame={compile=compile,begin=begin,finish=finish}
+  return nativeFrame
+end
+local function compileNativeFrame(definitions)
+  -- The public bridge exposes keyed tables through arg_field. This field
+  -- gives native code a length and selects that representation for the array.
+  definitions.count=#definitions
+  return nativeFrame.compile(definitions)
+end
+
+local function buildFrameBatch(instance,quads,clock,compile)
   local definitions,textures,slots,sources={},{},{},{}
   for _,q in ipairs(quads)do
     local name,x,y,w,h=q[1],q[2],q[3],q[4],q[5]
@@ -545,40 +637,90 @@ local function buildFrameBatch(instance,quads,clock)
     definitions[n+4],definitions[n+5],definitions[n+6]=x+w,y+h,u0
     definitions[n+7],definitions[n+8],definitions[n+9]=v0,u1,v1
   end
-  local program=compileImageQuads(definitions)
+  local program=compile(definitions)
   if program then return {program=program,sources=sources,textures=textures} end
-  return false
+  return program
 end
 
-local function paintFrameBatch(instance,quads,tint)
-  local clock=activeFrame or ui.GetFrameCount()
-  local batch=quads.batch
-  if batch==nil then
-    batch=buildFrameBatch(instance,quads,clock)
-    quads.batch=batch
-  end
-  if not batch then return false end
+local function acquireFrameTextures(instance,batch,clock)
   -- A retained frame has only sprite geometry. Acquire its atlas handles
   -- again with the current host lease and recompile if the dimensions changed.
   for i,source in ipairs(batch.sources)do
     local texture,w,h=image(instance,source[1],clock)
-    if not texture or w~=source[2] or h~=source[3] then
-      quads.batch=nil
-      return false
-    end
+    if not texture or w~=source[2] or h~=source[3] then return false end
     batch.textures[i]=texture
   end
+  return true
+end
+
+local function paintFrameBatch(instance,quads,tint,clock)
+  local batch=quads.batch
+  if batch==nil then
+    batch=buildFrameBatch(instance,quads,clock,compileHostFrame)
+    quads.batch=batch
+  end
+  if not batch then return false end
+  if not acquireFrameTextures(instance,batch,clock) then quads.batch=nil;return false end
   if tint~=WHITE and type(tint)=="table"then
     return drawImageQuads(batch.program,batch.textures,components(tint))
   end
   return drawImageQuads(batch.program,batch.textures,1,1,1,1)
 end
 
+local function drawFrameProbes(textures)
+  for _,texture in ipairs(textures)do ui.DrawImage(texture,0,0,0,0) end
+end
+
+local function paintNativeFrameBatch(instance,quads,tint,clock)
+  local batch=quads.nativeBatch
+  if batch==false or (quads.nativeRetry and clock<quads.nativeRetry) then return false end
+  if not quads.firstDraw then quads.firstDraw=clock end
+  -- Avoid compiling throwaway programs during a window drag or resize.
+  if quads.firstDraw==clock then return false end
+  local native=nativeFrameMethods(clock)
+  if not native then return false end
+  if batch==nil then
+    batch=buildFrameBatch(instance,quads,clock,compileNativeFrame)
+    quads.nativeBatch=batch
+    if not batch then
+      if batch==nil then quads.nativeRetry=clock+30 end
+      return false
+    end
+  end
+  if not acquireFrameTextures(instance,batch,clock) then
+    quads.nativeBatch=nil
+    quads.nativeRetry=clock+8
+    return false
+  end
+  local ready=native.begin(batch.program)
+  if ready~=true then
+    quads.nativeBatch=nil
+    quads.nativeRetry=clock+30
+    if ready==nil then nativeFrame=nil end
+    return false
+  end
+  -- Submit each opaque token through the actual Lua texture lease gate.
+  -- Empty-clip, zero-area probes cannot contribute visible pixels.
+  ui.PushClipRect(0,0,0,0,true)
+  local ok,why=pcall(drawFrameProbes,batch.textures)
+  ui.PopClipRect()
+  if not ok then native.finish(0);error(why,0) end
+  local drew
+  if tint~=WHITE and type(tint)=="table" then drew=native.finish(batch.program,components(tint))
+  else drew=native.finish(batch.program,1,1,1,1) end
+  if drew~=true then quads.nativeRetry=clock+8 end
+  return drew==true
+end
+
 local function paintFrame(instance,f,box,tint,scale,edgesOnly,quads)
   local any=false
   if quads then
-    if #quads>=3 and compileImageQuads and drawImageQuads and instance.index.portable==1
-        and paintFrameBatch(instance,quads,tint) then return true end
+    if #quads>=3 and instance.index.portable==1 then
+      local clock=activeFrame or ui.GetFrameCount()
+      if compileImageQuads and drawImageQuads then
+        if paintFrameBatch(instance,quads,tint,clock) then return true end
+      elseif not artworkCapture and paintNativeFrameBatch(instance,quads,tint,clock) then return true end
+    end
     for _,q in ipairs(quads) do
       if drawAnimation(instance,q[1],q[2],q[3],q[4],q[5],tint) then any=true end
     end
@@ -590,12 +732,12 @@ local function paintFrame(instance,f,box,tint,scale,edgesOnly,quads)
   return any
 end
 
-function R.Frame(instance, reference, box, tint, scale, edgesOnly)
+function R.Frame(instance, reference, box, tint, scale, edgesOnly, cacheInline)
   local f=template(instance,reference)
   if not f or box.w<=0 or box.h<=0 then return false end
   scale=math.max(0,number(scale,1))
   local x,y,w,h=box.x,box.y,box.w,box.h
-  local quads=frameInstructions(instance,reference,f,box,scale,edgesOnly)
+  local quads=frameInstructions(instance,reference,f,box,scale,edgesOnly,cacheInline)
   ui.PushClipRect(x,y,x+w,y+h,true)
   local ok,result=pcall(paintFrame,instance,f,box,tint,scale,edgesOnly,quads)
   ui.PopClipRect()
@@ -657,11 +799,11 @@ function R.Chrome(instance, box, opts)
   if f then
     if not opts.frameOnly then any=R.Animation(instance,f.Background,box,{1,1,1,opts.alpha or 1}) end
     if not opts.backgroundOnly and opts.border~=false then
-      framed=R.Frame(instance,f.Border,box,{1,1,1,opts.alpha or 1},scale,opts.frameOnly)
+      framed=R.Frame(instance,f.Border,box,{1,1,1,opts.alpha or 1},scale,opts.frameOnly,opts.cacheInline)
       any=framed or any
     end
     if not opts.frameOnly and not opts.backgroundOnly and opts.titleHeight and f.Titlebar then
-      any=R.Frame(instance,f.Titlebar,rect(box.x,box.y,box.w,opts.titleHeight),WHITE,scale) or any
+      any=R.Frame(instance,f.Titlebar,rect(box.x,box.y,box.w,opts.titleHeight),WHITE,scale,nil,opts.cacheInline) or any
     end
   end
   if not framed and not opts.backgroundOnly and opts.border~=false then
@@ -761,12 +903,12 @@ function R.WindowChrome(plan,title,outer,instance,opts)
   local f=windowTemplate(plan,instance) or {}
   local metrics=R.ChromeInsets(plan,instance,s,opts)
   local chrome={s=s,template=f,border=windowFlag(plan,"Style_Border",true),
-    alpha=opts.alpha,opaque=opts.opaque,color=opts.color}
+    alpha=opts.alpha,opaque=opts.opaque,color=opts.color,cacheInline=true}
   if windowFlag(plan,"Style_Transparent",false) then chrome.frameOnly=true end
   R.Chrome(instance,outer,chrome)
   local tint={1,1,1,opts.alpha or 1}
   if metrics.titleHeight>0 then
-    R.Frame(instance,f.Titlebar,rect(outer.x,outer.y,outer.w,metrics.titleArtHeight),tint,s)
+    R.Frame(instance,f.Titlebar,rect(outer.x,outer.y,outer.w,metrics.titleArtHeight),tint,s,nil,true)
     local close=metrics.close
     if close and opts.close~=false then
       local c=template(instance,f.CloseBox) or {}

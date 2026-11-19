@@ -1344,5 +1344,75 @@ do
   end
   dofile=originalDofile
 end
+-- Safe passive layouts use the native renderer regardless of profile name.
+-- A changed gauge or interactive frame still runs the source presenter.
+do
+  reset()
+  local captures,replays,draws=0,0,0
+  local currentWatch
+  local plugin={
+    Version=function()return 2 end,
+    BeginCapture=function()captures=captures+1;return true end,
+    EndCapture=function()return captures end,
+    BeginReplay=function(token)check(token>0);return true end,
+    EndReplay=function(token)check(token>0);replays=replays+1;return true end,
+  }
+  hs.UI.plugins={Get=function(key)equal(key,"plugin:ui-pack-native");return plugin end}
+  local renderer={}
+  for key,value in pairs(R)do renderer[key]=value end
+  renderer.Bindings={WatchCalls=function(observer)
+    local previous=currentWatch
+    currentWatch=observer
+    return previous
+  end}
+  renderer.CaptureArtwork=function()return {}end
+  renderer.EndArtworkCapture=function()end
+  renderer.ProbeArtwork=function()return true end
+  renderer.PaintGauge=function(_,_,_,_,value)S.latestHealth=value.fraction end
+  renderer.Draw=function(screen,p,inst,at)
+    draws=draws+1
+    for _,n in ipairs(p.children)do
+      if M.Shown(screen,n)~=false then
+        check(M.DrawControl(screen,n,at,inst,renderer))
+      end
+    end
+    return true
+  end
+  local p=plan()
+  local health=node("Gauge","ETW_Gauge0",5,6,80,20,42)
+  p._packColorsNormalized,health._packColorsNormalized=true,true
+  p.children={health}
+  for row=0,19 do S.shown["ETW_Gauge"..row]=row==0 end
+  S.windowHovered=false
+  for _,profile in ipairs{"default","Graphite-stock"}do
+    local inst=instance()
+    inst.profile={id=profile}
+    S.gauges={[42]={.35,"Target",350}}
+    local previousCaptures,previousReplays,previousDraws=captures,replays,draws
+    local function draw()
+      S.frame=S.frame+1
+      check(M.Draw("ExtendedTargetWnd",p,inst,box,renderer))
+    end
+    draw()
+    equal(captures,previousCaptures+1)
+    equal(draws,previousDraws+1)
+    equal(S.latestHealth,.35)
+    equal(currentWatch,nil,"capture restored the binding scope")
+    draw()
+    equal(replays,previousReplays+1)
+    equal(draws,previousDraws+1,"replay avoids the original draw")
+    S.windowHovered=true;S.click=true
+    draw()
+    equal(replays,previousReplays+1)
+    equal(events("click")[#events("click")][3],"ETW_Gauge0")
+    S.windowHovered=false;S.click=false
+    S.gauges[42]={.74,"Target",740}
+    draw()
+    equal(replays,previousReplays+1)
+    equal(S.latestHealth,.74,"a changed gauge paints fresh values")
+    S.frame=S.frame+64
+  end
+  hs.UI.plugins=nil
+end
 equal(S.fonts or 0,0,"font stack")
 print("source status presenters: "..total.." assertions passed")

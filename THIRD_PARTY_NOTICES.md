@@ -34,8 +34,8 @@ Credits retained from the supplied interface documentation include:
   retained in `licenses/Nemesis-GPL-2.0.txt`. The adapted Lua presentation tables
   are included in editable form in this repository.
 
-The Nemesis original-source supplement for version `0.2.0-preview.7` is
-`Hailstone-UI-Pack-Nemesis-Source-0.2.0-preview.7.zip`, distributed with the
+The Nemesis original-source supplement for version `0.2.0-preview.8` is
+`Hailstone-UI-Pack-Nemesis-Source-0.2.0-preview.8.zip`, distributed with the
 release. It retains the original editable XML, image and cursor inputs and
 license notices. Use it alongside the matching public GitHub source archive,
 which contains the complete editable Lua runtime, conversion/build tools,

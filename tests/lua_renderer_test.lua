@@ -1582,4 +1582,136 @@ run("older UI APIs keep game artwork without an InterfaceImage method",function(
   end,debug.traceback)
   rawset(api.assets,"InterfaceImage",method);assert(ok,why)
 end)
+run("artwork capture observes cached sprites and probes fresh opaque tokens",function()
+  local atlas="assets/"..string.rep("c",64)..".png"
+  local I=fixture({version=2,portable=1,windows={},images={Atlas={interface_path=atlas}},
+    animations={A={frames={{image="Atlas",rect={x=0,y=0,w=8,h=8}}}}}})
+  local first,replacement={},{}
+  S.interfaceImages={[atlas]={first,64,32}}
+  check(R.Animation(I,"A",box)) -- populate both same-frame caches before capture
+  local capture=R.CaptureArtwork()
+  check(R.Animation(I,"A",box));check(R.Animation(I,"A",box))
+  R.EndArtworkCapture(capture)
+  equal(capture.bad,false);equal(#capture.images,1)
+  local saved=capture.images[1]
+  equal(saved.name,"Atlas");equal(saved.texture,first);equal(saved.w,64);equal(saved.h,32)
+  equal(capture.seen.Atlas,saved)
+  local function reads()
+    local n=0;for _,event in ipairs(S.events)do if event.kind=="interfaceAsset"then n=n+1 end end;return n
+  end
+  equal(reads(),1,"capture records a cached lookup without inventing a new atlas")
+  S.draws={}
+  check(R.ProbeArtwork(I,capture));equal(reads(),2,"probe reacquires from the actual host in the same frame")
+  equal(#S.draws,1);equal(S.draws[1][1],first)
+  for n=2,5 do equal(S.draws[1][n],0,"probes are zero-area at the origin")end
+  -- A different token with equal dimensions still invalidates native replay.
+  S.interfaceImages[atlas]={replacement,64,32};S.draws={}
+  equal(R.ProbeArtwork(I,capture),false);equal(#S.draws,0)
+  check(R.Animation(I,"A",box));equal(S.draws[1][1],replacement,"fallback refreshes the same-frame sprite cache")
+  S.interfaceImages[atlas]={first,128,32};S.draws={}
+  equal(R.ProbeArtwork(I,capture),false);equal(#S.draws,0)
+  check(R.Animation(I,"A",box));equal(S.draws[1][8],8/128,"fallback uses the replacement atlas dimensions")
+  S.interfaceImages[atlas]=nil;S.draws={}
+  equal(R.ProbeArtwork(I,capture),false);equal(#S.draws,0)
+  equal(R.Animation(I,"A",box),false)
+end)
+run("artwork captures nest restore and bound distinct resources",function()
+  local images={}
+  for n=1,17 do images["A"..n]={path="uifiles/test/"..n..".png"}end
+  local I=fixture({version=2,portable=1,windows={},images=images})
+  local outer=R.CaptureArtwork();check(R.Animation(I,"A1",box))
+  local inner=R.CaptureArtwork();check(R.Animation(I,"A2",box));R.EndArtworkCapture(inner)
+  check(R.Animation(I,"A3",box));R.EndArtworkCapture(inner) -- idempotence must preserve outer
+  R.EndArtworkCapture(outer)
+  equal(#outer.images,2);equal(outer.images[2].name,"A3");equal(outer.seen.A2,nil)
+  equal(#inner.images,1);equal(inner.images[1].name,"A2")
+  equal(outer.bad,false);equal(inner.bad,false)
+  local limited=R.CaptureArtwork()
+  for n=1,17 do check(R.Animation(I,"A"..n,box))end
+  R.EndArtworkCapture(limited);equal(limited.bad,true);equal(#limited.images,16)
+  S.draws={};equal(R.ProbeArtwork(I,limited),false);equal(#S.draws,0)
+  local interrupted=R.CaptureArtwork();local nested=R.CaptureArtwork()
+  R.EndArtworkCapture(interrupted);equal(interrupted.bad,true);equal(nested.bad,true)
+  local nextCapture=R.CaptureArtwork();check(R.Animation(I,"A1",box));R.EndArtworkCapture(nextCapture)
+  equal(nextCapture.bad,false);equal(#nextCapture.images,1)
+end)
+run("artwork capture rejects live cycles missing images and cross-instance use",function()
+  local I=fixture({version=2,portable=1,windows={},images={Atlas={path="uifiles/test/atlas.png"}},
+    animations={Cycle={cycle=true,frames={{image="Atlas",rect={x=0,y=0,w=8,h=8}},
+      {image="Atlas",rect={x=8,y=0,w=8,h=8}}}}}})
+  check(R.Animation(I,"Cycle",box)) -- cycle must remain detectable through a cached sprite
+  local cycle=R.CaptureArtwork();check(R.Animation(I,"Cycle",box));R.EndArtworkCapture(cycle)
+  equal(cycle.bad,true);equal(R.ProbeArtwork(I,cycle),false)
+  local missing=R.CaptureArtwork();equal(R.Animation(I,"NotAnImage",box),false);R.EndArtworkCapture(missing)
+  equal(missing.bad,true);equal(#missing.images,0)
+  local capture=R.CaptureArtwork();check(R.Animation(I,"Atlas",box));R.EndArtworkCapture(capture)
+  equal(capture.bad,false);equal(R.ProbeArtwork({},capture),false)
+end)
+run("artwork probes validate every atlas before emitting any geometry",function()
+  local I=fixture({version=2,portable=1,windows={},images={
+    A={path="uifiles/test/a.png"},B={path="uifiles/test/b.png"}}})
+  local capture=R.CaptureArtwork()
+  check(R.Animation(I,"A",box));check(R.Animation(I,"B",box));R.EndArtworkCapture(capture)
+  equal(#capture.images,2)
+  S.assetInfo={["uifiles/test/b.png"]=false};S.draws={}
+  equal(R.ProbeArtwork(I,capture),false);equal(#S.draws,0)
+end)
+run("native frame batches reuse layouts and follow current atlas leases",function()
+  local loads,begins,finishes=0,0,0
+  local definitions
+  api.plugins={Get=function(id)
+    equal(id,"plugin:ui-pack-native")
+    return {
+      Version=function() return 2 end,
+      CompileFrameQuads=function(quads)
+        loads=loads+1;definitions=quads
+        equal(quads.count,27);equal(#quads,27);equal(quads[1],1);equal(quads[10],2);equal(quads[19],1)
+        return 7
+      end,
+      BeginFrameQuads=function(plan) equal(plan,7);begins=begins+1;return true end,
+      EndFrameQuads=function(plan,r,g,b,a)
+        equal(plan,7);finishes=finishes+1;equal(S.clips,1,"probe clip closed before emission")
+        equal(r,0.25);equal(g,0.5);equal(b,0.75);equal(a,0.5)
+        return not S.rejectNative
+      end,
+    }
+  end}
+  local renderer=realDofile("shared/renderer.lua")
+  local atlasA="assets/"..string.rep("a",64)..".png"
+  local atlasB="assets/"..string.rep("b",64)..".png"
+  S.bundled=true
+  files={["lib/layouts/index.lua"]={version=2,portable=1,windows={},
+    images={A={interface_path=atlasA},B={interface_path=atlasB}},
+    animations={Edge={frames={{image="A",rect={x=0,y=0,w=8,h=8}}}},
+      Strip={frames={{image="B",rect={x=8,y=0,w=8,h=8}}}}},
+    templates={Border={fields={Left="Edge",Middle="Strip",Right="Edge"}}},
+  }}
+  parentFiles={}
+  local I=renderer.New({id="native-frame-fixture",index="lib/layouts/index.lua"})
+  local tint={0.25,0.5,0.75,0.5}
+  S.interfaceImages={[atlasA]={"oldA",64,32},[atlasB]={"oldB",64,32}}
+  check(renderer.Frame(I,"Border",box,tint));equal(#S.draws,3);equal(loads,0)
+
+  S.frame=2;S.draws={}
+  check(renderer.Frame(I,"Border",box,tint));equal(#S.draws,2)
+  equal(S.draws[1][1],"oldA");equal(S.draws[2][1],"oldB")
+  equal(S.draws[1][2],0);equal(S.draws[1][4],0)
+  equal(definitions[15],8/64);equal(loads,1);equal(begins,1);equal(finishes,1)
+
+  S.frame=3;S.draws={};S.interfaceImages[atlasB]={"newB",64,32}
+  check(renderer.Frame(I,"Border",box,tint));equal(S.draws[2][1],"newB");equal(loads,1)
+  S.frame=4;S.draws={};S.rejectNative=true
+  check(renderer.Frame(I,"Border",box,tint));equal(#S.draws,5)
+  equal(S.draws[4][1],"newB");equal(S.draws[4][6],8/64,"native failure preserves Lua UVs")
+  S.frame=12;S.draws={};S.interfaceImages[atlasB]={"wideB",128,32}
+  check(renderer.Frame(I,"Border",box,tint));equal(#S.draws,3)
+  equal(S.draws[2][1],"wideB");equal(S.draws[2][6],8/128)
+
+  S.frame=21;S.draws={};S.rejectNative=false
+  local capture=renderer.CaptureArtwork()
+  check(renderer.Frame(I,"Border",box,tint));renderer.EndArtworkCapture(capture)
+  equal(#capture.images,2);equal(#S.draws,3);equal(loads,1);equal(begins,3);equal(finishes,3)
+  check(renderer.Frame(I,"Border",box,tint));equal(loads,2);equal(definitions[15],8/128)
+  api.plugins=nil
+end)
 print(string.format("Lua renderer: %d cases, %d assertions passed",passed,assertions))

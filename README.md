@@ -24,6 +24,19 @@ Use the frame menu's **Reset size** or **Reset position** to restore authored de
 Use the modular Lua UI client described in [client requirements](client/README.md).
 UI addons have full client interface access; install only code you trust.
 
+### Optional native rendering on Windows
+
+Install [Hailstone UI Pack Native](https://github.com/fryguy503/hailstone-ui-pack-native)
+separately through **Add-ons** on Windows x64. All twenty skins use it for
+supported window chrome and can reuse Extended Target drawing while the window
+is idle and its data is steady. The same Lua implementation handles interactive
+frames, changing data, and clients where the companion is unavailable.
+
+Use a Hailstone build with the modular UI API, bundled artwork support, and the
+companion's Dear ImGui version. On servers that enforce an add-on allowlist,
+the companion repository needs the `ui` capability and its own allowlist entry.
+See [client requirements](client/README.md) for compatibility details.
+
 ## How the interfaces work
 
 The package includes its Lua presentation tables, PNG artwork and shared rendering helpers.
